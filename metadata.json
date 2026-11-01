@@ -1,0 +1,6 @@
+{
+  "name": "Draw Race",
+  "description": "Un juego de carreras interactivo donde dibujas la trayectoria y velocidad de tu coche para competir en circuitos desafiantes.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
