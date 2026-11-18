@@ -114,6 +114,7 @@ export interface RaceCarState {
   lap: number;
   bounceCooldown: number; // frames to ignore wall collisions after bouncing
   slipstreamActive?: boolean;
+  overspeedTimer?: number; // frames of grip loss penalty when entering a corner too fast
 }
 
 export interface Particle {

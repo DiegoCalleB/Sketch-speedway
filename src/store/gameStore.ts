@@ -6,29 +6,29 @@ export const CAR_STATS: Record<CarType, CarStats> = {
   speedster: {
     name: 'Rayo Veloz',
     color: '#f43f5e', // Rose/Red
-    maxSpeed: 7.2,
-    acceleration: 0.13,
-    grip: 0.04, // slides super easily!
+    maxSpeed: 8.6,
+    acceleration: 0.16,
+    grip: 0.045, // slides super easily!
     driftRecovery: 0.15,
-    description: 'Máxima velocidad punta. Brutal en las rectas, pero derrapa fácilmente en curvas cerradas si vas rápido.'
+    description: 'Máxima velocidad punta (360+ km/h). Brutal en las rectas, pero exige frenar a tiempo en curvas cerradas.'
   },
   drifter: {
     name: 'Derrape Pro',
     color: '#10b981', // Emerald Green
-    maxSpeed: 5.4,
-    acceleration: 0.22,
-    grip: 0.11, // stable but recovers slides instantly
+    maxSpeed: 7.4,
+    acceleration: 0.25,
+    grip: 0.115, // stable and recovers slides instantly
     driftRecovery: 0.75,
-    description: 'El rey de las horquillas. Recupera el control tras deslizar de inmediato y tiene gran aceleración.'
+    description: 'El rey del paso por curva (315 km/h). Gran apoyo aerodinámico y tracción inmediata al salir de horquillas.'
   },
   balanced: {
     name: 'Grip F1',
     color: '#f97316', // Neon Orange
-    maxSpeed: 6.1,
-    acceleration: 0.17,
-    grip: 0.075,
+    maxSpeed: 8.1,
+    acceleration: 0.20,
+    grip: 0.08,
     driftRecovery: 0.45,
-    description: 'Comportamiento predecible. Muy veloz en todo tipo de situaciones, ideal tanto para novatos como veteranos.'
+    description: 'Monoplaza F1 equilibrado (345 km/h). Comportamiento predecible y rapidísimo tanto en rectas como en curvas.'
   }
 };
 
@@ -51,6 +51,7 @@ interface GameState {
   setRaceResults: (results: RaceResultItem[] | null) => void;
   setTelemetries: (telemetries: Record<string, PlayerTelemetry>) => void;
   restartGame: () => void;
+  goToMenu: () => void;
 }
 
 export const useGameStore = create<GameState>((set, get) => ({
@@ -121,6 +122,16 @@ export const useGameStore = create<GameState>((set, get) => ({
   setActivePlayerIndex: (activePlayerIndex) => set({ activePlayerIndex }),
   setRaceResults: (raceResults) => set({ raceResults }),
   setTelemetries: (telemetries) => set({ telemetries }),
+
+  goToMenu: () => {
+    set({
+      phase: 'menu',
+      players: [],
+      raceResults: null,
+      telemetries: {},
+      activePlayerIndex: 0
+    });
+  },
 
   restartGame: () => {
     const { phase } = get();

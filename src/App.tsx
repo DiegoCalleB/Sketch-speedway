@@ -72,6 +72,7 @@ export default function App() {
             activePlayerIndex={activePlayerIndex}
             phase={phase === 'drawing' ? 'drawing' : 'racing'}
             onPathDrawn={setDrawnPath}
+            onStartRace={() => setPhase('racing')}
             onRaceFinished={(results) => {
               setRaceResults(results);
               setPhase('results');

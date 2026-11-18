@@ -3,98 +3,206 @@ import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import { GamePhase, RaceCarState, Track } from '../../types';
 
+export type RaceCameraMode = 'helicopter' | 'chase' | 'circuit';
+
 interface CameraDirectorProps {
   phase: GamePhase;
   activeCar?: RaceCarState;
+  allCars?: RaceCarState[];
   activePlayerGrid?: { x: number; y: number };
   activeDrawingTip?: { x: number; y: number } | null;
   track: Track;
-  cameraMode?: 'chase' | 'tv';
+  cameraMode?: RaceCameraMode;
+  isPortrait?: boolean;
 }
+
+const _desiredPos = new THREE.Vector3(400, 250, 536);
+const _desiredLookAt = new THREE.Vector3(400, 250, 0);
 
 export const CameraDirector: React.FC<CameraDirectorProps> = ({
   phase,
   activeCar,
-  activePlayerGrid,
-  activeDrawingTip,
+  allCars = [],
   track,
-  cameraMode = 'chase'
+  cameraMode = 'helicopter',
+  isPortrait = false
 }) => {
   const shakeRef = useRef<number>(0);
   const prevBounceCooldown = useRef<number>(0);
+  const currentLookAtRef = useRef<THREE.Vector3>(new THREE.Vector3(400, 250, 0));
+  const initializedPhaseRef = useRef<string>('');
 
+  useFrame((state, delta) => {
+    const camera = state.camera as THREE.PerspectiveCamera;
+    const dt = Math.min(delta, 0.05);
 
-  useFrame((state) => {
-    const camera = state.camera;
+    const vFovRad = THREE.MathUtils.degToRad(camera.fov || 50);
+    const tanHalfFov = Math.tan(vFovRad * 0.5);
+    const aspect = state.size.width / Math.max(1, state.size.height);
 
+    // Up vector in world XY plane: (0, 1, 0) for landscape, (-1, 0, 0) for 90° clockwise portrait
+    const upX = isPortrait ? -1 : 0;
+    const upY = isPortrait ? 0 : 1;
+    camera.up.set(upX, upY, 0);
+
+    // World span along vertical screen axis vs horizontal screen axis
+    const worldSpanVertical = isPortrait ? track.width : track.height;
+    const worldSpanHorizontal = isPortrait ? track.height : track.width;
+
+    const zForHeight = (worldSpanVertical * 0.5) / tanHalfFov;
+    const zForWidth = (worldSpanHorizontal * 0.5) / (tanHalfFov * aspect);
+    const fullCircuitZ = Math.max(zForHeight, zForWidth) + 0.3;
+
+    // 1. DRAWING PHASE: Exact overhead framing of the entire circuit
     if (phase === 'drawing') {
-      // In drawing phase, keep the PerspectiveCamera locked statically and perfectly looking straight down at the entire circuit
-      // At distance 326, with 75 deg vertical FOV, the visible area is exactly 800x500 on the Z=0 plane.
-      camera.position.set(400, 250, 326);
-      camera.lookAt(400, 250, 0);
+      camera.position.set(400, 250, fullCircuitZ);
+      camera.lookAt(400, 250, 0.3);
+      currentLookAtRef.current.set(400, 250, 0.3);
+      initializedPhaseRef.current = `drawing-${isPortrait ? 'p' : 'l'}`;
       return;
     }
 
-    const target = new THREE.Vector3(400, 250, 0); // Default track center
-
-    // 1. Determine target lookAt coordinate in 3D
-    if (phase === 'racing' && activeCar) {
-      target.set(activeCar.x, 500 - activeCar.y, 0);
-
-      // Trigger heavy camera shake on wall collision impact
-      if (activeCar.bounceCooldown === 14 && prevBounceCooldown.current < 14) {
-        shakeRef.current = 7.5; // Shockwave amplitude
-      }
-      prevBounceCooldown.current = activeCar.bounceCooldown;
-
-      // Subtle high-frequency vibration during tire drifts
-      if (activeCar.isDrifting) {
-        shakeRef.current = Math.max(shakeRef.current, 0.95);
+    // 2. RACING PHASE
+    let focusCar = activeCar;
+    if (!focusCar || focusCar.finished || focusCar.disqualified) {
+      const racingCars = allCars.filter((c) => !c.finished && !c.disqualified);
+      if (racingCars.length > 0) {
+        focusCar = racingCars[0];
       }
     }
 
-    // Decay camera shake over time
-    shakeRef.current *= 0.9;
-    if (shakeRef.current < 0.05) shakeRef.current = 0;
+    if (focusCar) {
+      if (focusCar.bounceCooldown >= 12 && prevBounceCooldown.current < 12) {
+        shakeRef.current = 4.5;
+      }
+      prevBounceCooldown.current = focusCar.bounceCooldown;
 
-    // 2. Map dynamic camera height/zoom based on state
-    if (cameraMode === 'tv') {
-      // Stadium TV grandstand view, elevated at (400, 70, 320) looking down across track
-      const tvPos = new THREE.Vector3(400, 50, 330);
-      camera.position.lerp(tvPos, 0.04);
-      camera.lookAt(target);
-      return;
+      if (focusCar.isDrifting) {
+        shakeRef.current = Math.max(shakeRef.current, 0.45);
+      }
     }
 
-    let desiredDistance = 220;
-    const desiredCamPos = new THREE.Vector3();
+    shakeRef.current = THREE.MathUtils.damp(shakeRef.current, 0, 8, dt);
+    if (shakeRef.current < 0.03) shakeRef.current = 0;
 
-    // Racing camera: Zoom in/out based on speed and tilt for dynamic 3D feeling
-    if (activeCar) {
-      const speed = Math.hypot(activeCar.vx, activeCar.vy);
-      desiredDistance = 150 + speed * 12; // Dynamic FOV pulls out at speed!
+    if (cameraMode === 'circuit') {
+      // Full circuit 3D overview: whole track visible with slight stadium tilt along -up
+      _desiredLookAt.set(400, 250, 0);
+      _desiredPos.set(
+        400 - upX * (fullCircuitZ * 0.16),
+        250 - upY * (fullCircuitZ * 0.16),
+        fullCircuitZ * 0.96
+      );
+    } else if (cameraMode === 'chase' && focusCar) {
+      // Close 3D Pursuit Camera with velocity look-ahead
+      const speed = Math.hypot(focusCar.vx, focusCar.vy);
+      const lookAheadX = focusCar.vx * 11;
+      const lookAheadY = -focusCar.vy * 11;
+
+      const targetX = THREE.MathUtils.clamp(focusCar.x + lookAheadX, 110, 690);
+      const targetY = THREE.MathUtils.clamp(500 - focusCar.y + lookAheadY, 85, 415);
+
+      _desiredLookAt.set(targetX, targetY, 0.5);
+
+      const dist = 125 + speed * 8.5;
+      _desiredPos.set(
+        targetX - upX * (dist * 0.58),
+        targetY - upY * (dist * 0.58),
+        dist * 0.84
+      );
+    } else {
+      // 'helicopter' (Default): Smart Broadcast TV Camera that frames the player + pack battle
+      if (focusCar) {
+        const speed = Math.hypot(focusCar.vx, focusCar.vy);
+        const lookAheadX = focusCar.vx * 9;
+        const lookAheadY = -focusCar.vy * 9;
+
+        let packX = focusCar.x + lookAheadX;
+        let packY = 500 - focusCar.y + lookAheadY;
+        let maxSpread = 0;
+
+        const racingCars = allCars.filter((c) => !c.finished && !c.disqualified);
+        if (racingCars.length > 1) {
+          let sumX = 0;
+          let sumY = 0;
+          racingCars.forEach((c) => {
+            const cy = 500 - c.y;
+            sumX += c.x;
+            sumY += cy;
+            const d = Math.hypot(c.x - focusCar!.x, cy - (500 - focusCar!.y));
+            if (d > maxSpread) maxSpread = d;
+          });
+          const avgX = sumX / racingCars.length;
+          const avgY = sumY / racingCars.length;
+          packX = packX * 0.72 + avgX * 0.28;
+          packY = packY * 0.72 + avgY * 0.28;
+        }
+
+        const clampedX = THREE.MathUtils.clamp(packX, 165, 635);
+        const clampedY = THREE.MathUtils.clamp(packY, 115, 385);
+
+        _desiredLookAt.set(clampedX, clampedY, 0);
+
+        const spreadZoom = Math.min(115, maxSpread * 0.32);
+        const dist = (isPortrait ? 235 : 195) + speed * 6 + spreadZoom;
+        _desiredPos.set(
+          clampedX - upX * (dist * 0.5),
+          clampedY - upY * (dist * 0.5),
+          dist * 0.88
+        );
+      } else {
+        _desiredLookAt.set(400, 250, 0);
+        _desiredPos.set(
+          400 - upX * 90,
+          250 - upY * 90,
+          fullCircuitZ * 0.95
+        );
+      }
     }
-    desiredCamPos.set(
-      target.x,
-      target.y - desiredDistance * 0.7,
-      target.z + desiredDistance * 0.9
+
+    const phaseKey = `racing-${isPortrait ? 'p' : 'l'}`;
+    if (initializedPhaseRef.current !== phaseKey) {
+      camera.position.set(
+        400 - upX * 85,
+        250 - upY * 85,
+        fullCircuitZ * 0.92
+      );
+      currentLookAtRef.current.set(400, 250, 0);
+      initializedPhaseRef.current = phaseKey;
+    }
+
+    const posLambda = cameraMode === 'chase' ? 6.5 : 4.8;
+    const lookLambda = cameraMode === 'chase' ? 9.0 : 6.5;
+
+    camera.position.x = THREE.MathUtils.damp(camera.position.x, _desiredPos.x, posLambda, dt);
+    camera.position.y = THREE.MathUtils.damp(camera.position.y, _desiredPos.y, posLambda, dt);
+    camera.position.z = THREE.MathUtils.damp(camera.position.z, _desiredPos.z, posLambda, dt);
+
+    currentLookAtRef.current.x = THREE.MathUtils.damp(
+      currentLookAtRef.current.x,
+      _desiredLookAt.x,
+      lookLambda,
+      dt
+    );
+    currentLookAtRef.current.y = THREE.MathUtils.damp(
+      currentLookAtRef.current.y,
+      _desiredLookAt.y,
+      lookLambda,
+      dt
+    );
+    currentLookAtRef.current.z = THREE.MathUtils.damp(
+      currentLookAtRef.current.z,
+      _desiredLookAt.z,
+      lookLambda,
+      dt
     );
 
-    // Smooth lerp camera position to avoid snaps
-    camera.position.lerp(desiredCamPos, 0.05);
-
-    // Apply Camera Shake offset
     if (shakeRef.current > 0) {
-      const shake = new THREE.Vector3(
-        (Math.random() - 0.5) * shakeRef.current,
-        (Math.random() - 0.5) * shakeRef.current,
-        (Math.random() - 0.5) * shakeRef.current
-      );
-      camera.position.add(shake);
+      camera.position.x += (Math.random() - 0.5) * shakeRef.current;
+      camera.position.y += (Math.random() - 0.5) * shakeRef.current;
     }
 
-    // Direct camera to look at the target coordinate
-    camera.lookAt(target);
+    camera.lookAt(currentLookAtRef.current);
   });
 
   return null;

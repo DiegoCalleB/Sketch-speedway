@@ -1,4 +1,4 @@
-import { Track, TrackPoint, Point } from '../types';
+import { Track, TrackPoint, Point, AIArchetype } from '../types';
 
 // Ray-casting algorithm for point-in-polygon check
 export function isPointInPolygon(p: TrackPoint, polygon: TrackPoint[]): boolean {
@@ -9,9 +9,10 @@ export function isPointInPolygon(p: TrackPoint, polygon: TrackPoint[]): boolean 
     const yi = polygon[i].y;
     const xj = polygon[j].x;
     const yj = polygon[j].y;
-    
-    const intersect = ((yi > p.y) !== (yj > p.y))
-        && (p.x < (xj - xi) * (p.y - yi) / (yj - yi) + xi);
+
+    const intersect =
+      yi > p.y !== yj > p.y &&
+      p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi;
     if (intersect) isInside = !isInside;
   }
   return isInside;
@@ -22,10 +23,28 @@ export function getDistance(p1: TrackPoint, p2: TrackPoint): number {
   return Math.hypot(p2.x - p1.x, p2.y - p1.y);
 }
 
+// Distance from point P to segment AB
+export function distToSegment(
+  p: TrackPoint,
+  a: TrackPoint,
+  b: TrackPoint
+): { dist: number; closest: TrackPoint } {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return { dist: Math.hypot(p.x - a.x, p.y - a.y), closest: { x: a.x, y: a.y } };
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const closest = { x: a.x + t * dx, y: a.y + t * dy };
+  return { dist: Math.hypot(p.x - closest.x, p.y - closest.y), closest };
+}
+
 // Check if a line segment intersects another line segment
 export function lineIntersects(
-  a1: TrackPoint, a2: TrackPoint,
-  b1: TrackPoint, b2: TrackPoint
+  a1: TrackPoint,
+  a2: TrackPoint,
+  b1: TrackPoint,
+  b2: TrackPoint
 ): boolean {
   const det = (a2.x - a1.x) * (b2.y - b1.y) - (b2.x - b1.x) * (a2.y - a1.y);
   if (det === 0) return false; // Parallel
@@ -33,11 +52,37 @@ export function lineIntersects(
   const lambda = ((b2.y - b1.y) * (b2.x - a1.x) + (b1.x - b2.x) * (b2.y - a1.y)) / det;
   const gamma = ((a1.y - a2.y) * (b2.x - a1.x) + (a2.x - a1.x) * (b2.y - a1.y)) / det;
 
-  return (0 < lambda && lambda < 1) && (0 < gamma && gamma < 1);
+  return 0 <= lambda && lambda <= 1 && 0 <= gamma && gamma <= 1;
+}
+
+// Create a gate segment spanning from outerBoundary[idx] to innerBoundary[idx] with safety margin
+function createGateAt(
+  outer: TrackPoint[],
+  inner: TrackPoint[],
+  idx: number,
+  margin: number = 14
+): { p1: TrackPoint; p2: TrackPoint } {
+  const o = outer[idx % outer.length];
+  const i = inner[idx % inner.length];
+  const dx = o.x - i.x;
+  const dy = o.y - i.y;
+  const len = Math.hypot(dx, dy) || 1;
+  const nx = dx / len;
+  const ny = dy / len;
+  return {
+    p1: { x: o.x + nx * margin, y: o.y + ny * margin },
+    p2: { x: i.x - nx * margin, y: i.y - ny * margin }
+  };
 }
 
 // Generate smooth ellipse points
-function generateEllipse(cx: number, cy: number, rx: number, ry: number, count: number): TrackPoint[] {
+function generateEllipse(
+  cx: number,
+  cy: number,
+  rx: number,
+  ry: number,
+  count: number
+): TrackPoint[] {
   const points: TrackPoint[] = [];
   for (let i = 0; i < count; i++) {
     const angle = (i / count) * Math.PI * 2;
@@ -49,43 +94,32 @@ function generateEllipse(cx: number, cy: number, rx: number, ry: number, count: 
   return points;
 }
 
-// Track 1: Oval (Easy)
-const outer1 = generateEllipse(400, 250, 350, 200, 60);
-const inner1 = generateEllipse(400, 250, 220, 100, 60);
+// Track 1: Oval (Easy) — fits cleanly within [60..740] x [55..445]
+const outer1 = generateEllipse(400, 250, 340, 192, 72);
+const inner1 = generateEllipse(400, 250, 215, 96, 72);
 
-// Track 2: S-Curve / Technical (Medium)
-// We will generate this using customized mathematical control loops
+// Track 2: S-Curve / Technical (Medium) — fits cleanly within [55..745] x [45..455]
 function generateTrack2Points(): { outer: TrackPoint[]; inner: TrackPoint[] } {
   const outer: TrackPoint[] = [];
   const inner: TrackPoint[] = [];
   const count = 80;
-  
+
   for (let i = 0; i < count; i++) {
     const angle = (i / count) * Math.PI * 2;
-    // Base radius with variations to create curves
-    let rOuter = 260;
-    let rInner = 140;
+    let rCenter = 168;
+    const halfWidth = 48;
 
-    // Add a couple of beautiful custom bends
-    if (angle > 0 && angle < Math.PI) {
-      // Curve inwards on the upper half
-      const s = Math.sin(angle * 2);
-      rOuter += s * 60;
-      rInner += s * 60;
-    } else {
-      // Wave on lower half
-      const s = Math.sin(angle * 3);
-      rOuter += s * 30;
-      rInner += s * 30;
-    }
+    const wave1 = Math.sin(angle * 2) * 26;
+    const wave2 = Math.cos(angle * 3) * 14;
+    rCenter += wave1 + wave2;
 
-    // Centered at 400, 250 with slight stretch
+    const rOuter = rCenter + halfWidth;
+    const rInner = rCenter - halfWidth;
+
     const cx = 400;
     const cy = 250;
-    
-    // Stretch x more than y
-    const scaleX = 1.35;
-    const scaleY = 0.95;
+    const scaleX = 1.32;
+    const scaleY = 0.86;
 
     outer.push({
       x: cx + Math.cos(angle) * rOuter * scaleX,
@@ -103,61 +137,80 @@ function generateTrack2Points(): { outer: TrackPoint[]; inner: TrackPoint[] } {
 
 const track2Points = generateTrack2Points();
 
-// Track 3: Red Bull Ring style/Complex (Hard)
-// We'll create custom track vertexes for a truly exciting race track with straights and tight hairpins
+// Track 3: Grand Prix Technical Circuit (Hard) — fits cleanly within [65..735] x [55..445]
 function generateTrack3Points(): { outer: TrackPoint[]; inner: TrackPoint[] } {
-  // Classic Grand Prix style track vertices (outer)
-  // Let's create a beautiful technical circuit with 12 key keypoints, then interpolate them to make them smooth.
-  const outerKeypoints: TrackPoint[] = [
-    { x: 100, y: 120 },
-    { x: 380, y: 100 },
-    { x: 500, y: 180 },
-    { x: 720, y: 120 },
-    { x: 740, y: 380 },
-    { x: 550, y: 350 },
-    { x: 450, y: 440 },
-    { x: 320, y: 320 },
-    { x: 220, y: 430 },
-    { x: 80,  y: 380 },
+  const centerlineKeypoints: TrackPoint[] = [
+    { x: 155, y: 155 },
+    { x: 380, y: 135 },
+    { x: 485, y: 195 },
+    { x: 655, y: 145 },
+    { x: 675, y: 345 },
+    { x: 535, y: 315 },
+    { x: 440, y: 385 },
+    { x: 330, y: 290 },
+    { x: 225, y: 375 },
+    { x: 125, y: 335 }
   ];
 
-  const innerKeypoints: TrackPoint[] = [
-    { x: 200, y: 220 },
-    { x: 370, y: 200 },
-    { x: 440, y: 250 },
-    { x: 620, y: 210 },
-    { x: 640, y: 290 },
-    { x: 530, y: 270 },
-    { x: 440, y: 320 },
-    { x: 340, y: 240 },
-    { x: 240, y: 310 },
-    { x: 180, y: 290 },
-  ];
+  const smoothCenterline: TrackPoint[] = [];
+  const len = centerlineKeypoints.length;
+  const subSteps = 10;
 
-  // Helper to interpolate points
-  const interpolatePoints = (keypoints: TrackPoint[], countPerSegment: number): TrackPoint[] => {
-    const result: TrackPoint[] = [];
-    const len = keypoints.length;
-    for (let i = 0; i < len; i++) {
-      const p1 = keypoints[i];
-      const p2 = keypoints[(i + 1) % len];
-      for (let j = 0; j < countPerSegment; j++) {
-        const t = j / countPerSegment;
-        // Simple cubic bezier interpolation or linear with light cosine smoothing
-        const tSmooth = (1 - Math.cos(t * Math.PI)) / 2;
-        result.push({
-          x: p1.x + (p2.x - p1.x) * tSmooth,
-          y: p1.y + (p2.y - p1.y) * tSmooth,
-        });
-      }
+  for (let i = 0; i < len; i++) {
+    const p0 = centerlineKeypoints[(i - 1 + len) % len];
+    const p1 = centerlineKeypoints[i];
+    const p2 = centerlineKeypoints[(i + 1) % len];
+    const p3 = centerlineKeypoints[(i + 2) % len];
+
+    for (let j = 0; j < subSteps; j++) {
+      const t = j / subSteps;
+      const t2 = t * t;
+      const t3 = t2 * t;
+
+      const x =
+        0.5 *
+        (2 * p1.x +
+          (-p0.x + p2.x) * t +
+          (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+          (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3);
+      const y =
+        0.5 *
+        (2 * p1.y +
+          (-p0.y + p2.y) * t +
+          (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+          (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
+
+      smoothCenterline.push({ x, y });
     }
-    return result;
-  };
+  }
 
-  return {
-    outer: interpolatePoints(outerKeypoints, 8),
-    inner: interpolatePoints(innerKeypoints, 8)
-  };
+  const outer: TrackPoint[] = [];
+  const inner: TrackPoint[] = [];
+  const total = smoothCenterline.length;
+  const halfWidth = 44;
+
+  for (let i = 0; i < total; i++) {
+    const prev = smoothCenterline[(i - 1 + total) % total];
+    const curr = smoothCenterline[i];
+    const next = smoothCenterline[(i + 1) % total];
+
+    const tx = next.x - prev.x;
+    const ty = next.y - prev.y;
+    const tLen = Math.hypot(tx, ty) || 1;
+    const nx = ty / tLen;
+    const ny = -tx / tLen;
+
+    outer.push({
+      x: curr.x + nx * halfWidth,
+      y: curr.y + ny * halfWidth
+    });
+    inner.push({
+      x: curr.x - nx * halfWidth,
+      y: curr.y - ny * halfWidth
+    });
+  }
+
+  return { outer, inner };
 }
 
 const track3Points = generateTrack3Points();
@@ -167,185 +220,124 @@ export const TRACKS: Track[] = [
     id: 'oval',
     name: 'Circuito Óvalo de Iniciación',
     difficulty: 'Fácil',
-    description: 'Un circuito de entrenamiento simple ideal para entender la física de derrape, aceleración y curvas fluidas.',
+    description:
+      'Dos grandes rectas para acelerar a fondo y dos curvas de 180° donde debes dosificar el trazo para no derrapar.',
     width: 800,
     height: 500,
     outerBoundary: outer1,
     innerBoundary: inner1,
     startGrid: [
-      { x: 400, y: 400, angle: 0 },
-      { x: 370, y: 420, angle: 0 },
-      { x: 340, y: 400, angle: 0 },
-      { x: 310, y: 420, angle: 0 }
+      { x: 385, y: 382, angle: 0 },
+      { x: 355, y: 406, angle: 0 },
+      { x: 325, y: 380, angle: 0 },
+      { x: 295, y: 404, angle: 0 }
     ],
-    startLine: {
-      p1: { x: 400, y: 350 },
-      p2: { x: 400, y: 450 }
-    },
+    startLine: createGateAt(outer1, inner1, 18, 14),
     checkpoints: [
-      { p1: { x: 750, y: 250 }, p2: { x: 620, y: 250 } }, // East
-      { p1: { x: 400, y: 50 },  p2: { x: 400, y: 150 } }, // North
-      { p1: { x: 50,  y: 250 }, p2: { x: 180, y: 250 } }  // West
+      createGateAt(outer1, inner1, 0, 14),
+      createGateAt(outer1, inner1, 54, 14),
+      createGateAt(outer1, inner1, 36, 14)
     ],
     trees: [
-      // Infield trees
-      { x: 250, y: 210, size: 22, type: 'leaf' },
-      { x: 280, y: 260, size: 16, type: 'pine' },
-      { x: 550, y: 210, size: 22, type: 'leaf' },
-      { x: 520, y: 260, size: 16, type: 'pine' },
-      { x: 320, y: 230, size: 14, type: 'leaf' },
-      { x: 480, y: 230, size: 15, type: 'pine' },
-      // Outfield trees
-      { x: 80, y: 60, size: 24, type: 'pine' },
-      { x: 110, y: 80, size: 20, type: 'leaf' },
-      { x: 720, y: 60, size: 24, type: 'pine' },
-      { x: 690, y: 80, size: 20, type: 'leaf' },
-      { x: 80, y: 440, size: 22, type: 'leaf' },
-      { x: 720, y: 440, size: 22, type: 'leaf' },
-      { x: 50, y: 250, size: 18, type: 'pine' },
-      { x: 750, y: 250, size: 18, type: 'pine' }
+      { x: 260, y: 225, size: 18, type: 'leaf' },
+      { x: 290, y: 265, size: 15, type: 'pine' },
+      { x: 540, y: 225, size: 18, type: 'leaf' },
+      { x: 510, y: 265, size: 15, type: 'pine' },
+      { x: 65, y: 65, size: 20, type: 'pine' },
+      { x: 735, y: 65, size: 20, type: 'pine' },
+      { x: 65, y: 435, size: 20, type: 'leaf' },
+      { x: 735, y: 435, size: 20, type: 'leaf' }
     ],
     grandstands: [
-      { x: 400, y: 25, width: 260, height: 18, angle: 0, title: 'TRIBUNA DE HONOR OVAL' },
-      { x: 220, y: 475, width: 130, height: 16, angle: 0, title: 'PADDOCK GENERAL' }
+      { x: 400, y: 26, width: 220, height: 16, angle: 0, title: 'TRIBUNA DE HONOR OVAL' },
+      { x: 230, y: 474, width: 120, height: 15, angle: 0, title: 'PADDOCK GENERAL' }
     ],
     decorations: [
-      // Parked service vehicles and flags
-      { x: 400, y: 250, type: 'box', color: '#ffffff' }, // Heli-pad marker center
-      { x: 400, y: 210, type: 'flag', color: '#3b82f6' },
-      { x: 360, y: 475, type: 'car', color: '#ef4444', angle: 0 },
-      { x: 380, y: 475, type: 'car', color: '#eab308', angle: -0.1 },
-      { x: 130, y: 470, type: 'tent', color: '#8b5cf6' },
-      { x: 670, y: 470, type: 'tent', color: '#10b981' }
+      { x: 400, y: 230, type: 'flag', color: '#3b82f6' },
+      { x: 130, y: 472, type: 'tent', color: '#8b5cf6' },
+      { x: 670, y: 472, type: 'tent', color: '#10b981' }
     ]
   },
   {
     id: 'forest',
     name: 'Circuito S-Bucle Forestal',
     difficulty: 'Medio',
-    description: 'Bends cerrados y curvas invertidas de tipo S que exigen frenar a tiempo y acelerar fuerte en las rectas.',
+    description:
+      'Curvas enlazadas en S y cambios de apoyo que exigen frenar el trazo antes de cada vértice y acelerar al salir.',
     width: 800,
     height: 500,
     outerBoundary: track2Points.outer,
     innerBoundary: track2Points.inner,
     startGrid: [
-      { x: 400, y: 420, angle: 0 },
-      { x: 370, y: 440, angle: 0 },
-      { x: 340, y: 420, angle: 0 },
-      { x: 310, y: 440, angle: 0 }
+      { x: 385, y: 382, angle: 0 },
+      { x: 355, y: 404, angle: 0 },
+      { x: 325, y: 378, angle: 0 },
+      { x: 295, y: 400, angle: 0 }
     ],
-    startLine: {
-      p1: { x: 400, y: 360 },
-      p2: { x: 400, y: 480 }
-    },
+    startLine: createGateAt(track2Points.outer, track2Points.inner, 20, 14),
     checkpoints: [
-      { p1: { x: 740, y: 250 }, p2: { x: 610, y: 250 } },
-      { p1: { x: 400, y: 50 },  p2: { x: 400, y: 160 } },
-      { p1: { x: 70,  y: 250 }, p2: { x: 190, y: 250 } }
+      createGateAt(track2Points.outer, track2Points.inner, 0, 14),
+      createGateAt(track2Points.outer, track2Points.inner, 60, 14),
+      createGateAt(track2Points.outer, track2Points.inner, 40, 14)
     ],
     trees: [
-      // Very dense forest feeling
-      // Infield clusters
-      { x: 400, y: 250, size: 26, type: 'leaf' },
-      { x: 430, y: 270, size: 20, type: 'pine' },
-      { x: 370, y: 240, size: 18, type: 'pine' },
-      { x: 410, y: 290, size: 15, type: 'leaf' },
-      { x: 260, y: 180, size: 24, type: 'pine' },
-      { x: 280, y: 150, size: 18, type: 'leaf' },
-      { x: 540, y: 320, size: 22, type: 'pine' },
-      { x: 520, y: 350, size: 16, type: 'leaf' },
-      // Outer boundaries dense forest
-      { x: 100, y: 60, size: 25, type: 'pine' },
-      { x: 130, y: 70, size: 21, type: 'pine' },
-      { x: 160, y: 50, size: 24, type: 'leaf' },
-      { x: 320, y: 50, size: 22, type: 'pine' },
-      { x: 480, y: 45, size: 23, type: 'leaf' },
-      { x: 640, y: 60, size: 25, type: 'pine' },
-      { x: 670, y: 80, size: 19, type: 'leaf' },
-      { x: 700, y: 110, size: 22, type: 'pine' },
-      { x: 750, y: 160, size: 24, type: 'pine' },
-      { x: 760, y: 350, size: 22, type: 'leaf' },
-      { x: 720, y: 430, size: 25, type: 'pine' },
-      { x: 680, y: 460, size: 20, type: 'pine' },
-      { x: 120, y: 450, size: 26, type: 'pine' },
-      { x: 90, y: 420, size: 21, type: 'leaf' },
-      { x: 60, y: 340, size: 23, type: 'pine' },
-      { x: 50, y: 150, size: 25, type: 'leaf' }
+      { x: 400, y: 250, size: 20, type: 'leaf' },
+      { x: 435, y: 265, size: 16, type: 'pine' },
+      { x: 365, y: 240, size: 16, type: 'pine' },
+      { x: 75, y: 60, size: 20, type: 'pine' },
+      { x: 725, y: 65, size: 20, type: 'pine' },
+      { x: 735, y: 435, size: 20, type: 'pine' },
+      { x: 75, y: 435, size: 20, type: 'pine' }
     ],
     grandstands: [
-      { x: 400, y: 22, width: 140, height: 15, angle: 0, title: 'TRIBUNA FOREST' }
+      { x: 400, y: 22, width: 140, height: 14, angle: 0, title: 'TRIBUNA FOREST' }
     ],
     decorations: [
-      // Fan tents and flags in the forest clearing
-      { x: 330, y: 220, type: 'tent', color: '#eab308' },
-      { x: 350, y: 200, type: 'tent', color: '#f97316' },
-      { x: 470, y: 220, type: 'tent', color: '#06b6d4' },
-      { x: 220, y: 470, type: 'flag', color: '#ffffff' },
-      { x: 580, y: 470, type: 'flag', color: '#ffffff' },
-      { x: 500, y: 465, type: 'car', color: '#10b981', angle: -0.2 }
+      { x: 335, y: 235, type: 'tent', color: '#eab308' },
+      { x: 465, y: 235, type: 'tent', color: '#06b6d4' }
     ]
   },
   {
     id: 'grandprix',
     name: 'Templo de la Velocidad',
     difficulty: 'Difícil',
-    description: 'Horquillas de gran frenada, curvas enlazadas con poco margen de error y pianos traicioneros.',
+    description:
+      'Horquillas de gran frenada, rectas de alta velocidad y chicanes técnicas donde entrar pasado penaliza gravemente.',
     width: 800,
     height: 500,
     outerBoundary: track3Points.outer,
     innerBoundary: track3Points.inner,
     startGrid: [
-      { x: 220, y: 110, angle: 0 },
-      { x: 190, y: 110, angle: 0 },
-      { x: 160, y: 110, angle: 0 },
-      { x: 130, y: 110, angle: 0 }
+      { x: 255, y: 138, angle: 0 },
+      { x: 225, y: 156, angle: 0 },
+      { x: 195, y: 144, angle: 0 },
+      { x: 168, y: 164, angle: 0 }
     ],
-    startLine: {
-      p1: { x: 240, y: 100 },
-      p2: { x: 240, y: 220 }
-    },
+    startLine: createGateAt(track3Points.outer, track3Points.inner, 7, 14),
     checkpoints: [
-      { p1: { x: 610, y: 150 }, p2: { x: 530, y: 220 } },
-      { p1: { x: 640, y: 340 }, p2: { x: 530, y: 310 } },
-      { p1: { x: 280, y: 370 }, p2: { x: 290, y: 270 } },
-      { p1: { x: 90,  y: 250 }, p2: { x: 180, y: 250 } }
+      createGateAt(track3Points.outer, track3Points.inner, 32, 14),
+      createGateAt(track3Points.outer, track3Points.inner, 55, 14),
+      createGateAt(track3Points.outer, track3Points.inner, 80, 14)
     ],
     trees: [
-      // Elegant pine rows representing European circuits like Monza
-      { x: 40, y: 40, size: 22, type: 'pine' },
-      { x: 70, y: 40, size: 22, type: 'pine' },
-      { x: 100, y: 40, size: 22, type: 'pine' },
-      { x: 740, y: 60, size: 24, type: 'pine' },
-      { x: 770, y: 80, size: 22, type: 'pine' },
-      { x: 750, y: 440, size: 20, type: 'leaf' },
-      { x: 500, y: 480, size: 18, type: 'pine' },
-      { x: 420, y: 480, size: 18, type: 'pine' },
-      // Infield trees
-      { x: 140, y: 180, size: 18, type: 'leaf' },
-      { x: 300, y: 170, size: 16, type: 'pine' },
-      { x: 580, y: 240, size: 20, type: 'pine' },
-      { x: 200, y: 330, size: 15, type: 'leaf' }
+      { x: 55, y: 55, size: 20, type: 'pine' },
+      { x: 745, y: 60, size: 20, type: 'pine' },
+      { x: 745, y: 440, size: 18, type: 'leaf' },
+      { x: 55, y: 440, size: 18, type: 'pine' },
+      { x: 260, y: 235, size: 16, type: 'leaf' },
+      { x: 565, y: 235, size: 16, type: 'pine' }
     ],
     grandstands: [
-      { x: 450, y: 40, width: 200, height: 18, angle: 0, title: 'TRIBUNA PRINCIPAL MONZA' },
-      { x: 680, y: 260, width: 90, height: 15, angle: 1.5, title: 'TRIBUNA CURVA ESTE' },
-      { x: 380, y: 475, width: 120, height: 16, angle: 0, title: 'ZONA DE SOCIOS' }
+      { x: 450, y: 32, width: 190, height: 15, angle: 0, title: 'TRIBUNA PRINCIPAL MONZA' },
+      { x: 380, y: 476, width: 120, height: 14, angle: 0, title: 'ZONA DE SOCIOS' }
     ],
     decorations: [
-      // Cones, sponsors and paddock items
-      { x: 450, y: 240, type: 'box', color: '#ff4d4d' }, // Red-white barriers
-      { x: 470, y: 250, type: 'box', color: '#ff4d4d' },
-      { x: 250, y: 70, type: 'flag', color: '#ef4444' }, // Start line flags
-      { x: 250, y: 240, type: 'flag', color: '#ffffff' },
-      { x: 350, y: 160, type: 'car', color: '#f43f5e', angle: 3.14 }, // Parked supercar
-      { x: 380, y: 160, type: 'car', color: '#10b981', angle: 3.14 },
-      { x: 100, y: 460, type: 'tent', color: '#f43f5e' }
+      { x: 270, y: 78, type: 'flag', color: '#ef4444' },
+      { x: 100, y: 465, type: 'tent', color: '#f43f5e' }
     ]
   }
 ];
 
-// Helper to check if a car has crossed a line segment
-// Used for checkpoint crossing & start/finish line checks
 export function checkSegmentCrossing(
   oldPos: TrackPoint,
   newPos: TrackPoint,
@@ -354,7 +346,6 @@ export function checkSegmentCrossing(
   return lineIntersects(oldPos, newPos, line.p1, line.p2);
 }
 
-// Helper to calculate the mathematical centerline of any track
 export function getTrackCenterline(track: Track): TrackPoint[] {
   const outer = track.outerBoundary;
   const inner = track.innerBoundary;
@@ -369,38 +360,376 @@ export function getTrackCenterline(track: Track): TrackPoint[] {
   return centerline;
 }
 
+// Compute smooth 3D banking (peralte) profile for each ring index around the circuit
+export function getTrackBankingProfile(track: Track): {
+  outerZ: number;
+  innerZ: number;
+  bankAngleRad: number;
+  curvature: number;
+  turnSign: number;
+}[] {
+  const outer = track.outerBoundary;
+  const inner = track.innerBoundary;
+  const len = Math.min(outer.length, inner.length);
+
+  const rawCurv: number[] = [];
+  const rawSign: number[] = [];
+
+  for (let i = 0; i < len; i++) {
+    const pPrev = {
+      x: (outer[(i - 2 + len) % len].x + inner[(i - 2 + len) % len].x) * 0.5,
+      y: (outer[(i - 2 + len) % len].y + inner[(i - 2 + len) % len].y) * 0.5
+    };
+    const pCurr = {
+      x: (outer[i].x + inner[i].x) * 0.5,
+      y: (outer[i].y + inner[i].y) * 0.5
+    };
+    const pNext = {
+      x: (outer[(i + 2) % len].x + inner[(i + 2) % len].x) * 0.5,
+      y: (outer[(i + 2) % len].y + inner[(i + 2) % len].y) * 0.5
+    };
+
+    const d1 = Math.hypot(pCurr.x - pPrev.x, pCurr.y - pPrev.y) || 1;
+    const d2 = Math.hypot(pNext.x - pCurr.x, pNext.y - pCurr.y) || 1;
+    const a1 = Math.atan2(pCurr.y - pPrev.y, pCurr.x - pPrev.x);
+    const a2 = Math.atan2(pNext.y - pCurr.y, pNext.x - pCurr.x);
+    let dAngle = a2 - a1;
+    while (dAngle > Math.PI) dAngle -= Math.PI * 2;
+    while (dAngle < -Math.PI) dAngle += Math.PI * 2;
+
+    rawCurv.push(Math.abs(dAngle) / ((d1 + d2) * 0.5));
+    rawSign.push(Math.sign(dAngle) || 1);
+  }
+
+  // Smooth the curvature over a 5-point window so banking transitions are silky smooth
+  const profile: {
+    outerZ: number;
+    innerZ: number;
+    bankAngleRad: number;
+    curvature: number;
+    turnSign: number;
+  }[] = [];
+
+  for (let i = 0; i < len; i++) {
+    let sumCurv = 0;
+    for (let k = -2; k <= 2; k++) {
+      sumCurv += rawCurv[(i + k + len) % len];
+    }
+    const smoothCurv = sumCurv / 5;
+    const width = Math.hypot(outer[i].x - inner[i].x, outer[i].y - inner[i].y) || 88;
+    // Raise the outside of curves up to +4.2 units (realistic F1/NASCAR banking)
+    const bankHeight = Math.min(4.2, Math.max(0, (smoothCurv - 0.0025) * 340));
+    const outerZ = 0.35 + bankHeight;
+    const innerZ = 0.32;
+    const bankAngleRad = Math.atan2(outerZ - innerZ, width);
+
+    profile.push({
+      outerZ,
+      innerZ,
+      bankAngleRad,
+      curvature: smoothCurv,
+      turnSign: rawSign[i]
+    });
+  }
+
+  return profile;
+}
+
+// Analyze where a point is relative to the track centerline, boundaries, and local track curvature
+export function getTrackSurfaceInfo(
+  pt: TrackPoint,
+  track: Track
+): {
+  onAsphalt: boolean;
+  onCurbOrGrass: boolean;
+  hitBarrier: boolean;
+  closestCenterPt: TrackPoint;
+  inwardNormal: TrackPoint;
+  outwardEdgeVec: TrackPoint;
+  distFromCenter: number;
+  halfWidth: number;
+  trackCurvature: number; // radians per pixel of centerline turn
+  trackTurnSign: number;
+  elevationZ: number;
+  bankAngleRad: number;
+} {
+  const outer = track.outerBoundary;
+  const inner = track.innerBoundary;
+  const len = Math.min(outer.length, inner.length);
+
+  let minDist = Infinity;
+  let bestIdx = 0;
+  let bestClosest: TrackPoint = { x: 400, y: 250 };
+
+  for (let i = 0; i < len; i++) {
+    const nIdx = (i + 1) % len;
+    const c1 = { x: (outer[i].x + inner[i].x) * 0.5, y: (outer[i].y + inner[i].y) * 0.5 };
+    const c2 = { x: (outer[nIdx].x + inner[nIdx].x) * 0.5, y: (outer[nIdx].y + inner[nIdx].y) * 0.5 };
+    const res = distToSegment(pt, c1, c2);
+    if (res.dist < minDist) {
+      minDist = res.dist;
+      bestIdx = i;
+      bestClosest = res.closest;
+    }
+  }
+
+  // Compute local centerline curvature at bestIdx
+  const pPrev = {
+    x: (outer[(bestIdx - 2 + len) % len].x + inner[(bestIdx - 2 + len) % len].x) * 0.5,
+    y: (outer[(bestIdx - 2 + len) % len].y + inner[(bestIdx - 2 + len) % len].y) * 0.5
+  };
+  const pCurr = {
+    x: (outer[bestIdx].x + inner[bestIdx].x) * 0.5,
+    y: (outer[bestIdx].y + inner[bestIdx].y) * 0.5
+  };
+  const pNext = {
+    x: (outer[(bestIdx + 2) % len].x + inner[(bestIdx + 2) % len].x) * 0.5,
+    y: (outer[(bestIdx + 2) % len].y + inner[(bestIdx + 2) % len].y) * 0.5
+  };
+
+  const d1 = Math.hypot(pCurr.x - pPrev.x, pCurr.y - pPrev.y) || 1;
+  const d2 = Math.hypot(pNext.x - pCurr.x, pNext.y - pCurr.y) || 1;
+  const a1 = Math.atan2(pCurr.y - pPrev.y, pCurr.x - pPrev.x);
+  const a2 = Math.atan2(pNext.y - pCurr.y, pNext.x - pCurr.x);
+  let dAngle = a2 - a1;
+  while (dAngle > Math.PI) dAngle -= Math.PI * 2;
+  while (dAngle < -Math.PI) dAngle += Math.PI * 2;
+
+  const trackCurvature = Math.abs(dAngle) / ((d1 + d2) * 0.5);
+  const trackTurnSign = Math.sign(dAngle) || 1;
+
+  const outerPt = outer[bestIdx];
+  const innerPt = inner[bestIdx];
+  const halfWidth = Math.hypot(outerPt.x - innerPt.x, outerPt.y - innerPt.y) * 0.5;
+
+  const dx = bestClosest.x - pt.x;
+  const dy = bestClosest.y - pt.y;
+  const dLen = Math.hypot(dx, dy) || 1;
+  const inwardNormal = { x: dx / dLen, y: dy / dLen };
+
+  // Vector pointing from inner apex toward outer curb of the track at bestIdx
+  const oDx = outerPt.x - innerPt.x;
+  const oDy = outerPt.y - innerPt.y;
+  const oLen = Math.hypot(oDx, oDy) || 1;
+  const outwardEdgeVec = { x: oDx / oLen, y: oDy / oLen };
+
+  const inPoly = isPointInPolygon(pt, outer) && !isPointInPolygon(pt, inner);
+  const onAsphalt = inPoly || minDist <= halfWidth + 2;
+  const onCurbOrGrass = !onAsphalt && minDist <= halfWidth + 14;
+  const hitBarrier = false; // No artificial invisible wall bounce — realistic gravel/grass runoff slows the car down!
+
+  // Compute banking height & roll angle at this point
+  const distToInner = Math.hypot(pt.x - innerPt.x, pt.y - innerPt.y);
+  const radialRatio = Math.max(0, Math.min(1, distToInner / Math.max(1, halfWidth * 2)));
+  const bankHeight = Math.min(4.2, Math.max(0, (trackCurvature - 0.0025) * 340));
+  const elevationZ = onAsphalt ? 0.32 + bankHeight * radialRatio : 0.25;
+  const bankAngleRad = onAsphalt ? Math.atan2(bankHeight, halfWidth * 2) : 0;
+
+  return {
+    onAsphalt,
+    onCurbOrGrass,
+    hitBarrier,
+    closestCenterPt: bestClosest,
+    inwardNormal,
+    outwardEdgeVec,
+    distFromCenter: minDist,
+    halfWidth,
+    trackCurvature,
+    trackTurnSign,
+    elevationZ,
+    bankAngleRad
+  };
+}
+
+// Compute the maximum safe cornering speed for a given path curvature & track curvature
+export function getMaxSafeCornerSpeed(
+  pathCurvatureRadPerPx: number,
+  trackCurvatureRadPerPx: number,
+  carGrip: number,
+  onAsphalt: boolean = true
+): number {
+  if (!onAsphalt) {
+    return 2.4; // Grass/off-track severely limits safe speed
+  }
+  // Good racing line (wide entry, clipping apex) can reduce effective curvature down to 62% of raw centerline curvature
+  const effectiveCurvature = Math.max(pathCurvatureRadPerPx, trackCurvatureRadPerPx * 0.62);
+  if (effectiveCurvature < 0.0022) {
+    return 7.5; // Straightaway — full speed allowed!
+  }
+  // Friction circle physical limit: v_max = sqrt(mu / kappa)
+  const gripFactor = 0.088 * Math.pow(carGrip / 0.075, 0.55);
+  const vMax = Math.sqrt(gripFactor / effectiveCurvature);
+  return Math.max(2.1, Math.min(7.5, vMax));
+}
+
+// Evaluate a drawn path for overspeed corners and optimal straight segments
+export interface SegmentSafetyInfo {
+  index: number;
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  speed: number;
+  maxSafeSpeed: number;
+  overspeedRatio: number; // > 1.12 means too fast for the corner!
+  status: 'optimal_straight' | 'safe_corner' | 'slow_straight' | 'warning_drift' | 'danger_overspeed';
+}
+
+export function analyzeDrawnPathSafety(
+  points: Point[],
+  track: Track,
+  carGrip: number = 0.075
+): {
+  segments: SegmentSafetyInfo[];
+  dangerZones: { x: number; y: number; speedKmh: number; limitKmh: number }[];
+  safetyScore: number;
+} {
+  const segments: SegmentSafetyInfo[] = [];
+  const dangerZones: { x: number; y: number; speedKmh: number; limitKmh: number }[] = [];
+
+  if (points.length < 2) {
+    return { segments, dangerZones, safetyScore: 100 };
+  }
+
+  let dangerCount = 0;
+  let lastDangerPos: TrackPoint | null = null;
+
+  for (let i = 1; i < points.length; i++) {
+    const pPrev = points[Math.max(0, i - 3)];
+    const pCurr = points[i - 1];
+    const pNext = points[Math.min(points.length - 1, i + 2)];
+
+    const d1 = Math.hypot(pCurr.x - pPrev.x, pCurr.y - pPrev.y) || 1;
+    const d2 = Math.hypot(pNext.x - pCurr.x, pNext.y - pCurr.y) || 1;
+    const a1 = Math.atan2(pCurr.y - pPrev.y, pCurr.x - pPrev.x);
+    const a2 = Math.atan2(pNext.y - pCurr.y, pNext.x - pCurr.x);
+    let dAngle = Math.abs(a2 - a1);
+    if (dAngle > Math.PI) dAngle = Math.PI * 2 - dAngle;
+
+    const pathCurvature = dAngle / ((d1 + d2) * 0.5);
+    const surf = getTrackSurfaceInfo(points[i], track);
+    const maxSafe = getMaxSafeCornerSpeed(pathCurvature, surf.trackCurvature, carGrip, surf.onAsphalt);
+
+    const speed = points[i].speed;
+    const overspeedRatio = speed / maxSafe;
+
+    let status: SegmentSafetyInfo['status'] = 'safe_corner';
+    if (!surf.onAsphalt && speed > 2.8) {
+      status = 'danger_overspeed';
+    } else if (overspeedRatio > 1.22) {
+      status = 'danger_overspeed';
+    } else if (overspeedRatio > 1.05) {
+      status = 'warning_drift';
+    } else if (maxSafe >= 5.8) {
+      status = speed >= 4.3 ? 'optimal_straight' : 'slow_straight';
+    } else {
+      status = 'safe_corner';
+    }
+
+    if (status === 'danger_overspeed') {
+      dangerCount++;
+      if (!lastDangerPos || Math.hypot(points[i].x - lastDangerPos.x, points[i].y - lastDangerPos.y) > 55) {
+        dangerZones.push({
+          x: points[i].x,
+          y: points[i].y,
+          speedKmh: Math.round(speed * F1_KMH_FACTOR),
+          limitKmh: Math.round(maxSafe * F1_KMH_FACTOR)
+        });
+        lastDangerPos = { x: points[i].x, y: points[i].y };
+      }
+    }
+
+    segments.push({
+      index: i,
+      x1: points[i - 1].x,
+      y1: points[i - 1].y,
+      x2: points[i].x,
+      y2: points[i].y,
+      speed,
+      maxSafeSpeed: maxSafe,
+      overspeedRatio,
+      status
+    });
+  }
+
+  const safetyScore = Math.max(
+    25,
+    Math.round(100 - (dangerCount / Math.max(1, points.length)) * 160)
+  );
+
+  return { segments, dangerZones, safetyScore };
+}
+
+// Resample and smooth any drawn path into uniform arc-length points
+export function resampleAndSmoothPath(rawPath: Point[], stepDist: number = 5): Point[] {
+  if (rawPath.length < 2) return rawPath;
+
+  const smoothedCoords: Point[] = rawPath.map((pt, idx) => {
+    if (idx === 0 || idx === rawPath.length - 1) return { ...pt };
+    const prev = rawPath[idx - 1];
+    const next = rawPath[idx + 1];
+    return {
+      x: pt.x * 0.6 + (prev.x + next.x) * 0.2,
+      y: pt.y * 0.6 + (prev.y + next.y) * 0.2,
+      t: pt.t,
+      speed: pt.speed * 0.6 + (prev.speed + next.speed) * 0.2
+    };
+  });
+
+  const resampled: Point[] = [{ ...smoothedCoords[0] }];
+  let accumDist = 0;
+
+  for (let i = 1; i < smoothedCoords.length; i++) {
+    let p1 = smoothedCoords[i - 1];
+    const p2 = smoothedCoords[i];
+    let segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    if (segDist < 0.001) continue;
+
+    while (accumDist + segDist >= stepDist) {
+      const remain = stepDist - accumDist;
+      const ratio = remain / segDist;
+      const nx = p1.x + (p2.x - p1.x) * ratio;
+      const ny = p1.y + (p2.y - p1.y) * ratio;
+      const nt = p1.t + (p2.t - p1.t) * ratio;
+      const nSpeed = p1.speed + (p2.speed - p1.speed) * ratio;
+
+      const newPt: Point = { x: nx, y: ny, t: nt, speed: nSpeed };
+      resampled.push(newPt);
+
+      p1 = newPt;
+      segDist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+      accumDist = 0;
+    }
+    accumDist += segDist;
+  }
+
+  const lastRaw = smoothedCoords[smoothedCoords.length - 1];
+  const lastRes = resampled[resampled.length - 1];
+  if (Math.hypot(lastRaw.x - lastRes.x, lastRaw.y - lastRes.y) > 1) {
+    resampled.push({ ...lastRaw });
+  }
+
+  return resampled;
+}
+
 // Generate the baseline or apex-optimized racing line for CPU players
-// Supports AI archetypes ('apex_master' | 'aggressive' | 'defensive') and grid placement
 export function generateAIPath(
   track: Track,
   stepsCount: number = 320,
-  archetype: import('../types').AIArchetype = 'apex_master',
+  archetype: AIArchetype = 'apex_master',
   gridIdx: number = 0
 ): Point[] {
   const outer = track.outerBoundary;
   const inner = track.innerBoundary;
   const len = Math.min(outer.length, inner.length);
-  
-  // 1. Calculate centerline points and track width normals
-  const centerline: TrackPoint[] = [];
-  const trackVectors: { nx: number; ny: number; width: number }[] = [];
 
+  const centerline: TrackPoint[] = [];
   for (let i = 0; i < len; i++) {
     const cx = (outer[i].x + inner[i].x) / 2;
     const cy = (outer[i].y + inner[i].y) / 2;
     centerline.push({ x: cx, y: cy });
-
-    const dx = outer[i].x - inner[i].x;
-    const dy = outer[i].y - inner[i].y;
-    const width = Math.hypot(dx, dy);
-    trackVectors.push({
-      nx: width > 0 ? dx / width : 0,
-      ny: width > 0 ? dy / width : 0,
-      width
-    });
   }
 
-  // 2. Find closest point on centerline to start grid
   const startGridPt = track.startGrid[gridIdx] || track.startGrid[0];
   const startX = startGridPt.x;
   const startY = startGridPt.y;
@@ -415,7 +744,6 @@ export function generateAIPath(
     }
   }
 
-  // 3. Determine forward direction along the track relative to startGrid angle
   const forwardGridVec = {
     x: Math.cos(startGridPt.angle),
     y: Math.sin(startGridPt.angle)
@@ -437,7 +765,6 @@ export function generateAIPath(
   const bwdDot = bwdTangent.x * forwardGridVec.x + bwdTangent.y * forwardGridVec.y;
   const isForward = fwdDot >= bwdDot;
 
-  // 4. Reorder track nodes and compute geometric racing line (late apex shift)
   const orderedNodes: { pt: TrackPoint; outerPt: TrackPoint; innerPt: TrackPoint }[] = [];
   for (let i = 0; i < len; i++) {
     const index = isForward ? (startIdx + i) % len : (startIdx - i + len * 10) % len;
@@ -448,40 +775,33 @@ export function generateAIPath(
     });
   }
 
-  // Curvature-based spline relaxation for optimal racing line:
-  // "Out-In-Out" trajectory calculation
   const optimizedNodes: TrackPoint[] = [];
   const nodeCount = orderedNodes.length;
 
   for (let i = 0; i < nodeCount; i++) {
-    const prev = orderedNodes[(i - 1 + nodeCount) % nodeCount].pt;
+    const prev = orderedNodes[(i - 2 + nodeCount) % nodeCount].pt;
     const curr = orderedNodes[i].pt;
-    const next = orderedNodes[(i + 1) % nodeCount].pt;
+    const next = orderedNodes[(i + 2) % nodeCount].pt;
 
-    // Estimate curvature using discrete turn angle
     const v1 = { x: curr.x - prev.x, y: curr.y - prev.y };
     const v2 = { x: next.x - curr.x, y: next.y - curr.y };
-    const cross = v1.x * v2.y - v1.y * v2.x; // positive = turns right/inner, negative = turns left/outer
+    const cross = v1.x * v2.y - v1.y * v2.x;
 
-    let shift = 0; // -0.5 is inner boundary, +0.5 is outer boundary
+    let shift = 0;
     if (archetype === 'apex_master') {
-      // Classic late-apex racing line: clips inside apex, uses outside on entry and exit
-      const curvature = Math.abs(cross) / 500;
-      const turnBias = cross > 0 ? -0.38 : 0.38;
-      shift = Math.max(-0.42, Math.min(0.42, turnBias * Math.min(1.0, curvature * 1.5)));
+      const curvature = Math.abs(cross) / 900;
+      const turnBias = cross > 0 ? -0.32 : 0.32;
+      shift = Math.max(-0.34, Math.min(0.34, turnBias * Math.min(1.0, curvature * 1.4)));
     } else if (archetype === 'aggressive') {
-      // Aggressive cuts early and deeper, carrying maximum velocity
-      const curvature = Math.abs(cross) / 450;
-      const turnBias = cross > 0 ? -0.45 : 0.45;
-      shift = Math.max(-0.46, Math.min(0.46, turnBias * Math.min(1.1, curvature * 1.6)));
+      const curvature = Math.abs(cross) / 800;
+      const turnBias = cross > 0 ? -0.38 : 0.38;
+      shift = Math.max(-0.38, Math.min(0.38, turnBias * Math.min(1.1, curvature * 1.5)));
     } else {
-      // Defensive stays conservative within 15% of track center
-      shift = Math.sin(i * 0.2) * 0.12;
+      shift = Math.sin(i * 0.2) * 0.1;
     }
 
     const innerP = orderedNodes[i].innerPt;
     const outerP = orderedNodes[i].outerPt;
-    // 0.5 is centerline; 0.0 is inner; 1.0 is outer
     const factor = 0.5 + shift;
     optimizedNodes.push({
       x: innerP.x + (outerP.x - innerP.x) * factor,
@@ -489,73 +809,78 @@ export function generateAIPath(
     });
   }
 
-  // Anchor to exact start grid and loop through finish line
-  optimizedNodes.unshift({ x: startX, y: startY });
-  const finishHeading = isForward ? (startIdx + 3) % len : (startIdx - 3 + len * 10) % len;
-  optimizedNodes.push({ x: startX, y: startY });
-  optimizedNodes.push(centerline[finishHeading]);
+  const smoothedControl: TrackPoint[] = optimizedNodes.map((pt, i) => {
+    const prev = optimizedNodes[(i - 1 + nodeCount) % nodeCount];
+    const next = optimizedNodes[(i + 1) % nodeCount];
+    return {
+      x: pt.x * 0.5 + (prev.x + next.x) * 0.25,
+      y: pt.y * 0.5 + (prev.y + next.y) * 0.25
+    };
+  });
 
-  // 5. Interpolate points for super smooth spline tracking
+  const fullLoopNodes: TrackPoint[] = [
+    { x: startX, y: startY },
+    ...smoothedControl.slice(1),
+    smoothedControl[0],
+    smoothedControl[1],
+    smoothedControl[2],
+    smoothedControl[3]
+  ];
+
   const finalPath: TrackPoint[] = [];
   for (let s = 0; s < stepsCount; s++) {
     const ratio = s / (stepsCount - 1);
-    const floatIdx = ratio * (optimizedNodes.length - 1);
+    const floatIdx = ratio * (fullLoopNodes.length - 1);
     const idx = Math.floor(floatIdx);
-    const nIdx = Math.min(idx + 1, optimizedNodes.length - 1);
+    const nIdx = Math.min(idx + 1, fullLoopNodes.length - 1);
     const t = floatIdx - idx;
-    // Cosine smoothing
     const tSmooth = (1 - Math.cos(t * Math.PI)) / 2;
 
     finalPath.push({
-      x: optimizedNodes[idx].x + (optimizedNodes[nIdx].x - optimizedNodes[idx].x) * tSmooth,
-      y: optimizedNodes[idx].y + (optimizedNodes[nIdx].y - optimizedNodes[idx].y) * tSmooth,
+      x: fullLoopNodes[idx].x + (fullLoopNodes[nIdx].x - fullLoopNodes[idx].x) * tSmooth,
+      y: fullLoopNodes[idx].y + (fullLoopNodes[nIdx].y - fullLoopNodes[idx].y) * tSmooth
     });
   }
 
-  // 6. Assign speed profile tailored by archetype
+  // Assign physical speed profile that respects corner grip limits (braking before corners, full throttle on straights)
   const idealAIPath: Point[] = [];
   let currentTime = 0;
 
-  // Base parameters per archetype
-  const maxStraightSpeed = archetype === 'aggressive' ? 6.2 : archetype === 'apex_master' ? 5.9 : 5.4;
-  const minCornerSpeed = archetype === 'aggressive' ? 2.5 : archetype === 'apex_master' ? 2.3 : 2.0;
+  const maxStraightSpeed =
+    archetype === 'aggressive' ? 5.8 : archetype === 'apex_master' ? 5.6 : 5.1;
+  const cautionFactor =
+    archetype === 'aggressive' ? 1.06 : archetype === 'apex_master' ? 0.96 : 0.88;
 
   for (let i = 0; i < finalPath.length; i++) {
     const curr = finalPath[i];
-    const prev = finalPath[Math.max(0, i - 1)];
-    const next = finalPath[Math.min(finalPath.length - 1, i + 1)];
-    const nextAhead = finalPath[Math.min(finalPath.length - 1, i + 7)];
+    const prev = finalPath[Math.max(0, i - 3)];
+    const next = finalPath[Math.min(finalPath.length - 1, i + 3)];
+    const nextAhead = finalPath[Math.min(finalPath.length - 1, i + 8)];
 
-    // Curvature calculation
-    const d1x = curr.x - prev.x;
-    const d1y = curr.y - prev.y;
-    const d2x = next.x - curr.x;
-    const d2y = next.y - curr.y;
-
-    const angle1 = Math.atan2(d1y, d1x);
-    const angle2 = Math.atan2(d2y, d2x);
-    let diff = Math.abs(angle2 - angle1);
+    const d1 = Math.hypot(curr.x - prev.x, curr.y - prev.y) || 1;
+    const d2 = Math.hypot(next.x - curr.x, next.y - curr.y) || 1;
+    const a1 = Math.atan2(curr.y - prev.y, curr.x - prev.x);
+    const a2 = Math.atan2(next.y - curr.y, next.x - curr.x);
+    let diff = Math.abs(a2 - a1);
     if (diff > Math.PI) diff = Math.PI * 2 - diff;
+    const localCurvature = diff / ((d1 + d2) * 0.5);
 
-    // Look ahead to brake in advance before entering corners
-    const d3x = nextAhead.x - curr.x;
-    const d3y = nextAhead.y - curr.y;
-    const angle3 = Math.atan2(d3y, d3x);
-    let diffAhead = Math.abs(angle3 - angle1);
+    // Look ahead curvature for braking zone
+    const d3 = Math.hypot(nextAhead.x - curr.x, nextAhead.y - curr.y) || 1;
+    const a3 = Math.atan2(nextAhead.y - curr.y, nextAhead.x - curr.x);
+    let diffAhead = Math.abs(a3 - a1);
     if (diffAhead > Math.PI) diffAhead = Math.PI * 2 - diffAhead;
+    const aheadCurvature = diffAhead / d3;
 
-    const maxCurvature = Math.max(diff * 3.5, diffAhead);
+    const surf = getTrackSurfaceInfo(curr, track);
+    const safeHere = getMaxSafeCornerSpeed(localCurvature, surf.trackCurvature, 0.075, true);
+    const safeAhead = getMaxSafeCornerSpeed(aheadCurvature, surf.trackCurvature * 0.8, 0.075, true);
 
-    let targetSpeed = maxStraightSpeed;
-    if (maxCurvature > 0.14) {
-      targetSpeed = Math.max(minCornerSpeed, maxStraightSpeed - maxCurvature * 6.2);
-    }
+    let targetSpeed = Math.min(maxStraightSpeed, Math.min(safeHere, safeAhead) * cautionFactor);
+    targetSpeed += Math.sin(i * 0.25) * 0.06;
+    targetSpeed = Math.max(2.1, Math.min(maxStraightSpeed, targetSpeed));
 
-    // Add subtle human-like variance
-    targetSpeed += Math.sin(i * 0.35) * 0.12;
-    targetSpeed = Math.max(1.8, Math.min(6.3, targetSpeed));
-
-    const dist = i === 0 ? 0 : Math.hypot(curr.x - prev.x, curr.y - prev.y);
+    const dist = i === 0 ? 0 : Math.hypot(curr.x - finalPath[i - 1].x, curr.y - finalPath[i - 1].y);
     const dt = targetSpeed > 0 ? dist / targetSpeed : 16;
     currentTime += dt;
 
@@ -593,7 +918,6 @@ export function computeTelemetryEvaluation(
 
   let totalSpeed = 0;
   let maxSpeed = 0;
-  let lateralGAccum = 0;
   let maxLateralG = 0;
   let jerkAccum = 0;
 
@@ -605,7 +929,6 @@ export function computeTelemetryEvaluation(
     totalSpeed += pCurr.speed;
     if (pCurr.speed > maxSpeed) maxSpeed = pCurr.speed;
 
-    // Angular acceleration / Lateral G
     const dx1 = pCurr.x - pPrev.x;
     const dy1 = pCurr.y - pPrev.y;
     const dx2 = pNext.x - pCurr.x;
@@ -617,10 +940,8 @@ export function computeTelemetryEvaluation(
     if (deltaA > Math.PI) deltaA = Math.PI * 2 - deltaA;
 
     const latG = (pCurr.speed * pCurr.speed * deltaA) / 10;
-    lateralGAccum += latG;
     if (latG > maxLateralG) maxLateralG = latG;
 
-    // Jerk (derivative of acceleration)
     const accel1 = pCurr.speed - pPrev.speed;
     const accel2 = pNext.speed - pCurr.speed;
     jerkAccum += Math.abs(accel2 - accel1);
@@ -630,12 +951,11 @@ export function computeTelemetryEvaluation(
   const avgSpeed = count > 0 ? totalSpeed / count : 4.0;
   const avgJerk = count > 0 ? jerkAccum / count : 0.5;
 
-  // Smoothness: penalizes erratic hand jerks
+  const safetyAnalysis = analyzeDrawnPathSafety(drawnPath, track, 0.075);
   const smoothnessScore = Math.max(40, Math.min(98, Math.round(100 - avgJerk * 180)));
-
-  // Apex accuracy: reward proper speed modulation (braking into corners and accelerating out)
-  const speedVariability = maxSpeed - Math.min(...drawnPath.map(p => p.speed));
-  const apexScore = Math.max(50, Math.min(99, Math.round(65 + Math.min(30, speedVariability * 8))));
+  const speedVariability = maxSpeed - Math.min(...drawnPath.map((p) => p.speed));
+  const rawApex = 60 + Math.min(25, speedVariability * 7) + (safetyAnalysis.safetyScore - 70) * 0.4;
+  const apexScore = Math.max(45, Math.min(99, Math.round(rawApex)));
 
   return {
     apexScore,
@@ -644,5 +964,106 @@ export function computeTelemetryEvaluation(
     maxSpeed: Number(maxSpeed.toFixed(2)),
     maxLateralG: Number(Math.min(3.5, maxLateralG).toFixed(2))
   };
+}
+
+export interface PerfectLapCallout {
+  x: number;
+  y: number;
+  speedKmh: number;
+  type: 'straight' | 'corner';
+  label: string;
+}
+
+export const F1_KMH_FACTOR = 46;
+
+// Compute the "Perfect Lap" ideal path and key corner/straight speed callout badges for any track
+export function getPerfectLapGuide(
+  track: Track,
+  carGrip: number = 0.08,
+  gridIdx: number = 0
+): {
+  perfectPath: Point[];
+  callouts: PerfectLapCallout[];
+} {
+  const basePath = generateAIPath(track, 220, 'apex_master', gridIdx);
+  const perfectPath: Point[] = [];
+  let accumT = 0;
+
+  for (let i = 0; i < basePath.length; i++) {
+    const curr = basePath[i];
+    const prev = basePath[Math.max(0, i - 3)];
+    const next = basePath[Math.min(basePath.length - 1, i + 3)];
+    const ahead = basePath[Math.min(basePath.length - 1, i + 7)];
+
+    const d1 = Math.hypot(curr.x - prev.x, curr.y - prev.y) || 1;
+    const d2 = Math.hypot(next.x - curr.x, next.y - curr.y) || 1;
+    const a1 = Math.atan2(curr.y - prev.y, curr.x - prev.x);
+    const a2 = Math.atan2(next.y - curr.y, next.x - curr.x);
+    let diff = Math.abs(a2 - a1);
+    if (diff > Math.PI) diff = Math.PI * 2 - diff;
+    const localCurv = diff / ((d1 + d2) * 0.5);
+
+    const d3 = Math.hypot(ahead.x - curr.x, ahead.y - curr.y) || 1;
+    const a3 = Math.atan2(ahead.y - curr.y, ahead.x - curr.x);
+    let diffAhead = Math.abs(a3 - a1);
+    if (diffAhead > Math.PI) diffAhead = Math.PI * 2 - diffAhead;
+    const aheadCurv = diffAhead / d3;
+
+    const surf = getTrackSurfaceInfo(curr, track);
+    const safeHere = getMaxSafeCornerSpeed(localCurv, surf.trackCurvature, carGrip, true);
+    const safeAhead = getMaxSafeCornerSpeed(aheadCurv, surf.trackCurvature * 0.85, carGrip, true);
+
+    const idealSpeed = Math.max(2.4, Math.min(7.35, Math.min(safeHere, safeAhead) * 0.98));
+    const stepDist = i === 0 ? 0 : Math.hypot(curr.x - basePath[i - 1].x, curr.y - basePath[i - 1].y);
+    accumT += (stepDist / idealSpeed) * 14;
+
+    perfectPath.push({
+      x: curr.x,
+      y: curr.y,
+      t: accumT,
+      speed: idealSpeed
+    });
+  }
+
+  // Extract 6 well-spaced speed callout anchors around the lap (fastest straights & slowest corner apexes)
+  const callouts: PerfectLapCallout[] = [];
+  const total = perfectPath.length;
+  const numBuckets = 6;
+  const bucketSize = Math.floor((total - 16) / numBuckets);
+
+  for (let b = 0; b < numBuckets; b++) {
+    const start = 8 + b * bucketSize;
+    const end = Math.min(total - 8, start + bucketSize);
+
+    let minPt = perfectPath[start];
+    let maxPt = perfectPath[start];
+    for (let i = start; i < end; i++) {
+      if (perfectPath[i].speed < minPt.speed) minPt = perfectPath[i];
+      if (perfectPath[i].speed > maxPt.speed) maxPt = perfectPath[i];
+    }
+
+    // Decide whether this sector is best represented by a braking corner apex or a high-speed F1 straight
+    if (minPt.speed < 4.5) {
+      const kmh = Math.round(minPt.speed * F1_KMH_FACTOR);
+      callouts.push({
+        x: minPt.x,
+        y: minPt.y,
+        speedKmh: kmh,
+        type: 'corner',
+        label: `CURVA ${kmh} km/h`
+      });
+    } else {
+      const kmh = Math.round(maxPt.speed * F1_KMH_FACTOR);
+      callouts.push({
+        x: maxPt.x,
+        y: maxPt.y,
+        speedKmh: kmh,
+        type: 'straight',
+        label: `RECTA ${kmh} km/h`
+      });
+    }
+  }
+
+  return { perfectPath, callouts };
 }
 

@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { Track, Player, RaceResultItem, PlayerTelemetry, Point } from '../types';
-import { getTrackCenterline } from '../utils/tracks';
+import { getTrackCenterline, F1_KMH_FACTOR } from '../utils/tracks';
 import { Play, Pause, RotateCcw, Download, Sparkles, Activity, Gauge, Zap, Compass, Trophy } from 'lucide-react';
 
 interface TelemetryLabProps {
@@ -215,15 +215,15 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
           <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-800">
             <div className="text-xs text-slate-400">Velocidad Promedio</div>
             <div className="text-2xl font-bold font-mono text-white mt-1">
-              {playerTelemetry?.avgSpeed ? (playerTelemetry.avgSpeed * 22).toFixed(1) : '94.2'} km/h
+              {playerTelemetry?.avgSpeed ? (playerTelemetry.avgSpeed * F1_KMH_FACTOR).toFixed(1) : '218.5'} km/h
             </div>
-            <div className="text-[11px] text-slate-400 mt-0.5">Ritmo medio en vuelta</div>
+            <div className="text-[11px] text-slate-400 mt-0.5">Ritmo medio de vuelta F1</div>
           </div>
 
           <div className="p-3.5 rounded-xl bg-slate-900 border border-slate-800">
-            <div className="text-xs text-slate-400">Velocidad Máxima</div>
+            <div className="text-xs text-slate-400">Velocidad Punta F1</div>
             <div className="text-2xl font-bold font-mono text-rose-400 mt-1">
-              {playerTelemetry?.maxSpeed ? (playerTelemetry.maxSpeed * 24).toFixed(1) : '146.4'} km/h
+              {playerTelemetry?.maxSpeed ? (playerTelemetry.maxSpeed * F1_KMH_FACTOR).toFixed(1) : '338.0'} km/h
             </div>
             <div className="text-[11px] text-slate-400 mt-0.5">Al final de recta principal</div>
           </div>
@@ -387,7 +387,7 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                 <div className="flex justify-between font-mono">
                   <span className="text-slate-400">Velocidad:</span>
                   <span className="text-white font-semibold">
-                    {currentSample ? (currentSample.speed * 22).toFixed(1) : '0.0'} km/h
+                    {currentSample ? (currentSample.speed * F1_KMH_FACTOR).toFixed(1) : '0.0'} km/h
                   </span>
                 </div>
                 <div className="flex justify-between font-mono">
@@ -482,19 +482,19 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                   <line key={y} x1="40" y1={y} x2="780" y2={y} stroke="rgba(255,255,255,0.06)" />
                 ))}
 
-                {/* Y-axis speed labels */}
-                <text x="35" y="10" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">160 km/h</text>
-                <text x="35" y="70" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">120 km/h</text>
-                <text x="35" y="130" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">80 km/h</text>
-                <text x="35" y="190" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">40 km/h</text>
+                {/* Y-axis speed labels (Formula 1 scale) */}
+                <text x="38" y="10" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">360 km/h</text>
+                <text x="38" y="70" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">270 km/h</text>
+                <text x="38" y="130" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">180 km/h</text>
+                <text x="38" y="190" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">90 km/h</text>
 
                 {/* AI Speed Profile curve */}
                 {aiPlayer && aiPlayer.drawnPath.length > 1 && (
                   <path
                     d={`M ${aiPlayer.drawnPath
                       .map((p, i) => {
-                        const x = 40 + (i / (aiPlayer.drawnPath.length - 1)) * 740;
-                        const y = 200 - (p.speed / 7.2) * 190;
+                        const x = 44 + (i / (aiPlayer.drawnPath.length - 1)) * 736;
+                        const y = Math.max(8, Math.min(220, 200 - (p.speed / 8.0) * 190));
                         return `${x},${y}`;
                       })
                       .join(' L ')}`}
@@ -510,8 +510,8 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                   <path
                     d={`M ${selectedPlayer.drawnPath
                       .map((p, i) => {
-                        const x = 40 + (i / (selectedPlayer.drawnPath.length - 1)) * 740;
-                        const y = 200 - (p.speed / 7.2) * 190;
+                        const x = 44 + (i / (selectedPlayer.drawnPath.length - 1)) * 736;
+                        const y = Math.max(8, Math.min(220, 200 - (p.speed / 8.0) * 190));
                         return `${x},${y}`;
                       })
                       .join(' L ')}`}

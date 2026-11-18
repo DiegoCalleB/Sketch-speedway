@@ -608,6 +608,16 @@ export const GameUI: React.FC<GameUIProps> = ({
                 <RotateCcw className="w-4 h-4" />
                 Volver a Jugar
               </button>
+
+              <button
+                onClick={() => {
+                  audio.playBeep(330, 0.1, 'sine');
+                  useGameStore.getState().goToMenu();
+                }}
+                className="flex items-center gap-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold py-2.5 px-5 rounded-xl cursor-pointer transition-colors"
+              >
+                Menú Principal (Cambiar Modo)
+              </button>
             </div>
           </div>
         )

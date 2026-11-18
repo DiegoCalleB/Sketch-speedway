@@ -1,4 +1,13 @@
-import { isPointInPolygon, getDistance, lineIntersects, checkSegmentCrossing, generateAIPath, computeTelemetryEvaluation, getTrackCenterline, TRACKS } from './tracks';
+import {
+  isPointInPolygon,
+  lineIntersects,
+  generateAIPath,
+  computeTelemetryEvaluation,
+  getTrackCenterline,
+  getMaxSafeCornerSpeed,
+  analyzeDrawnPathSafety,
+  TRACKS
+} from './tracks';
 
 function assert(condition: boolean, message: string) {
   if (!condition) {
@@ -32,7 +41,12 @@ const l4a = { x: 0, y: 5 };
 const l4b = { x: 10, y: 5 };
 assert(!lineIntersects(l3a, l3b, l4a, l4b), 'Parallel segments do not intersect');
 
-// 3. Track validity tests for all 3 circuits
+// 3. Corner speed limit physics test
+const straightLimit = getMaxSafeCornerSpeed(0.0005, 0.0005, 0.2, true);
+const tightCornerLimit = getMaxSafeCornerSpeed(0.025, 0.025, 0.2, true);
+assert(straightLimit > tightCornerLimit * 1.4, `Straight speed limit (${straightLimit.toFixed(2)}) > tight corner limit (${tightCornerLimit.toFixed(2)})`);
+
+// 4. Track validity tests for all 3 circuits
 for (const track of TRACKS) {
   assert(track.outerBoundary.length >= 20, `${track.name}: Outer boundary vertices count sufficient (${track.outerBoundary.length})`);
   assert(track.innerBoundary.length >= 20, `${track.name}: Inner boundary vertices count sufficient (${track.innerBoundary.length})`);
@@ -53,6 +67,11 @@ for (const track of TRACKS) {
   const defPath = generateAIPath(track, 150, 'defensive', 2);
   assert(defPath.length === 150, `${track.name}: Defensive path generated with 150 nodes`);
 
+  // Safety analysis on reckless overspeed path vs controlled AI path
+  const recklessPath = apexPath.map((pt) => ({ ...pt, speed: 6.9 }));
+  const recklessSafety = analyzeDrawnPathSafety(recklessPath, track, 0.2);
+  assert(recklessSafety.dangerZones.length > 0, `${track.name}: Reckless 6.9 speed in corners triggers dangerZones (${recklessSafety.dangerZones.length})`);
+
   // Telemetry Evaluation
   const evalMetrics = computeTelemetryEvaluation(apexPath, track);
   assert(evalMetrics.apexScore >= 50 && evalMetrics.apexScore <= 100, `${track.name}: Apex score within bounds [50-100] (${evalMetrics.apexScore})`);
@@ -61,3 +80,4 @@ for (const track of TRACKS) {
 }
 
 console.log('--- ALL ACADEMIC TESTS PASSED SUCCESSFULLY ---');
+
