@@ -4,7 +4,7 @@ import { motion } from 'motion/react';
 import { Trophy, Users, Cpu, Sliders, Volume2, VolumeX, Play, RotateCcw, HelpCircle, Check, Flag, Car, Zap, Sparkles, Activity, Video } from 'lucide-react';
 import { audio } from '../utils/audio';
 import { TelemetryLab } from './TelemetryLab';
-import { useGameStore } from '../store/gameStore';
+import { useGameStore, CAR_LIVERY_PALETTE } from '../store/gameStore';
 import { PWAInstallButton } from './PWAControls';
 
 interface GameUIProps {
@@ -17,7 +17,15 @@ interface GameUIProps {
   gameMode: 'solo' | 'ai' | 'multiplayer';
   onSelectTrack: (track: Track) => void;
   onSetGameMode: (mode: 'solo' | 'ai' | 'multiplayer') => void;
-  onSetupPlayers: (playersSetup: { name: string; carType: CarType; isAI: boolean; aiArchetype?: AIArchetype }[]) => void;
+  onSetupPlayers: (
+    playersSetup: {
+      name: string;
+      carType: CarType;
+      color?: string;
+      isAI: boolean;
+      aiArchetype?: AIArchetype;
+    }[]
+  ) => void;
   onStartDrawing: () => void;
   onStartRace: () => void;
   raceResults: RaceResultItem[] | null;
@@ -88,15 +96,25 @@ export const GameUI: React.FC<GameUIProps> = ({
     }
   }, [phase, raceResults, selectedTrack.id]);
   
-  // Local state for player registration form
-  const [playersForm, setPlayersForm] = useState<{[key: number]: { name: string; carType: CarType }}>({
-    0: { name: 'Jugador 1', carType: 'balanced' },
-    1: { name: 'Jugador 2', carType: 'drifter' },
-    2: { name: 'Jugador 3', carType: 'speedster' },
-    3: { name: 'Jugador 4', carType: 'balanced' },
+  // Local state for player registration form (each slot has a guaranteed unique high-contrast livery color!)
+  const [playersForm, setPlayersForm] = useState<{
+    [key: number]: { name: string; carType: CarType; color: string };
+  }>({
+    0: { name: 'Jugador 1', carType: 'balanced', color: CAR_LIVERY_PALETTE[0].hex },
+    1: { name: 'Jugador 2', carType: 'drifter', color: CAR_LIVERY_PALETTE[1].hex },
+    2: { name: 'Jugador 3', carType: 'speedster', color: CAR_LIVERY_PALETTE[2].hex },
+    3: { name: 'Jugador 4', carType: 'balanced', color: CAR_LIVERY_PALETTE[3].hex }
   });
-  
+  const [aiColor, setAiColor] = useState<string>(CAR_LIVERY_PALETTE[1].hex);
+
   const [numPlayers, setNumPlayers] = useState(2); // for multiplayer local
+
+  const resolvedAiColor =
+    aiColor.toLowerCase() === playersForm[0].color.toLowerCase()
+      ? CAR_LIVERY_PALETTE.find(
+          (c) => c.hex.toLowerCase() !== playersForm[0].color.toLowerCase()
+        )?.hex || CAR_LIVERY_PALETTE[1].hex
+      : aiColor;
 
   const handleMuteToggle = () => {
     const nextMute = audio.toggleMute();
@@ -104,7 +122,7 @@ export const GameUI: React.FC<GameUIProps> = ({
   };
 
   const handleFormChange = (idx: number, field: 'name' | 'carType', value: string) => {
-    setPlayersForm(prev => ({
+    setPlayersForm((prev) => ({
       ...prev,
       [idx]: {
         ...prev[idx],
@@ -113,24 +131,63 @@ export const GameUI: React.FC<GameUIProps> = ({
     }));
   };
 
+  const handlePlayerColorChange = (idx: number, newHex: string) => {
+    setPlayersForm((prev) => {
+      const oldHex = prev[idx].color;
+      if (oldHex.toLowerCase() === newHex.toLowerCase()) return prev;
+      const next = { ...prev };
+      // If another pilot currently owns this color, swap cleanly so every car stays 100% unique
+      Object.keys(next).forEach((k) => {
+        const otherIdx = Number(k);
+        if (otherIdx !== idx && next[otherIdx].color.toLowerCase() === newHex.toLowerCase()) {
+          next[otherIdx] = { ...next[otherIdx], color: oldHex };
+        }
+      });
+      next[idx] = { ...next[idx], color: newHex };
+      return next;
+    });
+
+    if (idx === 0 && aiColor.toLowerCase() === newHex.toLowerCase()) {
+      const fallbackAi =
+        CAR_LIVERY_PALETTE.find((c) => c.hex.toLowerCase() !== newHex.toLowerCase())?.hex ||
+        CAR_LIVERY_PALETTE[1].hex;
+      setAiColor(fallbackAi);
+    }
+    audio.playBeep(520, 0.05, 'sine');
+  };
+
   const handleStartSetup = () => {
-    const list: { name: string; carType: CarType; isAI: boolean; aiArchetype?: AIArchetype }[] = [];
-    
+    const list: {
+      name: string;
+      carType: CarType;
+      color?: string;
+      isAI: boolean;
+      aiArchetype?: AIArchetype;
+    }[] = [];
+
     if (gameMode === 'solo') {
       list.push({
         name: playersForm[0].name || 'Piloto Solo',
         carType: playersForm[0].carType,
+        color: playersForm[0].color,
         isAI: false
       });
     } else if (gameMode === 'ai') {
       list.push({
         name: playersForm[0].name || 'Jugador',
         carType: playersForm[0].carType,
+        color: playersForm[0].color,
         isAI: false
       });
       list.push({
-        name: selectedAiArchetype === 'apex_master' ? 'Apex Master IA' : selectedAiArchetype === 'aggressive' ? 'Predator IA' : 'Guardian IA',
+        name:
+          selectedAiArchetype === 'apex_master'
+            ? 'Apex Master IA'
+            : selectedAiArchetype === 'aggressive'
+              ? 'Predator IA'
+              : 'Guardian IA',
         carType: 'balanced',
+        color: resolvedAiColor,
         isAI: true,
         aiArchetype: selectedAiArchetype
       });
@@ -139,11 +196,12 @@ export const GameUI: React.FC<GameUIProps> = ({
         list.push({
           name: playersForm[i].name || `Jugador ${i + 1}`,
           carType: playersForm[i].carType,
+          color: playersForm[i].color,
           isAI: false
         });
       }
     }
-    
+
     onSetupPlayers(list);
     audio.playBeep(440, 0.1, 'sine');
   };
@@ -174,14 +232,14 @@ export const GameUI: React.FC<GameUIProps> = ({
         </div>
 
         {/* Audio & Install App controls */}
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-1.5 sm:gap-2 shrink-0">
           <PWAInstallButton />
           <button
             onClick={handleMuteToggle}
-            className="flex items-center gap-1.5 px-2.5 py-1 sm:px-3.5 sm:py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 text-slate-300 transition-colors cursor-pointer"
+            className="flex items-center gap-1.5 px-2.5 py-2 sm:px-3.5 sm:py-1.5 min-h-[38px] rounded-lg border border-slate-800 hover:bg-slate-800 active:scale-95 text-slate-300 transition-all cursor-pointer"
           >
-            {isMuted ? <VolumeX className="w-3.5 h-3.5 text-rose-400" /> : <Volume2 className="w-3.5 h-3.5 text-emerald-400" />}
-            <span className="text-[10px] sm:text-xs font-mono font-bold">{isMuted ? 'MUTE' : 'SONIDO'}</span>
+            {isMuted ? <VolumeX className="w-4 h-4 text-rose-400" /> : <Volume2 className="w-4 h-4 text-emerald-400" />}
+            <span className="text-[11px] sm:text-xs font-mono font-bold">{isMuted ? 'MUTE' : 'SONIDO'}</span>
           </button>
         </div>
       </div>
@@ -359,7 +417,7 @@ export const GameUI: React.FC<GameUIProps> = ({
                 audio.playBeep(440, 0.1, 'sine');
                 onRestart(); // Move to Car Selection screen
               }}
-              className="mt-2 flex items-center justify-center gap-2 bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-500 hover:to-amber-600 text-slate-950 font-bold py-3 px-6 rounded-xl shadow-lg transition-transform hover:scale-[1.02] cursor-pointer"
+              className="mt-2 min-h-[48px] flex items-center justify-center gap-2 bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-500 hover:to-amber-600 active:scale-[0.98] text-slate-950 font-bold py-3 px-6 rounded-xl shadow-lg transition-all hover:scale-[1.02] cursor-pointer"
             >
               Configurar Pilotos
               <Play className="w-4 h-4 fill-slate-950" />
@@ -409,13 +467,19 @@ export const GameUI: React.FC<GameUIProps> = ({
               <div key={idx} className="flex flex-col gap-3.5 bg-slate-950/40 border border-slate-800/80 p-4 rounded-xl">
                 <div className="flex items-center justify-between">
                   <span className="text-xs font-extrabold text-amber-400 uppercase tracking-wider font-mono">Piloto #{idx + 1}</span>
-                  <div className="flex gap-1">
-                    <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: carStats[playersForm[idx].carType].color }} />
-                    <span className="text-[10px] text-slate-400 capitalize font-mono">{playersForm[idx].carType}</span>
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className="w-3 h-3 rounded-full ring-2 ring-white/25"
+                      style={{ backgroundColor: playersForm[idx].color }}
+                    />
+                    <span className="text-[10px] text-slate-300 font-mono font-bold">
+                      {CAR_LIVERY_PALETTE.find((c) => c.hex === playersForm[idx].color)?.name ||
+                        playersForm[idx].carType}
+                    </span>
                   </div>
                 </div>
 
-                {/* Name Input */}
+                {/* Name Input (16px on mobile prevents iPhone Safari automatic viewport zoom!) */}
                 <div className="flex flex-col gap-1">
                   <label className="text-[10.5px] font-bold text-slate-400 uppercase">Nombre del Piloto</label>
                   <input
@@ -423,13 +487,60 @@ export const GameUI: React.FC<GameUIProps> = ({
                     maxLength={14}
                     value={playersForm[idx].name}
                     onChange={(e) => handleFormChange(idx, 'name', e.target.value)}
-                    className="bg-slate-900 border border-slate-800 text-white rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:border-amber-400/50"
+                    className="bg-slate-900 border border-slate-800 text-white rounded-lg px-3 py-2.5 sm:py-1.5 text-base sm:text-xs focus:outline-none focus:border-amber-400/50"
                   />
+                </div>
+
+                {/* Unique Car Livery Color Picker (guaranteed unique per car in race!) */}
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[10.5px] font-bold text-slate-400 uppercase">
+                      Color Único en Pista
+                    </label>
+                    <span className="text-[9.5px] font-mono text-slate-400">
+                      Diferente para cada coche
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-6 gap-1.5">
+                    {CAR_LIVERY_PALETTE.map((swatch) => {
+                      const isPicked =
+                        playersForm[idx].color.toLowerCase() === swatch.hex.toLowerCase();
+                      const activeSlotsCount =
+                        gameMode === 'multiplayer' ? numPlayers : 1;
+                      const usedByOther = Array.from({ length: activeSlotsCount }).some(
+                        (_, otherIdx) =>
+                          otherIdx !== idx &&
+                          playersForm[otherIdx].color.toLowerCase() === swatch.hex.toLowerCase()
+                      );
+                      return (
+                        <button
+                          key={swatch.id}
+                          type="button"
+                          onClick={() => handlePlayerColorChange(idx, swatch.hex)}
+                          title={
+                            usedByOther
+                              ? `${swatch.name} (intercambiar con otro piloto)`
+                              : swatch.name
+                          }
+                          className={`relative h-8 rounded-lg border flex items-center justify-center transition-all cursor-pointer ${
+                            isPicked
+                              ? 'border-white ring-2 ring-amber-400/70 scale-105'
+                              : usedByOther
+                                ? 'border-slate-700 opacity-50 hover:opacity-90'
+                                : 'border-slate-800 hover:border-slate-500'
+                          }`}
+                          style={{ backgroundColor: swatch.hex }}
+                        >
+                          {isPicked && <Check className="w-4 h-4 text-slate-950 stroke-[3]" />}
+                        </button>
+                      );
+                    })}
+                  </div>
                 </div>
 
                 {/* Car Presets Grid */}
                 <div className="flex flex-col gap-1.5">
-                  <label className="text-[10.5px] font-bold text-slate-400 uppercase">Selecciona tu Coche</label>
+                  <label className="text-[10.5px] font-bold text-slate-400 uppercase">Tipo de Chasis</label>
                   <div className="grid grid-cols-3 gap-2">
                     {(Object.keys(carStats) as CarType[]).map((type) => {
                       const car = carStats[type];
@@ -437,17 +548,21 @@ export const GameUI: React.FC<GameUIProps> = ({
                       return (
                         <button
                           key={type}
+                          type="button"
                           onClick={() => {
                             handleFormChange(idx, 'carType', type);
-                            audio.playBeep(260 + (type === 'speedster' ? 150 : type === 'drifter' ? -50 : 0), 0.08, 'sine');
+                            audio.playBeep(
+                              260 + (type === 'speedster' ? 150 : type === 'drifter' ? -50 : 0),
+                              0.08,
+                              'sine'
+                            );
                           }}
-                          className={`flex flex-col items-center justify-center p-2.5 rounded-lg border transition-all text-center cursor-pointer ${
-                            isSelected 
-                              ? 'bg-slate-800 border-amber-400' 
+                          className={`flex flex-col items-center justify-center p-2 rounded-lg border transition-all text-center cursor-pointer ${
+                            isSelected
+                              ? 'bg-slate-800 border-amber-400'
                               : 'bg-slate-900/60 border-slate-800 hover:border-slate-700'
                           }`}
                         >
-                          <span className="w-4 h-4 rounded-full mb-1" style={{ backgroundColor: car.color }} />
                           <span className="text-[10px] font-bold text-white capitalize">{car.name}</span>
                         </button>
                       );
@@ -501,15 +616,68 @@ export const GameUI: React.FC<GameUIProps> = ({
               </div>
             ))}
 
-            {/* AI Opponent Card with Archetype Configuration */}
+            {/* AI Opponent Card with Archetype & Distinct Livery Color Configuration */}
             {gameMode === 'ai' && (
               <div className="flex flex-col gap-3 bg-slate-950/40 border border-slate-800 p-4 rounded-xl">
-                <div className="flex items-center gap-2">
-                  <Cpu className="w-5 h-5 text-cyan-400" />
-                  <span className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                    Estilo de Piloto IA Rival
-                  </span>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <Cpu className="w-5 h-5 text-cyan-400" />
+                    <span className="text-xs font-bold text-white uppercase tracking-wider font-mono">
+                      Estilo de Piloto IA Rival
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className="w-3 h-3 rounded-full ring-2 ring-white/25"
+                      style={{ backgroundColor: resolvedAiColor }}
+                    />
+                    <span className="text-[10px] font-mono font-bold text-slate-300">
+                      {CAR_LIVERY_PALETTE.find((c) => c.hex === resolvedAiColor)?.name || 'IA'}
+                    </span>
+                  </div>
                 </div>
+
+                {/* Distinct AI Livery Swatch Picker (never matches Pilot 1) */}
+                <div className="flex flex-col gap-1.5">
+                  <label className="text-[10.5px] font-bold text-slate-400 uppercase">
+                    Color del Coche IA
+                  </label>
+                  <div className="grid grid-cols-6 gap-1.5">
+                    {CAR_LIVERY_PALETTE.map((swatch) => {
+                      const isTakenByHuman =
+                        playersForm[0].color.toLowerCase() === swatch.hex.toLowerCase();
+                      const isPicked =
+                        resolvedAiColor.toLowerCase() === swatch.hex.toLowerCase();
+                      return (
+                        <button
+                          key={`ai-${swatch.id}`}
+                          type="button"
+                          disabled={isTakenByHuman}
+                          onClick={() => {
+                            setAiColor(swatch.hex);
+                            audio.playBeep(520, 0.05, 'sine');
+                          }}
+                          title={
+                            isTakenByHuman
+                              ? `${swatch.name} (usado por Piloto #1)`
+                              : swatch.name
+                          }
+                          className={`relative h-8 rounded-lg border flex items-center justify-center transition-all ${
+                            isTakenByHuman
+                              ? 'border-slate-800 opacity-20 cursor-not-allowed'
+                              : isPicked
+                                ? 'border-white ring-2 ring-cyan-400/80 scale-105 cursor-pointer'
+                                : 'border-slate-800 hover:border-slate-500 cursor-pointer'
+                          }`}
+                          style={{ backgroundColor: swatch.hex }}
+                        >
+                          {isPicked && <Check className="w-4 h-4 text-slate-950 stroke-[3]" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
                 <p className="text-[11px] text-slate-400">
                   Elige la estrategia y agresividad del piloto rival en pista:
                 </p>
@@ -553,16 +721,16 @@ export const GameUI: React.FC<GameUIProps> = ({
             )}
           </div>
 
-          <div className="flex justify-end gap-3 border-t border-slate-800 pt-4">
+          <div className="flex flex-col-reverse sm:flex-row justify-end gap-2.5 sm:gap-3 border-t border-slate-800 pt-4">
             <button
               onClick={() => onRestart()}
-              className="px-5 py-2.5 rounded-xl border border-slate-800 text-slate-300 hover:bg-slate-800 text-xs font-bold cursor-pointer"
+              className="min-h-[46px] px-5 py-2.5 rounded-xl border border-slate-800 text-slate-300 hover:bg-slate-800 active:scale-[0.98] text-xs font-bold cursor-pointer"
             >
               Atrás
             </button>
             <button
               onClick={handleStartSetup}
-              className="flex items-center gap-2 bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 text-white font-bold py-2.5 px-6 rounded-xl shadow-lg transition-transform hover:scale-[1.02] text-xs cursor-pointer"
+              className="min-h-[48px] flex items-center justify-center gap-2 bg-gradient-to-r from-emerald-500 to-emerald-600 hover:from-emerald-600 hover:to-emerald-700 active:scale-[0.98] text-white font-bold py-2.5 px-6 rounded-xl shadow-lg transition-all hover:scale-[1.02] text-sm sm:text-xs cursor-pointer"
             >
               Confirmar Pilotos
               <Check className="w-4 h-4" />
@@ -577,33 +745,43 @@ export const GameUI: React.FC<GameUIProps> = ({
           <div>
             <h3 className="font-sans font-bold text-white text-xs sm:text-base flex items-center gap-1.5">
               <Sparkles className="w-3.5 h-3.5 sm:w-4.5 sm:h-4.5 text-amber-400" />
-              Fase de Trazado
+              Fase de Trazado ({totalLaps} {totalLaps === 1 ? 'Vuelta' : 'Vueltas Independientes'})
             </h3>
-            <p className="text-slate-400 text-[10px] sm:text-xs mt-0.5 hidden sm:block">Cada jugador dibuja su trazada en orden. El circuito recordará la velocidad de tu dedo.</p>
+            <p className="text-slate-400 text-[10px] sm:text-xs mt-0.5 hidden sm:block">
+              Cada vuelta guarda su propia trazada y velocidad. Puedes dibujarlas todas seguidas o vuelta a vuelta.
+            </p>
           </div>
 
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
             {players.map((p, idx) => {
               const isCurrent = idx === activePlayerIndex;
-              const hasDrawn = p.drawnPath.length > 0;
+              const savedCount = p.isAI ? totalLaps : (p.lapPaths?.length || 0);
+              const hasDrawnAll = p.isAI || savedCount >= totalLaps;
               const stats = carStats[p.carType];
               
               return (
                 <div
                   key={p.id}
                   className={`flex items-center gap-1.5 p-1.5 sm:p-3 rounded-lg border transition-all ${
-                    isCurrent 
+                    isCurrent && !hasDrawnAll
                       ? 'bg-amber-400/10 border-amber-400/60 ring-1 ring-amber-400/20' 
-                      : hasDrawn 
+                      : hasDrawnAll 
                         ? 'bg-slate-950/50 border-slate-800/80' 
                         : 'bg-slate-950/20 border-slate-900 opacity-50'
                   }`}
                 >
-                  <span className="w-2.5 h-2.5 sm:w-3.5 sm:h-3.5 rounded-full shrink-0" style={{ backgroundColor: stats.color }} />
+                  <span
+                    className="w-2.5 h-2.5 sm:w-3.5 sm:h-3.5 rounded-full shrink-0"
+                    style={{ backgroundColor: p.color || stats.color }}
+                  />
                   <div className="flex-1 min-w-0">
                     <p className="text-[10px] sm:text-xs font-bold text-white truncate">{p.name}</p>
                     <p className="text-[9px] sm:text-[10px] text-slate-400 truncate">
-                      {isCurrent ? '👉 Dibujando' : hasDrawn ? '✅ Listo' : '⏳ Esperando'}
+                      {hasDrawnAll
+                        ? `✅ Listo (${totalLaps}V)`
+                        : isCurrent
+                          ? `👉 Vuelta ${Math.min(totalLaps, savedCount + 1)}/${totalLaps}`
+                          : '⏳ Esperando'}
                     </p>
                   </div>
                 </div>
@@ -611,8 +789,8 @@ export const GameUI: React.FC<GameUIProps> = ({
             })}
           </div>
 
-          {/* If all players have completed their paths, reveal start button */}
-          {players.every(p => p.drawnPath.length > 0 || p.isAI) && (
+          {/* If all players have completed all their lap paths, reveal start button */}
+          {players.every((p) => p.isAI || (p.lapPaths?.length || 0) >= totalLaps) && (
             <div className="flex justify-center border-t border-slate-800 pt-2.5 sm:pt-4 animate-bounce">
               <button
                 onClick={() => {
@@ -768,13 +946,13 @@ export const GameUI: React.FC<GameUIProps> = ({
               })()}
             </div>
 
-            <div className="flex flex-wrap items-center justify-center gap-3 border-t border-slate-800 pt-4">
+            <div className="grid grid-cols-1 sm:flex sm:flex-wrap items-center justify-center gap-2.5 sm:gap-3 border-t border-slate-800 pt-4">
               <button
                 onClick={() => {
                   audio.playBeep(740, 0.1, 'sine');
                   useGameStore.getState().startReplay();
                 }}
-                className="flex items-center gap-2 bg-gradient-to-r from-rose-500 to-amber-500 hover:from-rose-400 hover:to-amber-400 text-slate-950 text-xs font-extrabold py-2.5 px-5 rounded-xl cursor-pointer shadow-lg transition-transform hover:scale-[1.03]"
+                className="min-h-[46px] flex items-center justify-center gap-2 bg-gradient-to-r from-rose-500 to-amber-500 hover:from-rose-400 hover:to-amber-400 active:scale-[0.98] text-slate-950 text-xs font-extrabold py-2.5 px-5 rounded-xl cursor-pointer shadow-lg transition-all hover:scale-[1.03]"
               >
                 <Video className="w-4 h-4" />
                 🎬 Ver Repetición TV 3D
@@ -785,7 +963,7 @@ export const GameUI: React.FC<GameUIProps> = ({
                   audio.playBeep(600, 0.1, 'sine');
                   setResultsTab('telemetry');
                 }}
-                className="flex items-center gap-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold py-2.5 px-5 rounded-xl cursor-pointer shadow-lg transition-transform hover:scale-[1.02]"
+                className="min-h-[46px] flex items-center justify-center gap-2 bg-cyan-600 hover:bg-cyan-500 active:scale-[0.98] text-white text-xs font-bold py-2.5 px-5 rounded-xl cursor-pointer shadow-lg transition-all hover:scale-[1.02]"
               >
                 <Activity className="w-4 h-4" />
                 Abrir Telemetría F1 Pro
@@ -796,7 +974,7 @@ export const GameUI: React.FC<GameUIProps> = ({
                   audio.playBeep(440, 0.1, 'sine');
                   onRestart();
                 }}
-                className="flex items-center gap-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold py-2.5 px-5 rounded-xl cursor-pointer transition-colors"
+                className="min-h-[46px] flex items-center justify-center gap-2 bg-slate-800 hover:bg-slate-700 active:scale-[0.98] text-white text-xs font-bold py-2.5 px-5 rounded-xl cursor-pointer transition-colors"
               >
                 <RotateCcw className="w-4 h-4" />
                 Volver a Jugar
@@ -807,7 +985,7 @@ export const GameUI: React.FC<GameUIProps> = ({
                   audio.playBeep(330, 0.1, 'sine');
                   useGameStore.getState().goToMenu();
                 }}
-                className="flex items-center gap-2 bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 text-xs font-bold py-2.5 px-5 rounded-xl cursor-pointer transition-colors"
+                className="min-h-[46px] flex items-center justify-center gap-2 bg-amber-500/10 hover:bg-amber-500/20 active:scale-[0.98] text-amber-400 border border-amber-500/30 text-xs font-bold py-2.5 px-5 rounded-xl cursor-pointer transition-colors"
               >
                 Menú Principal (Cambiar Modo)
               </button>

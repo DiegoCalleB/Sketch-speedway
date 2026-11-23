@@ -26,11 +26,31 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
   const [showAiComparison, setShowAiComparison] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<'heatmap' | 'graph' | 'academic'>('heatmap');
+  const [selectedLapIdx, setSelectedLapIdx] = useState<number>(0);
 
   const selectedPlayer = players.find((p) => p.id === selectedPlayerId) || players[0];
   const playerTelemetry = telemetries[selectedPlayerId];
   const aiPlayer = players.find((p) => p.isAI);
   const aiTelemetry = aiPlayer ? telemetries[aiPlayer.id] : null;
+
+  const selectedPlayerLaps: Point[][] =
+    selectedPlayer?.lapPaths && selectedPlayer.lapPaths.length > 0
+      ? selectedPlayer.lapPaths
+      : selectedPlayer?.drawnPath?.length
+        ? [selectedPlayer.drawnPath]
+        : [];
+  const safeLapIdx = Math.min(selectedLapIdx, Math.max(0, selectedPlayerLaps.length - 1));
+  const activePlayerLapPath: Point[] = selectedPlayerLaps[safeLapIdx] || selectedPlayer?.drawnPath || [];
+  const aiPlayerLaps: Point[][] =
+    aiPlayer?.lapPaths && aiPlayer.lapPaths.length > 0
+      ? aiPlayer.lapPaths
+      : aiPlayer?.drawnPath?.length
+        ? [aiPlayer.drawnPath]
+        : [];
+  const activeAiLapPath: Point[] =
+    aiPlayerLaps[Math.min(safeLapIdx, Math.max(0, aiPlayerLaps.length - 1))] ||
+    aiPlayer?.drawnPath ||
+    [];
 
   const centerline = useMemo(() => getTrackCenterline(track), [track]);
 
@@ -229,29 +249,55 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
           </div>
         </div>
 
-        {/* Player Selector Bar */}
+        {/* Player & Per-Lap Selector Bar */}
         <div className="flex flex-wrap items-center justify-between gap-3 p-3 bg-slate-900/60 border border-slate-800/80 rounded-xl">
-          <div className="flex items-center gap-2">
-            <span className="text-xs text-slate-400">Piloto seleccionado:</span>
-            <div className="flex gap-2">
-              {players.map((p) => (
-                <button
-                  key={p.id}
-                  onClick={() => setSelectedPlayerId(p.id)}
-                  className={`px-3 py-1 rounded-md text-xs font-medium transition-colors ${
-                    selectedPlayerId === p.id
-                      ? 'bg-slate-700 text-white border border-slate-600'
-                      : 'text-slate-400 hover:text-white bg-slate-800/50'
-                  }`}
-                >
-                  <span
-                    className="inline-block w-2 h-2 rounded-full mr-1.5"
-                    style={{ backgroundColor: p.color }}
-                  />
-                  {p.name} {p.isAI ? `(IA: ${p.aiArchetype || 'Equilibrada'})` : '(Tú)'}
-                </button>
-              ))}
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-slate-400">Piloto:</span>
+              <div className="flex gap-1.5">
+                {players.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => {
+                      setSelectedPlayerId(p.id);
+                      setSelectedLapIdx(0);
+                    }}
+                    className={`px-3 py-1 rounded-md text-xs font-medium transition-colors cursor-pointer ${
+                      selectedPlayerId === p.id
+                        ? 'bg-slate-700 text-white border border-slate-600'
+                        : 'text-slate-400 hover:text-white bg-slate-800/50'
+                    }`}
+                  >
+                    <span
+                      className="inline-block w-2 h-2 rounded-full mr-1.5"
+                      style={{ backgroundColor: p.color }}
+                    />
+                    {p.name} {p.isAI ? `(IA: ${p.aiArchetype || 'Equilibrada'})` : '(Tú)'}
+                  </button>
+                ))}
+              </div>
             </div>
+
+            {selectedPlayerLaps.length > 1 && (
+              <div className="flex items-center gap-1.5 pl-2 border-l border-slate-800">
+                <span className="text-xs text-slate-400">Vuelta:</span>
+                <div className="flex gap-1">
+                  {selectedPlayerLaps.map((_, lIdx) => (
+                    <button
+                      key={`tel-lap-${lIdx}`}
+                      onClick={() => setSelectedLapIdx(lIdx)}
+                      className={`px-2 py-1 rounded-md text-xs font-mono font-bold transition-colors cursor-pointer ${
+                        safeLapIdx === lIdx
+                          ? 'bg-cyan-500 text-slate-950'
+                          : 'bg-slate-800/70 text-slate-300 hover:text-white'
+                      }`}
+                    >
+                      V{lIdx + 1}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
 
           <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer">
@@ -261,7 +307,7 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
               onChange={(e) => setShowAiComparison(e.target.checked)}
               className="rounded bg-slate-800 border-slate-700 text-cyan-500 focus:ring-0"
             />
-            Superponer Trazada Óptima IA (Ápice Calculado)
+            Superponer Trazada IA (V{safeLapIdx + 1})
           </label>
         </div>
 
@@ -326,11 +372,11 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                   strokeDasharray="6 6"
                 />
 
-                {/* AI Ideal Line (Apex Line) */}
-                {showAiComparison && aiPlayer && aiPlayer.drawnPath.length > 1 && (
+                {/* AI Ideal Line (Apex Line for selected lap) */}
+                {showAiComparison && activeAiLapPath.length > 1 && (
                   <g opacity="0.65">
                     <polyline
-                      points={aiPlayer.drawnPath.map((p) => `${p.x},${p.y}`).join(' ')}
+                      points={activeAiLapPath.map((p) => `${p.x},${p.y}`).join(' ')}
                       fill="none"
                       stroke="#06b6d4"
                       strokeWidth="2.5"
@@ -339,12 +385,12 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                   </g>
                 )}
 
-                {/* Selected Player's Colored Speed Heatmap Segments */}
-                {selectedPlayer.drawnPath.length > 1 && (
+                {/* Selected Player's Colored Speed Heatmap Segments for Selected Lap */}
+                {activePlayerLapPath.length > 1 && (
                   <g>
-                    {selectedPlayer.drawnPath.map((p, idx) => {
+                    {activePlayerLapPath.map((p, idx) => {
                       if (idx === 0) return null;
-                      const prev = selectedPlayer.drawnPath[idx - 1];
+                      const prev = activePlayerLapPath[idx - 1];
                       const segColor = getHeatmapColor(p.speed);
                       return (
                         <line
@@ -488,12 +534,12 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                 <text x="38" y="130" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">180 km/h</text>
                 <text x="38" y="190" fill="#64748b" fontSize="10" textAnchor="end" fontFamily="monospace">90 km/h</text>
 
-                {/* AI Speed Profile curve */}
-                {aiPlayer && aiPlayer.drawnPath.length > 1 && (
+                {/* AI Speed Profile curve for Selected Lap */}
+                {activeAiLapPath.length > 1 && (
                   <path
-                    d={`M ${aiPlayer.drawnPath
+                    d={`M ${activeAiLapPath
                       .map((p, i) => {
-                        const x = 44 + (i / (aiPlayer.drawnPath.length - 1)) * 736;
+                        const x = 44 + (i / (activeAiLapPath.length - 1)) * 736;
                         const y = Math.max(8, Math.min(220, 200 - (p.speed / 8.0) * 190));
                         return `${x},${y}`;
                       })
@@ -505,12 +551,12 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                   />
                 )}
 
-                {/* Player Speed Profile curve */}
-                {selectedPlayer.drawnPath.length > 1 && (
+                {/* Player Speed Profile curve for Selected Lap */}
+                {activePlayerLapPath.length > 1 && (
                   <path
-                    d={`M ${selectedPlayer.drawnPath
+                    d={`M ${activePlayerLapPath
                       .map((p, i) => {
-                        const x = 44 + (i / (selectedPlayer.drawnPath.length - 1)) * 736;
+                        const x = 44 + (i / (activePlayerLapPath.length - 1)) * 736;
                         const y = Math.max(8, Math.min(220, 200 - (p.speed / 8.0) * 190));
                         return `${x},${y}`;
                       })

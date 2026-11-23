@@ -92,6 +92,7 @@ export interface Player {
   color: string;
   carType: CarType;
   drawnPath: Point[];
+  lapPaths: Point[][];
   isAI: boolean;
   aiArchetype?: AIArchetype;
   isReady: boolean;

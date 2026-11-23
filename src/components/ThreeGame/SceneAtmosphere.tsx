@@ -2,12 +2,18 @@ import React, { useEffect, useMemo, useRef } from 'react';
 import { useThree, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 
+import { RaceCarState } from '../../types';
+import { CARS_RENDER_LAYER } from './renderLayers';
+
 export type LightingPreset = 'day' | 'sunset' | 'night';
 
 interface SceneAtmosphereProps {
   preset?: LightingPreset;
   shadowFocus?: [number, number];
+  carsStateRef?: React.MutableRefObject<RaceCarState[]>;
+  focusedPlayerId?: string | null;
   tightShadows?: boolean;
+  shadowMapSize?: number;
 }
 
 // High-contrast HDR-style Studio/Autodrome IBL Environment Scene for PMREMGenerator
@@ -250,11 +256,26 @@ const AtmosphericSkyShader = {
 export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
   preset = 'day',
   shadowFocus = [400, 250],
-  tightShadows = false
+  carsStateRef,
+  focusedPlayerId = null,
+  tightShadows = false,
+  shadowMapSize = 2048
 }) => {
   const { gl, scene } = useThree();
+  const hemiRef = useRef<THREE.HemisphereLight>(null);
   const sunRef = useRef<THREE.DirectionalLight>(null);
+  const rimRef = useRef<THREE.DirectionalLight>(null);
   const smoothFocusRef = useRef(new THREE.Vector2(400, 250));
+
+  // Ensure all scene lights & directional shadow map cover BOTH World (Layer 0) and Cars (Layer 1)
+  useEffect(() => {
+    hemiRef.current?.layers.enable(CARS_RENDER_LAYER);
+    rimRef.current?.layers.enable(CARS_RENDER_LAYER);
+    if (sunRef.current) {
+      sunRef.current.layers.enable(CARS_RENDER_LAYER);
+      sunRef.current.shadow.camera.layers.enable(CARS_RENDER_LAYER);
+    }
+  }, [preset, shadowMapSize]);
 
   const skyMaterial = useMemo(() => {
     return new THREE.ShaderMaterial({
@@ -315,9 +336,33 @@ export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
     const dt = Math.min(delta, 0.05);
     skyMaterial.uniforms.uTime.value = elapsed;
 
-    // Smoothly track the racing pack for razor-sharp shadows
-    const targetFx = tightShadows ? shadowFocus[0] : 400;
-    const targetFy = tightShadows ? shadowFocus[1] : 250;
+    // Smoothly track the live racing pack directly from carsStateRef for razor-sharp shadows with zero React re-renders
+    let targetFx = tightShadows ? shadowFocus[0] : 400;
+    let targetFy = tightShadows ? shadowFocus[1] : 250;
+    if (tightShadows && carsStateRef?.current && carsStateRef.current.length > 0) {
+      const cars = carsStateRef.current;
+      let sumX = 0;
+      let sumY = 0;
+      let count = 0;
+      for (let i = 0; i < cars.length; i++) {
+        const c = cars[i];
+        if (!c.disqualified) {
+          sumX += c.x;
+          sumY += 500 - c.y;
+          count++;
+        }
+      }
+      if (count > 0) {
+        targetFx = sumX / count;
+        targetFy = sumY / count;
+      } else if (focusedPlayerId) {
+        const focused = cars.find((c) => c.playerId === focusedPlayerId);
+        if (focused) {
+          targetFx = focused.x;
+          targetFy = 500 - focused.y;
+        }
+      }
+    }
     smoothFocusRef.current.x = THREE.MathUtils.damp(smoothFocusRef.current.x, targetFx, 5.5, dt);
     smoothFocusRef.current.y = THREE.MathUtils.damp(smoothFocusRef.current.y, targetFy, 5.5, dt);
 
@@ -365,17 +410,17 @@ export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
         <sphereGeometry args={[2250, 40, 28]} />
       </mesh>
 
-      {/* Natural Sky / Ground Hemisphere Fill */}
-      <hemisphereLight args={[hemiSky, hemiGround, hemiIntensity]} />
+      {/* Natural Sky / Ground Hemisphere Fill (illuminates Layer 0 World + Layer 1 Cars) */}
+      <hemisphereLight ref={hemiRef} args={[hemiSky, hemiGround, hemiIntensity]} />
 
-      {/* Primary Key Sun / Stadium Moon with Dynamic Tight-Tracking 2048px PCFSoft Shadows */}
+      {/* Primary Key Sun / Stadium Moon with Dynamic Tight-Tracking PCFSoft Shadows */}
       <directionalLight
         ref={sunRef}
         position={[760, 460, preset === 'sunset' ? 215 : 355]}
         intensity={keyIntensity}
         color={keyColor}
         castShadow
-        shadow-mapSize={[2048, 2048]}
+        shadow-mapSize={[shadowMapSize, shadowMapSize]}
         shadow-camera-left={-475}
         shadow-camera-right={475}
         shadow-camera-top={365}
@@ -387,7 +432,12 @@ export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
       />
 
       {/* Cool Sky Rim / Backlight to Sculpt Aerodynamic Curves & Carbon Edges */}
-      <directionalLight position={[40, 30, 205]} intensity={rimIntensity} color={rimColor} />
+      <directionalLight
+        ref={rimRef}
+        position={[40, 30, 205]}
+        intensity={rimIntensity}
+        color={rimColor}
+      />
     </group>
   );
 };

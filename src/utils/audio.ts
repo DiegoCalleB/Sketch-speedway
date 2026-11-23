@@ -82,6 +82,24 @@ class AudioEngine {
     }
   }
 
+  // Unlock WebAudio synchronously inside a user touch gesture (critical for iPhone/iPad Safari & Chrome iOS!)
+  unlockForMobile() {
+    this.init();
+    if (!this.ctx) return;
+    if (this.ctx.state === 'suspended') {
+      void this.ctx.resume().catch(() => {});
+    }
+    try {
+      const silentBuffer = this.ctx.createBuffer(1, 1, 22050);
+      const src = this.ctx.createBufferSource();
+      src.buffer = silentBuffer;
+      src.connect(this.ctx.destination);
+      src.start(0);
+    } catch {
+      // ignore unlock errors
+    }
+  }
+
   toggleMute() {
     this.isMuted = !this.isMuted;
     if (this.isMuted) {

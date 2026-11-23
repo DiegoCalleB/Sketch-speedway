@@ -1,9 +1,16 @@
-import React, { useMemo, useRef, useEffect } from 'react';
+import React, { useMemo, useRef, useEffect, useLayoutEffect } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import { Html } from '@react-three/drei';
 import * as THREE from 'three';
+import { RaceCarState, Track } from '../../types';
+import { getTrackSurfaceInfo } from '../../utils/tracks';
+import { CARS_RENDER_LAYER } from './renderLayers';
 
 interface Car3DProps {
+  playerId?: string;
+  carsStateRef?: React.MutableRefObject<RaceCarState[]>;
+  track?: Track;
+  isRacing?: boolean;
   color: string;
   position: [number, number, number];
   angle: number;
@@ -263,8 +270,16 @@ const createSculptedF1Geometries = () => {
 
 const _normalScaleCarbon = new THREE.Vector2(1.25, 1.25);
 const _normalScaleFlake = new THREE.Vector2(0.18, 0.18);
+const _colBrakeRed = new THREE.Color('#ff1e42');
+const _colCyan = new THREE.Color('#22d3ee');
+const _colDarkRain = new THREE.Color('#7f1d1d');
+const _colDarkBrake = new THREE.Color('#450a0a');
 
 export const Car3D: React.FC<Car3DProps> = ({
+  playerId,
+  carsStateRef,
+  track,
+  isRacing = false,
   color,
   position,
   angle,
@@ -284,6 +299,8 @@ export const Car3D: React.FC<Car3DProps> = ({
   const { gl } = useThree();
   const maxAnisotropy = Math.min(8, gl.capabilities.getMaxAnisotropy());
 
+  const rootGroupRef = useRef<THREE.Group>(null);
+  const contactShadowRef = useRef<THREE.Mesh>(null);
   const carGroupRef = useRef<THREE.Group>(null);
   const chassisBodyRef = useRef<THREE.Group>(null);
   const frontLeftWheelGroupRef = useRef<THREE.Group>(null);
@@ -307,6 +324,56 @@ export const Car3D: React.FC<Car3DProps> = ({
   const frBrakeMatRef = useRef<THREE.MeshStandardMaterial>(null);
   const rlBrakeMatRef = useRef<THREE.MeshStandardMaterial>(null);
   const rrBrakeMatRef = useRef<THREE.MeshStandardMaterial>(null);
+  const steeringLedMatRef = useRef<THREE.MeshStandardMaterial>(null);
+  const rainLightMatRef = useRef<THREE.MeshStandardMaterial>(null);
+  const leftBrakeLedMatRef = useRef<THREE.MeshStandardMaterial>(null);
+  const rightBrakeLedMatRef = useRef<THREE.MeshStandardMaterial>(null);
+
+  // Assign entire Car3D hierarchy strictly to CARS_RENDER_LAYER (Layer 1) with frustumCulled=false
+  // so BOTH/ALL cars render in Pass 2 at native full-DPR sharpness with ZERO bloom smear or scenery occlusion
+  useLayoutEffect(() => {
+    const root = rootGroupRef.current;
+    if (!root) return;
+    root.traverse((obj) => {
+      obj.layers.set(CARS_RENDER_LAYER);
+      if ((obj as THREE.Light).isLight) {
+        obj.layers.enable(0);
+      }
+      obj.frustumCulled = false;
+    });
+  }, [active, showLabel, isRacing]);
+
+  // Synchronize initial / drawing-mode transforms imperatively so React HUD re-renders during 'racing'
+  // can NEVER overwrite live physics positions managed inside useFrame
+  useLayoutEffect(() => {
+    if (!isRacing) {
+      if (rootGroupRef.current) {
+        rootGroupRef.current.visible = true;
+        rootGroupRef.current.position.set(position[0], position[1], position[2]);
+      }
+      if (contactShadowRef.current) {
+        contactShadowRef.current.rotation.set(0, 0, -angle);
+      }
+      if (carGroupRef.current) {
+        carGroupRef.current.rotation.z = -angle;
+      }
+      smoothYawRef.current = -angle;
+    } else if (rootGroupRef.current && carsStateRef?.current && playerId && track) {
+      const liveCar = carsStateRef.current.find((c) => c.playerId === playerId);
+      if (liveCar) {
+        const carSurf = getTrackSurfaceInfo({ x: liveCar.x, y: liveCar.y }, track);
+        rootGroupRef.current.position.set(liveCar.x, 500 - liveCar.y, carSurf.elevationZ + 0.15);
+        if (contactShadowRef.current) contactShadowRef.current.rotation.set(0, 0, -liveCar.angle);
+        if (carGroupRef.current) carGroupRef.current.rotation.z = -liveCar.angle;
+        smoothYawRef.current = -liveCar.angle;
+      } else {
+        rootGroupRef.current.position.set(position[0], position[1], position[2]);
+        if (contactShadowRef.current) contactShadowRef.current.rotation.set(0, 0, -angle);
+        if (carGroupRef.current) carGroupRef.current.rotation.z = -angle;
+        smoothYawRef.current = -angle;
+      }
+    }
+  }, [isRacing, position[0], position[1], position[2], angle, carsStateRef, playerId, track]);
 
   const {
     carbonMaps,
@@ -359,8 +426,52 @@ export const Car3D: React.FC<Car3DProps> = ({
     const dt = Math.min(delta, 0.05);
     const elapsed = state.clock.getElapsedTime();
 
+    // Direct 60/120fps physics-ref synchronization during 'racing' (zero React reconciliation lag!)
+    let liveSpeed = speed;
+    let liveAngle = angle;
+    let liveSteerAngle = steerAngle;
+    let liveLongG = longitudinalG;
+    let liveLatG = lateralG;
+    let liveBankAngle = bankAngle;
+    let liveDrifting = isDrifting;
+    let liveBraking = isBraking;
+    let liveDrs = drsActive;
+    let liveThrottle = throttle;
+
+    if (isRacing && carsStateRef?.current && playerId && track) {
+      const liveCar = carsStateRef.current.find((c) => c.playerId === playerId);
+      if (liveCar) {
+        if (rootGroupRef.current) {
+          const isHidden = Boolean(liveCar.disqualified);
+          rootGroupRef.current.visible = !isHidden;
+          if (isHidden) return;
+          const carSurf = getTrackSurfaceInfo({ x: liveCar.x, y: liveCar.y }, track);
+          rootGroupRef.current.position.set(liveCar.x, 500 - liveCar.y, carSurf.elevationZ + 0.15);
+          liveBankAngle = carSurf.bankAngleRad;
+        }
+        if (contactShadowRef.current) {
+          contactShadowRef.current.rotation.z = -liveCar.angle;
+        }
+        liveSpeed = Math.hypot(liveCar.vx, liveCar.vy);
+        liveAngle = liveCar.angle;
+        liveSteerAngle = liveCar.steerAngle ?? 0;
+        liveLongG = liveCar.longitudinalG ?? 0;
+        liveLatG = liveCar.lateralG ?? 0;
+        liveDrifting = liveCar.isDrifting;
+        liveBraking = (liveCar.brake ?? 0) > 0.18 && liveSpeed > 1.4;
+        liveDrs = Boolean(liveCar.drsActive);
+        liveThrottle = liveCar.throttle ?? 0;
+      }
+    } else if (rootGroupRef.current) {
+      rootGroupRef.current.visible = true;
+      rootGroupRef.current.position.set(position[0], position[1], position[2]);
+      if (contactShadowRef.current) {
+        contactShadowRef.current.rotation.z = -angle;
+      }
+    }
+
     // 1. Spin 18-inch Pirelli tires at exact angular velocity v / R
-    const wheelSpinSpeed = speed * 25 * dt;
+    const wheelSpinSpeed = liveSpeed * 25 * dt;
     if (rearLeftTireRef.current && rearRightTireRef.current) {
       rearLeftTireRef.current.rotation.y += wheelSpinSpeed * 0.92;
       rearRightTireRef.current.rotation.y += wheelSpinSpeed * 0.92;
@@ -373,7 +484,7 @@ export const Car3D: React.FC<Car3DProps> = ({
     // 2. Real Physical Ackermann Front-Wheel Steering (inner wheel turns tighter than outer wheel!)
     if (frontLeftWheelGroupRef.current && frontRightWheelGroupRef.current) {
       // In 3D Z-up coordinates (3D Y = 500 - 2D y), 2D clockwise +steerAngle maps to -steerAngle around +Z
-      const baseSteerZ = THREE.MathUtils.clamp(-steerAngle, -0.52, 0.52);
+      const baseSteerZ = THREE.MathUtils.clamp(-liveSteerAngle, -0.52, 0.52);
       const ackermannLeft = baseSteerZ < 0 ? baseSteerZ * 1.12 : baseSteerZ * 0.92;
       const ackermannRight = baseSteerZ > 0 ? baseSteerZ * 1.12 : baseSteerZ * 0.92;
       frontLeftWheelGroupRef.current.rotation.z = THREE.MathUtils.damp(
@@ -392,7 +503,7 @@ export const Car3D: React.FC<Car3DProps> = ({
 
     // Rotate F1 cockpit steering wheel in sync with physical front-wheel steering!
     if (steeringWheelRef.current) {
-      const targetWheelRoll = THREE.MathUtils.clamp(-steerAngle * 2.1, -1.1, 1.1);
+      const targetWheelRoll = THREE.MathUtils.clamp(-liveSteerAngle * 2.1, -1.1, 1.1);
       steeringWheelRef.current.rotation.x = THREE.MathUtils.damp(
         steeringWheelRef.current.rotation.x,
         targetWheelRoll,
@@ -403,8 +514,8 @@ export const Car3D: React.FC<Car3DProps> = ({
 
     // Driver helmet naturally looks toward the apex & leans against lateral G-forces!
     if (driverHelmetRef.current) {
-      const headLookZ = THREE.MathUtils.clamp(-steerAngle * 0.72, -0.34, 0.34);
-      const headTiltX = THREE.MathUtils.clamp(lateralG * 0.045, -0.22, 0.22);
+      const headLookZ = THREE.MathUtils.clamp(-liveSteerAngle * 0.72, -0.34, 0.34);
+      const headTiltX = THREE.MathUtils.clamp(liveLatG * 0.045, -0.22, 0.22);
       driverHelmetRef.current.rotation.z = THREE.MathUtils.damp(
         driverHelmetRef.current.rotation.z,
         headLookZ,
@@ -421,7 +532,7 @@ export const Car3D: React.FC<Car3DProps> = ({
 
     // 3. True Rigid-Body Chassis Yaw (-angle directly — ZERO artificial drift double-counting!)
     if (carGroupRef.current) {
-      const targetYaw = -angle;
+      const targetYaw = -liveAngle;
       let diff = targetYaw - smoothYawRef.current;
       while (diff > Math.PI) diff -= Math.PI * 2;
       while (diff < -Math.PI) diff += Math.PI * 2;
@@ -430,7 +541,7 @@ export const Car3D: React.FC<Car3DProps> = ({
 
       // Track banking camber + real lateral G-force body roll
       const targetRoll = THREE.MathUtils.clamp(
-        bankAngle * 1.4 + lateralG * 0.022,
+        liveBankAngle * 1.4 + liveLatG * 0.022,
         -0.28,
         0.28
       );
@@ -444,7 +555,7 @@ export const Car3D: React.FC<Car3DProps> = ({
 
     // 4. Physical Suspension Pitch (Braking Nose-Dive / Launch Squat) & Ground-Effect Aero Ride-Height Compression
     if (chassisBodyRef.current) {
-      const targetPitch = THREE.MathUtils.clamp(-longitudinalG * 0.015, -0.042, 0.068);
+      const targetPitch = THREE.MathUtils.clamp(-liveLongG * 0.015, -0.042, 0.068);
       chassisBodyRef.current.rotation.y = THREE.MathUtils.damp(
         chassisBodyRef.current.rotation.y,
         targetPitch,
@@ -452,8 +563,8 @@ export const Car3D: React.FC<Car3DProps> = ({
         dt
       );
       // Aerodynamic downforce compresses suspension lower at 300+ km/h + subtle high-frequency floor porpoising
-      const aeroCompression = -THREE.MathUtils.clamp((speed - 3.5) * 0.028, 0, 0.12);
-      const buzz = speed > 5.4 ? Math.sin(elapsed * 58) * 0.018 : 0;
+      const aeroCompression = -THREE.MathUtils.clamp((liveSpeed - 3.5) * 0.028, 0, 0.12);
+      const buzz = liveSpeed > 5.4 ? Math.sin(elapsed * 58) * 0.018 : 0;
       chassisBodyRef.current.position.z = THREE.MathUtils.damp(
         chassisBodyRef.current.position.z,
         aeroCompression + buzz,
@@ -464,7 +575,7 @@ export const Car3D: React.FC<Car3DProps> = ({
 
     // 5. Real Active Aerodynamic DRS Rear Flap synced to physics drsActive state
     if (drsFlapRef.current) {
-      const isDrsNow = drsActive || (speed > 6.1 && !isBraking && !isDrifting);
+      const isDrsNow = liveDrs || (liveSpeed > 6.1 && !liveBraking && !liveDrifting);
       const targetDrsPitch = isDrsNow ? -0.46 : 0.16;
       drsFlapRef.current.rotation.y = THREE.MathUtils.damp(
         drsFlapRef.current.rotation.y,
@@ -474,25 +585,42 @@ export const Car3D: React.FC<Car3DProps> = ({
       );
     }
 
-    // 6. Incandescent Carbon-Ceramic Brake Disc Glow driven by actual braking deceleration
-    const brakingEnergy = isBraking && speed > 1.6 ? Math.min(1, 0.45 + Math.abs(longitudinalG) * 0.25) : 0;
+    // 6. Incandescent Carbon-Ceramic Brake Disc Glow & Rear Brake LEDs driven directly by live deceleration
+    const brakingEnergy =
+      liveBraking && liveSpeed > 1.6 ? Math.min(1, 0.45 + Math.abs(liveLongG) * 0.25) : 0;
     brakeHeatRef.current = THREE.MathUtils.damp(
       brakeHeatRef.current,
       brakingEnergy,
-      isBraking ? 11.5 : 2.6,
+      liveBraking ? 11.5 : 2.6,
       dt
     );
     const glowIntensity = brakeHeatRef.current * 9.5;
-    [flBrakeMatRef, frBrakeMatRef, rlBrakeMatRef, rrBrakeMatRef].forEach((ref) => {
-      if (ref.current) {
-        ref.current.emissiveIntensity = glowIntensity;
-      }
-    });
+    if (flBrakeMatRef.current) flBrakeMatRef.current.emissiveIntensity = glowIntensity;
+    if (frBrakeMatRef.current) frBrakeMatRef.current.emissiveIntensity = glowIntensity;
+    if (rlBrakeMatRef.current) rlBrakeMatRef.current.emissiveIntensity = glowIntensity;
+    if (rrBrakeMatRef.current) rrBrakeMatRef.current.emissiveIntensity = glowIntensity;
+
+    if (steeringLedMatRef.current) {
+      steeringLedMatRef.current.emissive.copy(liveBraking ? _colBrakeRed : _colCyan);
+    }
+    if (rainLightMatRef.current) {
+      const lit = liveBraking || liveDrifting;
+      rainLightMatRef.current.color.copy(lit ? _colBrakeRed : _colDarkRain);
+      rainLightMatRef.current.emissiveIntensity = lit ? 9.5 : 1.5;
+    }
+    if (leftBrakeLedMatRef.current) {
+      leftBrakeLedMatRef.current.color.copy(liveBraking ? _colBrakeRed : _colDarkBrake);
+      leftBrakeLedMatRef.current.emissiveIntensity = liveBraking ? 7.8 : 0.3;
+    }
+    if (rightBrakeLedMatRef.current) {
+      rightBrakeLedMatRef.current.color.copy(liveBraking ? _colBrakeRed : _colDarkBrake);
+      rightBrakeLedMatRef.current.emissiveIntensity = liveBraking ? 7.8 : 0.3;
+    }
 
     // 7. Exhaust Overrun Backfire Flame Plume & Dynamic Real-Time Diffuser PointLight
     const isBackfiring =
-      (isBraking && speed > 2.6 && Math.sin(elapsed * 46) > 0.22) ||
-      (throttle > 0.8 && longitudinalG > 0.9 && speed > 2.8 && Math.sin(elapsed * 58) > 0.45);
+      (liveBraking && liveSpeed > 2.6 && Math.sin(elapsed * 46) > 0.22) ||
+      (liveThrottle > 0.8 && liveLongG > 0.9 && liveSpeed > 2.8 && Math.sin(elapsed * 58) > 0.45);
 
     if (exhaustFlameRef.current) {
       exhaustFlameRef.current.visible = isBackfiring;
@@ -506,7 +634,7 @@ export const Car3D: React.FC<Car3DProps> = ({
       if (isBackfiring) {
         tailLightPointRef.current.color.set('#38bdf8');
         tailLightPointRef.current.intensity = 16;
-      } else if (isBraking || isDrifting) {
+      } else if (liveBraking || liveDrifting) {
         tailLightPointRef.current.color.set('#ff1e42');
         tailLightPointRef.current.intensity = 3.2;
       } else {
@@ -516,11 +644,11 @@ export const Car3D: React.FC<Car3DProps> = ({
 
     // 8. Aerodynamic Rear Wingtip Condensation Vortices above 265 km/h
     if (leftVortexRef.current && rightVortexRef.current) {
-      const showVortex = speed > 5.55;
+      const showVortex = liveSpeed > 5.55;
       leftVortexRef.current.visible = showVortex;
       rightVortexRef.current.visible = showVortex;
       if (showVortex) {
-        const vAlpha = Math.min(0.38, (speed - 5.55) * 0.18);
+        const vAlpha = Math.min(0.38, (liveSpeed - 5.55) * 0.18);
         (leftVortexRef.current.material as THREE.MeshBasicMaterial).opacity = vAlpha;
         (rightVortexRef.current.material as THREE.MeshBasicMaterial).opacity = vAlpha;
       }
@@ -656,22 +784,22 @@ export const Car3D: React.FC<Car3DProps> = ({
   };
 
   return (
-    <group position={position}>
+    <group ref={rootGroupRef}>
       {/* Soft Grounded Contact Shadow directly beneath Venturi Floor */}
-      <mesh position={[0, 0, -0.04]} rotation={[0, 0, -angle]}>
+      <mesh ref={contactShadowRef} position={[0, 0, -0.04]}>
         <planeGeometry args={[18.8, 10.4]} />
         <meshBasicMaterial map={shadowTex} transparent opacity={0.94} depthWrite={false} />
       </mesh>
 
       {/* Subtle Active Car Focus Ring (only in drawing/selection) */}
-      {active && speed < 0.1 && (
+      {!isRacing && active && speed < 0.1 && (
         <mesh position={[0, 0, -0.02]}>
           <ringGeometry args={[7.8, 8.7, 36]} />
           <meshBasicMaterial color={color} transparent opacity={0.48} depthWrite={false} />
         </mesh>
       )}
 
-      <group ref={carGroupRef} rotation={[0, 0, -angle]}>
+      <group ref={carGroupRef}>
         {/* Suspended Chassis Group */}
         <group ref={chassisBodyRef}>
           {/* Compact Dynamic PointLight at Rear Diffuser */}
@@ -878,12 +1006,12 @@ export const Car3D: React.FC<Car3DProps> = ({
               <meshStandardMaterial color="#0f172a" roughness={0.38} />
             </mesh>
             <mesh position={[0, 0, 0.2]}>
-              <boxGeometry args={[0.38, 1.28, 0.14]} />
+              <boxGeometry args={[0.42, 1.48, 0.16]} />
               <meshStandardMaterial
-                color="#facc15"
-                emissive="#facc15"
-                emissiveIntensity={0.95}
-                roughness={0.22}
+                color={color}
+                emissive={color}
+                emissiveIntensity={1.15}
+                roughness={0.20}
               />
             </mesh>
           </group>
@@ -902,22 +1030,23 @@ export const Car3D: React.FC<Car3DProps> = ({
             <mesh position={[-0.07, 0, 0.08]}>
               <boxGeometry args={[0.02, 0.44, 0.13]} />
               <meshStandardMaterial
+                ref={steeringLedMatRef}
                 color="#22d3ee"
                 emissive={isBraking ? '#ff1e42' : '#22d3ee'}
                 emissiveIntensity={5.8}
               />
             </mesh>
           </group>
-          {/* Driver Racing Helmet (physically turns toward apex & leans against Lateral G!) */}
+          {/* Driver Racing Helmet (livery-matched crown for instant car recognition + turns toward apex!) */}
           <group ref={driverHelmetRef} position={[0.25, 0, 1.88]}>
             <mesh castShadow>
               <sphereGeometry args={[0.56, 22, 18]} />
               <meshPhysicalMaterial
-                color="#f8fafc"
-                roughness={0.05}
-                metalness={0.48}
+                color={color}
+                roughness={0.08}
+                metalness={0.55}
                 clearcoat={1.0}
-                envMapIntensity={2.5}
+                envMapIntensity={2.4}
               />
             </mesh>
             <mesh position={[0.36, 0, 0.08]}>
@@ -1052,6 +1181,7 @@ export const Car3D: React.FC<Car3DProps> = ({
             <mesh position={[0, 0, 0]}>
               <boxGeometry args={[0.22, 0.52, 0.56]} />
               <meshStandardMaterial
+                ref={rainLightMatRef}
                 color={isBraking || isDrifting ? '#ff1e42' : '#7f1d1d'}
                 emissive="#ff1e42"
                 emissiveIntensity={isBraking || isDrifting ? 9.5 : 1.5}
@@ -1061,6 +1191,7 @@ export const Car3D: React.FC<Car3DProps> = ({
             <mesh position={[0.35, -2.2, 0.92]}>
               <boxGeometry args={[0.16, 0.14, 0.82]} />
               <meshStandardMaterial
+                ref={leftBrakeLedMatRef}
                 color={isBraking ? '#ff1e42' : '#450a0a'}
                 emissive="#ff1e42"
                 emissiveIntensity={isBraking ? 7.8 : 0.3}
@@ -1069,6 +1200,7 @@ export const Car3D: React.FC<Car3DProps> = ({
             <mesh position={[0.35, 2.2, 0.92]}>
               <boxGeometry args={[0.16, 0.14, 0.82]} />
               <meshStandardMaterial
+                ref={rightBrakeLedMatRef}
                 color={isBraking ? '#ff1e42' : '#450a0a'}
                 emissive="#ff1e42"
                 emissiveIntensity={isBraking ? 7.8 : 0.3}

@@ -4,7 +4,8 @@ import * as THREE from 'three';
 import { Particle } from '../../types';
 
 interface SmokeParticlesProps {
-  particles: Particle[];
+  particles?: Particle[];
+  particlesRef?: React.MutableRefObject<Particle[]>;
 }
 
 // Soft radial Gaussian particle sprite (replaces harsh square WebGL pixels!)
@@ -31,32 +32,74 @@ const createSoftParticleTexture = () => {
 
 const MAX_PARTICLES = 450;
 
-export const SmokeParticles: React.FC<SmokeParticlesProps> = ({ particles }) => {
+export const SmokeParticles: React.FC<SmokeParticlesProps> = ({ particles, particlesRef }) => {
   const smokeRef = useRef<THREE.Points>(null);
   const sparksRef = useRef<THREE.Points>(null);
 
-  const { spriteTex, smokePos, smokeCol, sparkPos, sparkCol } = useMemo(() => {
+  const {
+    spriteTex,
+    smokePos,
+    smokeCol,
+    sparkPos,
+    sparkCol,
+    smokePosAttr,
+    smokeColAttr,
+    sparkPosAttr,
+    sparkColAttr
+  } = useMemo(() => {
+    const sPos = new Float32Array(MAX_PARTICLES * 3);
+    const sCol = new Float32Array(MAX_PARTICLES * 3);
+    const kPos = new Float32Array(MAX_PARTICLES * 3);
+    const kCol = new Float32Array(MAX_PARTICLES * 3);
+
+    const sPosAttr = new THREE.BufferAttribute(sPos, 3);
+    sPosAttr.setUsage(THREE.DynamicDrawUsage);
+    const sColAttr = new THREE.BufferAttribute(sCol, 3);
+    sColAttr.setUsage(THREE.DynamicDrawUsage);
+
+    const kPosAttr = new THREE.BufferAttribute(kPos, 3);
+    kPosAttr.setUsage(THREE.DynamicDrawUsage);
+    const kColAttr = new THREE.BufferAttribute(kCol, 3);
+    kColAttr.setUsage(THREE.DynamicDrawUsage);
+
     return {
       spriteTex: createSoftParticleTexture(),
-      smokePos: new Float32Array(MAX_PARTICLES * 3),
-      smokeCol: new Float32Array(MAX_PARTICLES * 3),
-      sparkPos: new Float32Array(MAX_PARTICLES * 3),
-      sparkCol: new Float32Array(MAX_PARTICLES * 3)
+      smokePos: sPos,
+      smokeCol: sCol,
+      sparkPos: kPos,
+      sparkCol: kCol,
+      smokePosAttr: sPosAttr,
+      smokeColAttr: sColAttr,
+      sparkPosAttr: kPosAttr,
+      sparkColAttr: kColAttr
     };
   }, []);
 
   useEffect(() => {
+    if (smokeRef.current) {
+      const geo = smokeRef.current.geometry;
+      geo.setAttribute('position', smokePosAttr);
+      geo.setAttribute('color', smokeColAttr);
+      geo.setDrawRange(0, 0);
+    }
+    if (sparksRef.current) {
+      const geo = sparksRef.current.geometry;
+      geo.setAttribute('position', sparkPosAttr);
+      geo.setAttribute('color', sparkColAttr);
+      geo.setDrawRange(0, 0);
+    }
     return () => {
       spriteTex.dispose();
     };
-  }, [spriteTex]);
+  }, [spriteTex, smokePosAttr, smokeColAttr, sparkPosAttr, sparkColAttr]);
 
   useFrame(() => {
+    const list = particlesRef ? particlesRef.current : particles || [];
     let smokeCount = 0;
     let sparkCount = 0;
 
-    for (let i = 0; i < particles.length; i++) {
-      const p = particles[i];
+    for (let i = 0; i < list.length; i++) {
+      const p = list[i];
       const alpha = Math.max(0, Math.min(1, p.alpha));
       const isSpark = p.color === '#fbbf24' || p.color === '#fff7ed';
 
@@ -64,7 +107,7 @@ export const SmokeParticles: React.FC<SmokeParticlesProps> = ({ particles }) => 
         const idx = sparkCount * 3;
         sparkPos[idx] = p.x;
         sparkPos[idx + 1] = 500 - p.y;
-        sparkPos[idx + 2] = 0.65 + (p.life * 0.08);
+        sparkPos[idx + 2] = 0.65 + p.life * 0.08;
         // Incandescent white-gold titanium skid-block sparks
         sparkCol[idx] = 1.0 * alpha;
         sparkCol[idx + 1] = (0.62 + alpha * 0.35) * alpha;
@@ -76,7 +119,8 @@ export const SmokeParticles: React.FC<SmokeParticlesProps> = ({ particles }) => 
         smokePos[idx + 1] = 500 - p.y;
         smokePos[idx + 2] = 0.9 + p.life * 0.12;
 
-        const isGravelDust = p.color === '#d6c7a1' || p.color === '#b45309' || p.color === '#34d399';
+        const isGravelDust =
+          p.color === '#d6c7a1' || p.color === '#b45309' || p.color === '#34d399';
         if (isGravelDust) {
           // Warm limestone gravel dust cloud
           smokeCol[idx] = 0.78 * alpha;
@@ -95,18 +139,20 @@ export const SmokeParticles: React.FC<SmokeParticlesProps> = ({ particles }) => 
 
     if (smokeRef.current) {
       const geo = smokeRef.current.geometry;
-      geo.setAttribute('position', new THREE.BufferAttribute(smokePos.subarray(0, smokeCount * 3), 3));
-      geo.setAttribute('color', new THREE.BufferAttribute(smokeCol.subarray(0, smokeCount * 3), 3));
+      if (smokeCount > 0) {
+        smokePosAttr.needsUpdate = true;
+        smokeColAttr.needsUpdate = true;
+      }
       geo.setDrawRange(0, smokeCount);
-      if (smokeCount > 0) geo.computeBoundingSphere();
     }
 
     if (sparksRef.current) {
       const geo = sparksRef.current.geometry;
-      geo.setAttribute('position', new THREE.BufferAttribute(sparkPos.subarray(0, sparkCount * 3), 3));
-      geo.setAttribute('color', new THREE.BufferAttribute(sparkCol.subarray(0, sparkCount * 3), 3));
+      if (sparkCount > 0) {
+        sparkPosAttr.needsUpdate = true;
+        sparkColAttr.needsUpdate = true;
+      }
       geo.setDrawRange(0, sparkCount);
-      if (sparkCount > 0) geo.computeBoundingSphere();
     }
   });
 

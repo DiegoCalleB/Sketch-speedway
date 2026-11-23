@@ -10,6 +10,8 @@ interface CameraDirectorProps {
   phase: GamePhase;
   activeCar?: RaceCarState;
   allCars?: RaceCarState[];
+  carsStateRef?: React.MutableRefObject<RaceCarState[]>;
+  focusedPlayerId?: string | null;
   activePlayerGrid?: { x: number; y: number };
   activeDrawingTip?: { x: number; y: number } | null;
   track: Track;
@@ -21,11 +23,17 @@ interface CameraDirectorProps {
 const _desiredPos = new THREE.Vector3(400, 250, 536);
 const _desiredLookAt = new THREE.Vector3(400, 250, 0);
 const _desiredUp = new THREE.Vector3(0, 1, 0);
+const _testForward = new THREE.Vector3();
+const _testRight = new THREE.Vector3();
+const _testUp = new THREE.Vector3();
+const _testToCar = new THREE.Vector3();
 
 export const CameraDirector: React.FC<CameraDirectorProps> = ({
   phase,
   activeCar,
   allCars = [],
+  carsStateRef,
+  focusedPlayerId = null,
   track,
   cameraMode = 'helicopter',
   isPortrait = false,
@@ -71,10 +79,15 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
       return;
     }
 
-    // 2. RACING PHASE
-    let focusCar = activeCar;
+    // 2. RACING PHASE — Read live carsStateRef directly so Camera & Car3D are 100% phase-locked on the exact same frame
+    const liveCars =
+      carsStateRef?.current && carsStateRef.current.length > 0 ? carsStateRef.current : allCars;
+    const focusTargetId = focusedPlayerId || activeCar?.playerId || null;
+    let focusCar = focusTargetId
+      ? liveCars.find((c) => c.playerId === focusTargetId)
+      : activeCar;
     if (!focusCar || focusCar.finished || focusCar.disqualified) {
-      const racingCars = allCars.filter((c) => !c.finished && !c.disqualified);
+      const racingCars = liveCars.filter((c) => !c.finished && !c.disqualified);
       if (racingCars.length > 0) {
         focusCar = racingCars[0];
       }
@@ -84,24 +97,23 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
 
     if (focusCar) {
       if (focusCar.bounceCooldown >= 12 && prevBounceCooldown.current < 12) {
-        shakeRef.current = 4.2;
+        shakeRef.current = 3.2;
       }
       prevBounceCooldown.current = focusCar.bounceCooldown;
 
       if (focusCar.offTrack && focusSpeed > 1.2) {
-        shakeRef.current = Math.max(shakeRef.current, 1.35);
+        shakeRef.current = Math.max(shakeRef.current, 0.9);
       } else if (focusCar.isDrifting) {
-        shakeRef.current = Math.max(shakeRef.current, 0.55);
+        shakeRef.current = Math.max(shakeRef.current, 0.35);
       } else if (cameraMode === 'onboard' && focusSpeed > 5.2) {
-        shakeRef.current = Math.max(shakeRef.current, 0.14);
+        shakeRef.current = Math.max(shakeRef.current, 0.1);
       }
     }
 
-    shakeRef.current = THREE.MathUtils.damp(shakeRef.current, 0, 9, dt);
+    shakeRef.current = THREE.MathUtils.damp(shakeRef.current, 0, 10, dt);
     if (shakeRef.current < 0.02) shakeRef.current = 0;
 
     // 2A. CINEMATIC STARTING GRID COUNTDOWN SHOT (3... 2... 1...)
-    // Frames the F1 cars from a dramatic low-angle 3D grid perspective looking through the glowing FIA Gantry!
     const isPreLaunchCountdown =
       countdownValue !== null && countdownValue !== '¡YA!' && focusCar && focusSpeed < 0.25;
 
@@ -109,11 +121,11 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
     if (isPreLaunchCountdown) {
       targetFov = 46;
     } else if (cameraMode === 'onboard') {
-      targetFov = 56 + THREE.MathUtils.clamp((focusSpeed - 2.0) * 2.6, 0, 15);
+      targetFov = 56 + THREE.MathUtils.clamp((focusSpeed - 2.0) * 2.2, 0, 12);
     } else if (cameraMode === 'chase') {
-      targetFov = 50 + THREE.MathUtils.clamp((focusSpeed - 2.2) * 2.1, 0, 12);
+      targetFov = 50 + THREE.MathUtils.clamp((focusSpeed - 2.2) * 1.8, 0, 10);
     } else if (cameraMode === 'helicopter') {
-      targetFov = 46 + THREE.MathUtils.clamp((focusSpeed - 2.8) * 1.1, 0, 6);
+      targetFov = 48;
     }
 
     if (Math.abs(camera.fov - targetFov) > 0.05) {
@@ -132,21 +144,20 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
       const carWorldY = 500 - focusCar.y;
       const carWorldZ = carSurf.elevationZ + 0.15;
 
-      // Low-slung cinematic grid camera right behind the rear wing looking up through the 5 red FIA gantry lights
+      // Frame ALL starting grid cars cleanly behind the pack looking toward the 5 red FIA gantry lights
       _desiredPos.set(
-        carWorldX - fwdX * 26 + sideX * 6.5,
-        carWorldY - fwdY * 26 + sideY * 6.5,
-        carWorldZ + 7.2
+        carWorldX - fwdX * 34 + sideX * 10,
+        carWorldY - fwdY * 34 + sideY * 10,
+        carWorldZ + 11.5
       );
       _desiredLookAt.set(
-        carWorldX + fwdX * 42,
-        carWorldY + fwdY * 42,
-        carWorldZ + 8.5
+        carWorldX + fwdX * 36,
+        carWorldY + fwdY * 36,
+        carWorldZ + 6.5
       );
       _desiredUp.set(0, 0, 1);
     } else if (cameraMode === 'onboard' && focusCar) {
       const carSurf = getTrackSurfaceInfo({ x: focusCar.x, y: focusCar.y }, track);
-      // True T-Cam mounted rigidly on the carbon airbox follows the real chassis heading
       const yaw = -focusCar.angle;
       const fwdX = Math.cos(yaw);
       const fwdY = Math.sin(yaw);
@@ -167,7 +178,6 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
       _desiredUp.set(0, 0, 1);
     } else if (cameraMode === 'chase' && focusCar) {
       const carSurf = getTrackSurfaceInfo({ x: focusCar.x, y: focusCar.y }, track);
-      // Chase camera tracks a natural blend of chassis heading and velocity vector so real drifts swing dramatically in view!
       const yaw = -focusCar.angle - (focusCar.slipAngle ?? 0) * 0.45;
       const fwdX = Math.cos(yaw);
       const fwdY = Math.sin(yaw);
@@ -175,12 +185,11 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
       const carWorldY = 500 - focusCar.y;
       const carWorldZ = carSurf.elevationZ + 0.15;
 
-      // Next-Gen GTA VI / F1 Low-Slung Broadcast Chase Cam right behind the rear wing!
-      const trailDist = 20.5 + focusSpeed * 1.35;
+      const trailDist = 22.0 + focusSpeed * 1.3;
       _desiredPos.set(
         carWorldX - fwdX * trailDist,
         carWorldY - fwdY * trailDist,
-        carWorldZ + 8.2 + focusSpeed * 0.32
+        carWorldZ + 8.8 + focusSpeed * 0.3
       );
       _desiredLookAt.set(
         carWorldX + fwdX * 34,
@@ -192,57 +201,128 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
       _desiredUp.set(upX, upY, 0);
       _desiredLookAt.set(400, 250, 0);
       _desiredPos.set(
-        400 - upX * (fullCircuitZ * 0.24),
-        250 - upY * (fullCircuitZ * 0.24),
-        fullCircuitZ * 0.88
+        400 - upX * (fullCircuitZ * 0.16),
+        250 - upY * (fullCircuitZ * 0.16),
+        fullCircuitZ * 0.94
       );
     } else {
-      // 'helicopter' (Default TV Dinámica): Dramatic low-altitude F1 TV Broadcast Helicopter framing specular road & cars
+      // 'helicopter' (Default TV Dinámica):
+      // Exact Multi-Car Bounding-Box + Frustum-Verified Framing!
+      // Dynamically zooms IN for close wheel-to-wheel battles and smoothly zooms OUT so ALL racing cars ALWAYS stay visible inside safe HUD bounds!
       _desiredUp.set(upX, upY, 0);
-      if (focusCar) {
-        const lookAheadX = focusCar.vx * 10.5;
-        const lookAheadY = -focusCar.vy * 10.5;
+      const activeRacers = liveCars.filter((c) => !c.disqualified);
+      const carsToFrame =
+        activeRacers.length > 0 ? activeRacers : focusCar ? [focusCar] : [];
 
-        let packX = focusCar.x + lookAheadX;
-        let packY = 500 - focusCar.y + lookAheadY;
-        let maxSpread = 0;
+      if (carsToFrame.length > 0) {
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minY = Infinity;
+        let maxY = -Infinity;
 
-        const racingCars = allCars.filter((c) => !c.finished && !c.disqualified);
-        if (racingCars.length > 1) {
-          let sumX = 0;
-          let sumY = 0;
-          racingCars.forEach((c) => {
-            const cy = 500 - c.y;
-            sumX += c.x;
-            sumY += cy;
-            const d = Math.hypot(c.x - focusCar!.x, cy - (500 - focusCar!.y));
-            if (d > maxSpread) maxSpread = d;
-          });
-          const avgX = sumX / racingCars.length;
-          const avgY = racingCars.length > 0 ? sumY / racingCars.length : packY;
-          packX = packX * 0.76 + avgX * 0.24;
-          packY = packY * 0.76 + avgY * 0.24;
+        for (let i = 0; i < carsToFrame.length; i++) {
+          const c = carsToFrame[i];
+          const cx = c.x;
+          const cy = 500 - c.y;
+          // Include subtle velocity lead so cars never touch the leading screen edge
+          const leadX = cx + c.vx * 5.0;
+          const leadY = cy - c.vy * 5.0;
+
+          if (cx < minX) minX = cx;
+          if (cx > maxX) maxX = cx;
+          if (leadX < minX) minX = leadX;
+          if (leadX > maxX) maxX = leadX;
+
+          if (cy < minY) minY = cy;
+          if (cy > maxY) maxY = cy;
+          if (leadY < minY) minY = leadY;
+          if (leadY > maxY) maxY = leadY;
         }
 
-        const clampedX = THREE.MathUtils.clamp(packX, 155, 645);
-        const clampedY = THREE.MathUtils.clamp(packY, 105, 395);
+        const midX = (minX + maxX) * 0.5;
+        const midY = (minY + maxY) * 0.5;
+        const boxSpanX = Math.max(0, maxX - minX);
+        const boxSpanY = Math.max(0, maxY - minY);
 
-        _desiredLookAt.set(clampedX, clampedY, 1.2);
+        // Generous world-space margin around the pack so cars + track curbs + HUD never clip cars off-screen
+        const padAlongUp = isPortrait ? 135 : 95;
+        const padAcross = isPortrait ? 95 : 120;
 
-        const spreadZoom = Math.min(85, maxSpread * 0.25);
-        const dist = (isPortrait ? 185 : 148) + focusSpeed * 4.8 + spreadZoom;
-        // Closer, lower grazing angle (0.72 horizontal offset, 0.66 vertical height) showcases 3D relief & car reflections!
-        _desiredPos.set(
-          clampedX - upX * (dist * 0.72),
-          clampedY - upY * (dist * 0.72),
-          dist * 0.66
+        const spanVertical = (isPortrait ? boxSpanX : boxSpanY) + padAlongUp * 2;
+        const spanHorizontal = (isPortrait ? boxSpanY : boxSpanX) + padAcross * 2;
+
+        const activeTanHalfFov = Math.tan(THREE.MathUtils.degToRad(targetFov) * 0.5);
+        const safeAspect = Math.max(0.42, aspect);
+        const reqDistV = (spanVertical * 0.5) / activeTanHalfFov;
+        const reqDistH = (spanHorizontal * 0.5) / (activeTanHalfFov * safeAspect);
+
+        const minCloseDist = isPortrait ? 195 : 165;
+        const maxOverviewDist = fullCircuitZ * 1.14;
+        let requiredDist = THREE.MathUtils.clamp(
+          Math.max(minCloseDist, reqDistV, reqDistH),
+          minCloseDist,
+          maxOverviewDist
         );
+
+        // Frustum-Verification Refinement (0 heap allocations): verifies EVERY active car stays inside safe HUD-free NDC bounds!
+        for (let iter = 0; iter < 6; iter++) {
+          const zoomOutRatio = THREE.MathUtils.clamp(
+            (requiredDist - minCloseDist) / Math.max(1, maxOverviewDist - minCloseDist),
+            0,
+            1
+          );
+          const lookX = THREE.MathUtils.lerp(
+            THREE.MathUtils.clamp(midX, 110, 690),
+            400,
+            zoomOutRatio * 0.65
+          );
+          const lookY = THREE.MathUtils.lerp(
+            THREE.MathUtils.clamp(midY, 85, 415),
+            250,
+            zoomOutRatio * 0.65
+          );
+          _desiredLookAt.set(lookX, lookY, 1.0);
+
+          const tiltRatio = THREE.MathUtils.lerp(0.46, 0.18, zoomOutRatio);
+          const heightRatio = Math.sqrt(Math.max(0.55, 1 - tiltRatio * tiltRatio));
+          _desiredPos.set(
+            lookX - upX * (requiredDist * tiltRatio),
+            lookY - upY * (requiredDist * tiltRatio),
+            requiredDist * heightRatio
+          );
+
+          // Construct orthonormal candidate camera basis
+          _testForward.subVectors(_desiredLookAt, _desiredPos).normalize();
+          _testRight.crossVectors(_testForward, _desiredUp).normalize();
+          _testUp.crossVectors(_testRight, _testForward).normalize();
+
+          let allInside = true;
+          for (let i = 0; i < carsToFrame.length; i++) {
+            const c = carsToFrame[i];
+            _testToCar.set(c.x - _desiredPos.x, 500 - c.y - _desiredPos.y, 1.8 - _desiredPos.z);
+            const depth = _testToCar.dot(_testForward);
+            if (depth <= 12) {
+              allInside = false;
+              break;
+            }
+            const ndcX = _testToCar.dot(_testRight) / (depth * activeTanHalfFov * safeAspect);
+            const ndcY = _testToCar.dot(_testUp) / (depth * activeTanHalfFov);
+            // Leave extra top margin (ndcY <= 0.68) for HUD pills & leaderboard
+            if (Math.abs(ndcX) > 0.78 || ndcY < -0.74 || ndcY > 0.68) {
+              allInside = false;
+              break;
+            }
+          }
+
+          if (allInside || requiredDist >= maxOverviewDist - 1) break;
+          requiredDist = Math.min(maxOverviewDist, requiredDist * 1.12);
+        }
       } else {
         _desiredLookAt.set(400, 250, 0);
         _desiredPos.set(
-          400 - upX * 115,
-          250 - upY * 115,
-          fullCircuitZ * 0.85
+          400 - upX * 90,
+          250 - upY * 90,
+          fullCircuitZ * 0.92
         );
       }
     }
@@ -269,7 +349,7 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
           ? 7.5
           : cameraMode === 'chase'
             ? 9.5
-            : 5.2;
+            : 5.8;
     const lookLambda =
       cameraMode === 'onboard'
         ? 24.0
@@ -277,7 +357,7 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
           ? 9.5
           : cameraMode === 'chase'
             ? 11.5
-            : 7.0;
+            : 7.5;
 
     camera.position.x = THREE.MathUtils.damp(camera.position.x, _desiredPos.x, posLambda, dt);
     camera.position.y = THREE.MathUtils.damp(camera.position.y, _desiredPos.y, posLambda, dt);
@@ -311,10 +391,10 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
     }
 
     if (shakeRef.current > 0) {
-      const shakeAmt = cameraMode === 'onboard' ? shakeRef.current * 0.28 : shakeRef.current;
+      const shakeAmt = cameraMode === 'onboard' ? shakeRef.current * 0.25 : shakeRef.current * 0.65;
       camera.position.x += (Math.random() - 0.5) * shakeAmt;
       camera.position.y += (Math.random() - 0.5) * shakeAmt;
-      camera.position.z += (Math.random() - 0.5) * shakeAmt * 0.5;
+      camera.position.z += (Math.random() - 0.5) * shakeAmt * 0.4;
     }
 
     camera.lookAt(currentLookAtRef.current);

@@ -29,6 +29,7 @@ import {
 import { stepVehiclePhysics, resolveCarCollisions } from '../utils/vehiclePhysics';
 import { useGameStore } from '../store/gameStore';
 import { audio } from '../utils/audio';
+import { haptics } from '../utils/haptics';
 import {
   Play,
   Pause,
@@ -59,6 +60,8 @@ import { Skidmarks3D, SkidmarkPoint } from './ThreeGame/Skidmarks3D';
 import { CameraDirector, RaceCameraMode } from './ThreeGame/CameraDirector';
 import { SceneAtmosphere, LightingPreset } from './ThreeGame/SceneAtmosphere';
 import { PostProcessingEffects } from './ThreeGame/PostProcessingEffects';
+import { CarScreenProjector, RacingOverlayCanvas } from './ThreeGame/RacingOverlayCanvas';
+import { ProjectedCarScreenPoint } from './ThreeGame/renderLayers';
 
 import * as THREE from 'three';
 
@@ -86,8 +89,13 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 }) => {
   // Default to full-viewport mode automatically during drawing and racing so the user has maximum space!
   const [isVirtualFullscreen, setIsVirtualFullscreen] = useState(true);
+  const [isMobileDevice, setIsMobileDevice] = useState(() =>
+    typeof window !== 'undefined'
+      ? window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768
+      : false
+  );
   const [isPortraitTrack, setIsPortraitTrack] = useState(() =>
-    typeof window !== 'undefined' ? window.innerHeight > window.innerWidth * 1.08 : false
+    typeof window !== 'undefined' ? window.innerHeight > window.innerWidth * 1.04 : false
   );
   const [manualOrientationOverride, setManualOrientationOverride] = useState<boolean | null>(null);
 
@@ -103,6 +111,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const [ghostFloatIdx, setGhostFloatIdx] = useState(0);
   const [countdownValue, setCountdownValue] = useState<string | null>(null);
   const [drawingSectorProgress, setDrawingSectorProgress] = useState(0);
+  const [lapSavedNotice, setLapSavedNotice] = useState<string | null>(null);
+  const [inspectLapIndex, setInspectLapIndex] = useState(0);
+  const [redrawLapTarget, setRedrawLapTarget] = useState<number | null>(null);
   const [cameraMode, setCameraMode] = useState<RaceCameraMode>('helicopter');
   const [lightingPreset, setLightingPreset] = useState<LightingPreset>('day');
   const [focusedPlayerId, setFocusedPlayerId] = useState<string | null>(null);
@@ -127,18 +138,31 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const raceSessionIdRef = useRef(0);
   const activePointerIdRef = useRef<number | null>(null);
 
-  // Automatically detect screen portrait vs landscape on resize unless manually overridden
+  // Automatically detect screen portrait vs landscape on Android & iPhone (including iOS Safari orientationchange delay)
   useEffect(() => {
+    let orientTimer: ReturnType<typeof setTimeout> | null = null;
     const updateOrientation = () => {
+      const mobile = window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768;
+      setIsMobileDevice(mobile);
       if (manualOrientationOverride !== null) {
         setIsPortraitTrack(manualOrientationOverride);
       } else {
-        setIsPortraitTrack(window.innerHeight > window.innerWidth * 1.08);
+        setIsPortraitTrack(window.innerHeight > window.innerWidth * 1.04);
       }
+    };
+    const handleOrientChange = () => {
+      updateOrientation();
+      if (orientTimer) clearTimeout(orientTimer);
+      orientTimer = setTimeout(updateOrientation, 140);
     };
     updateOrientation();
     window.addEventListener('resize', updateOrientation);
-    return () => window.removeEventListener('resize', updateOrientation);
+    window.addEventListener('orientationchange', handleOrientChange);
+    return () => {
+      if (orientTimer) clearTimeout(orientTimer);
+      window.removeEventListener('resize', updateOrientation);
+      window.removeEventListener('orientationchange', handleOrientChange);
+    };
   }, [manualOrientationOverride]);
 
   // Escape keylistener for virtual fullscreen mode
@@ -159,7 +183,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     return () => clearTimeout(timer);
   }, [drawingError]);
 
-  // Android / mobile lifecycle: suspend Web Audio & pause delta spikes when app moves to background
+  // Auto-dismiss positive per-lap saved notice after 2.6 seconds
+  useEffect(() => {
+    if (!lapSavedNotice) return;
+    const timer = setTimeout(() => setLapSavedNotice(null), 2600);
+    return () => clearTimeout(timer);
+  }, [lapSavedNotice]);
+
+  // Android & iPhone lifecycle: suspend Web Audio & pause delta spikes when app moves to background
   useEffect(() => {
     const handleVisibilityChange = () => {
       if (document.hidden) {
@@ -169,22 +200,39 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         audio.resumeFromBackground();
       }
     };
+    const handlePageHide = () => audio.suspendForBackground();
+    const handlePageShow = () => {
+      lastFrameTimeRef.current = performance.now();
+      audio.resumeFromBackground();
+    };
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('pageshow', handlePageShow);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('pageshow', handlePageShow);
+    };
   }, []);
 
-  // Core drawing vectors
+  // Core drawing vectors & synchronous multi-lap refs (prevents stale closures in pointerMove)
   const [drawnPoints, setDrawnPoints] = useState<Point[]>([]);
   const drawnPointsRef = useRef<Point[]>([]);
+  const drawingSectorProgressRef = useRef<number>(0);
+  const drawingLapsCompletedRef = useRef<Point[][]>([]);
+  const justSavedLapInMoveRef = useRef<boolean>(false);
 
-  // Simulation physics reactive states
+  // Simulation HUD reactive state (throttled ~15Hz; 3D WebGL & 2D Overlay read directly from refs at 60/120fps)
   const [activeCars, setActiveCars] = useState<RaceCarState[]>([]);
-  const [skidmarks, setSkidmarks] = useState<SkidmarkPoint[]>([]);
-  const [particles, setParticles] = useState<Particle[]>([]);
 
-  // Simulation refs for loop synchronization
+  // Simulation refs for zero-lag 60/120fps WebGL & 2D overlay canvas synchronization
   const carsStateRef = useRef<RaceCarState[]>([]);
+  const projectedCarsRef = useRef<ProjectedCarScreenPoint[]>([]);
+  const onOverlayFrameRef = useRef<(() => void) | null>(null);
+  const lastHudLapSumRef = useRef<number>(-1);
+  const lastHudFinishCountRef = useRef<number>(-1);
   const racePathsRef = useRef<Record<string, Point[]>>({});
+  const raceLapPathsRef = useRef<Record<string, Point[][]>>({});
   const flyingPathsRef = useRef<Record<string, Point[]>>({});
   const particlesRef = useRef<Particle[]>([]);
   const skidmarksRef = useRef<SkidmarkPoint[]>([]);
@@ -198,7 +246,31 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
   const activePlayer = players[activePlayerIndex];
   const gridPos = track.startGrid[activePlayerIndex] || track.startGrid[0];
-  const allPlayersReady = players.length > 0 && players.every((p) => p.drawnPath.length > 0 || p.isAI);
+  const allPlayersReady =
+    players.length > 0 &&
+    players.every((p) => p.isAI || (p.lapPaths?.length || 0) >= totalLaps);
+  const activePlayerSavedLaps = activePlayer?.lapPaths || [];
+  const activeDrawingLapNumber =
+    redrawLapTarget !== null
+      ? redrawLapTarget + 1
+      : Math.min(totalLaps, activePlayerSavedLaps.length + 1);
+  const isDrawingBlockedByReady = allPlayersReady && redrawLapTarget === null;
+
+  // Compute exact start anchor for the current lap being drawn (gridPos for V1, or previous lap's finish exit for V2..N)
+  const midStartLine = {
+    x: (track.startLine.p1.x + track.startLine.p2.x) * 0.5,
+    y: (track.startLine.p1.y + track.startLine.p2.y) * 0.5
+  };
+  const prevLapForAnchor =
+    activeDrawingLapNumber > 1 ? activePlayerSavedLaps[activeDrawingLapNumber - 2] : undefined;
+  const currentStartAnchor =
+    activeDrawingLapNumber === 1 || !prevLapForAnchor || prevLapForAnchor.length === 0
+      ? { x: gridPos.x, y: gridPos.y, angle: gridPos.angle }
+      : {
+          x: prevLapForAnchor[prevLapForAnchor.length - 1].x,
+          y: prevLapForAnchor[prevLapForAnchor.length - 1].y,
+          angle: gridPos.angle
+        };
 
   const usePortraitLayout = isVirtualFullscreen && isPortraitTrack;
 
@@ -286,6 +358,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     simulationTickRef.current = 0;
     telemetrySamplesRef.current = {};
     racePathsRef.current = {};
+    raceLapPathsRef.current = {};
     flyingPathsRef.current = {};
     setPaceMode('balanced');
     paceModeRef.current = 'balanced';
@@ -293,26 +366,89 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     if (finishCountdownTimerRef.current) clearTimeout(finishCountdownTimerRef.current);
     if (lapBannerTimerRef.current) clearTimeout(lapBannerTimerRef.current);
 
-    players.forEach((p, idx) => {
-      if (p.isAI && p.drawnPath.length === 0) {
-        p.drawnPath = generateAIPath(track, 320, p.aiArchetype || 'apex_master', idx);
-      }
-      const smoothed = resampleAndSmoothPath(p.drawnPath, 5);
-      racePathsRef.current[p.id] = smoothed;
+    const activeTotalLaps = Math.max(1, useGameStore.getState().totalLaps);
 
-      // Build a Flying-Lap path for Laps 2..N where the main straight start zone carries full straightaway exit speed instead of standing-start speed
-      const exitStraightSpeed =
-        smoothed.length > 4
-          ? Math.max(6.0, smoothed[smoothed.length - 3]?.speed || 6.4)
-          : 6.4;
-      flyingPathsRef.current[p.id] = smoothed.map((pt, ptIdx) => {
-        if (ptIdx < 20) {
-          const blend = ptIdx / 20;
-          const boosted = exitStraightSpeed * (1 - blend * 0.35) + pt.speed * (blend * 0.35);
-          return { ...pt, speed: Math.max(pt.speed, boosted) };
+    players.forEach((p, idx) => {
+      if (p.isAI) {
+        // Generate or reuse distinct saved AI racing lines for EVERY lap (so Replay & TelemetryLab match 100%)
+        let aiLapPaths: Point[][] =
+          p.lapPaths && p.lapPaths.length >= activeTotalLaps ? p.lapPaths.slice(0, activeTotalLaps) : [];
+
+        if (aiLapPaths.length < activeTotalLaps) {
+          aiLapPaths = [];
+          for (let lapIdx = 0; lapIdx < activeTotalLaps; lapIdx++) {
+            const rawAi = generateAIPath(
+              track,
+              320,
+              p.aiArchetype || 'apex_master',
+              (idx + lapIdx * 2) % 4
+            );
+            const smoothedAi = resampleAndSmoothPath(rawAi, 5);
+            if (lapIdx > 0) {
+              const prevLap = aiLapPaths[lapIdx - 1];
+              const exitSpd = Math.max(6.2, prevLap[prevLap.length - 3]?.speed || 6.5);
+              aiLapPaths.push(
+                smoothedAi.map((pt, ptIdx) =>
+                  ptIdx < 16
+                    ? {
+                        ...pt,
+                        speed: Math.max(
+                          pt.speed,
+                          exitSpd * (1 - (ptIdx / 24)) + pt.speed * (ptIdx / 24)
+                        )
+                      }
+                    : pt
+                )
+              );
+            } else {
+              aiLapPaths.push(smoothedAi);
+            }
+          }
+          useGameStore.getState().setPlayerLapPaths(p.id, aiLapPaths);
         }
-        return pt;
-      });
+
+        raceLapPathsRef.current[p.id] = aiLapPaths;
+        racePathsRef.current[p.id] = aiLapPaths[0] || [];
+        flyingPathsRef.current[p.id] = aiLapPaths[1] || aiLapPaths[0] || [];
+      } else {
+        // Human player: use each individual saved lap path verbatim!
+        const rawLaps: Point[][] =
+          p.lapPaths && p.lapPaths.length > 0
+            ? p.lapPaths
+            : p.drawnPath.length > 0
+              ? [p.drawnPath]
+              : [];
+
+        const processedLaps: Point[][] = [];
+        for (let lapIdx = 0; lapIdx < activeTotalLaps; lapIdx++) {
+          const sourceLap = rawLaps[lapIdx] || rawLaps[rawLaps.length - 1] || [];
+          const smoothed = resampleAndSmoothPath(sourceLap, 5);
+          if (lapIdx > 0 && smoothed.length > 4) {
+            // Preserve 100% of the player's Lap N line & corner speeds; only smooth initial 10 points if finger was lifted between laps
+            const prevLap = processedLaps[lapIdx - 1] || smoothed;
+            const prevExitSpeed = Math.max(
+              5.4,
+              prevLap[Math.max(0, prevLap.length - 4)]?.speed || 6.0
+            );
+            processedLaps.push(
+              smoothed.map((pt, ptIdx) => {
+                if (ptIdx < 10) {
+                  const blend = ptIdx / 10;
+                  const carryover = prevExitSpeed * (1 - blend * 0.45) + pt.speed * (blend * 0.45);
+                  return { ...pt, speed: Math.max(pt.speed, carryover) };
+                }
+                return pt;
+              })
+            );
+          } else {
+            processedLaps.push(smoothed);
+          }
+        }
+
+        raceLapPathsRef.current[p.id] = processedLaps;
+        racePathsRef.current[p.id] = processedLaps[0] || [];
+        flyingPathsRef.current[p.id] = processedLaps[1] || processedLaps[0] || [];
+      }
     });
 
     const initialCars: RaceCarState[] = players.map((p, idx) => {
@@ -355,9 +491,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     carsStateRef.current = initialCars;
     particlesRef.current = [];
     skidmarksRef.current = [];
+    lastHudLapSumRef.current = -1;
+    lastHudFinishCountRef.current = -1;
     setActiveCars([...initialCars]);
-    setParticles([]);
-    setSkidmarks([]);
 
     const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
     const isReplayActive = useGameStore.getState().isReplaying;
@@ -367,6 +503,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         if (raceSessionIdRef.current !== sessionId) return;
         setCountdownValue(count.toString());
         audio.playCountdownTick();
+        haptics.countdownTick();
         await delay(750);
         if (raceSessionIdRef.current !== sessionId) return;
       }
@@ -374,6 +511,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       if (raceSessionIdRef.current !== sessionId) return;
       setCountdownValue('¡YA!');
       audio.playCountdownGo();
+      haptics.countdownGo();
       setTimeout(() => {
         if (raceSessionIdRef.current === sessionId) {
           setCountdownValue(null);
@@ -419,12 +557,24 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     simulationTickRef.current++;
     updateSimulationPhysics(dtFactor, now);
 
-    setActiveCars([...carsStateRef.current]);
-    setParticles([...particlesRef.current]);
-    setSkidmarks([...skidmarksRef.current]);
+    // Sync React HUD leaderboard/speedometer at ~15Hz (or immediately on lap/finish change)
+    // while WebGL Car3D, CameraDirector, SmokeParticles, Skidmarks3D & 2D Overlay render at full 60/120fps directly from refs!
+    const finishedCount = carsStateRef.current.filter((c) => c.finished).length;
+    let lapSum = 0;
+    for (let i = 0; i < carsStateRef.current.length; i++) {
+      lapSum += carsStateRef.current[i].lap || 1;
+    }
+    if (
+      simulationTickRef.current % 4 === 0 ||
+      lapSum !== lastHudLapSumRef.current ||
+      finishedCount !== lastHudFinishCountRef.current
+    ) {
+      lastHudLapSumRef.current = lapSum;
+      lastHudFinishCountRef.current = finishedCount;
+      setActiveCars([...carsStateRef.current]);
+    }
 
     const elapsed = now - raceStartTimeRef.current;
-    const finishedCount = carsStateRef.current.filter((c) => c.finished).length;
 
     if (finishedCount >= Math.min(2, players.length) && !finishCountdownTimerRef.current) {
       finishCountdownTimerRef.current = setTimeout(() => {
@@ -684,32 +834,19 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         car.lapStartTime = now;
 
         if (car.lap < activeTotalLaps) {
-          // Advance to Next Flying Lap seamlessly!
+          // Advance to Next Lap using THAT LAP'S dedicated saved racing line!
           const finishedLapNum = car.lap;
           car.lap += 1;
           car.checkpointPassed = -1;
 
-          // If AI driver, subtly vary its racing line on subsequent laps for realistic wheel-to-wheel battles
-          if (player.isAI) {
-            const rawAiNext = generateAIPath(
-              track,
-              320,
-              player.aiArchetype || 'apex_master',
-              (carIdx + car.lap) % 4
-            );
-            const smoothedAiNext = resampleAndSmoothPath(rawAiNext, 5);
-            const exitSpd = Math.max(6.2, smoothedAiNext[smoothedAiNext.length - 3]?.speed || 6.5);
-            flyingPathsRef.current[car.playerId] = smoothedAiNext.map((pt, ptIdx) =>
-              ptIdx < 20
-                ? { ...pt, speed: Math.max(pt.speed, exitSpd * (1 - ptIdx / 28) + pt.speed * (ptIdx / 28)) }
-                : pt
-            );
-          }
-
-          const nextFlyingPath = flyingPathsRef.current[car.playerId] || path;
+          const playerLapList = raceLapPathsRef.current[car.playerId];
+          const nextFlyingPath =
+            (playerLapList && playerLapList[car.lap - 1]) ||
+            flyingPathsRef.current[car.playerId] ||
+            path;
           racePathsRef.current[car.playerId] = nextFlyingPath;
 
-          // Find closest continuation waypoint on the main straight in the first 28% of the flying lap path
+          // Find closest continuation waypoint on the main straight in the first 28% of the next lap path
           const searchLimit = Math.max(6, Math.floor(nextFlyingPath.length * 0.28));
           let bestResumeIdx = 2;
           let minResumeDist = Infinity;
@@ -797,17 +934,47 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     }
   };
 
-  // --- DRAWING GESTURE HANDLERS ---
+  // --- MULTI-LAP DRAWING GESTURE HANDLERS (Supports BOTH Continuous Dragging & Lap-by-Lap Drawing!) ---
+  const buildFinalizedLapPath = (rawPoints: Point[], drawVec: { x: number; y: number }): Point[] => {
+    const trimmedPath = [...rawPoints];
+    const lastFinishPt = trimmedPath[trimmedPath.length - 1];
+    const dirLen = Math.hypot(drawVec.x, drawVec.y) || 1;
+    const ux = drawVec.x / dirLen;
+    const uy = drawVec.y / dirLen;
+    trimmedPath.push({
+      x: lastFinishPt.x + ux * 28,
+      y: lastFinishPt.y + uy * 28,
+      t: lastFinishPt.t + 18,
+      speed: Math.max(4.2, lastFinishPt.speed)
+    });
+    return resampleAndSmoothPath(trimmedPath, 5);
+  };
+
   const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
-    if (phase !== 'drawing' || !activePlayer || allPlayersReady) return;
+    if (phase !== 'drawing' || !activePlayer || isDrawingBlockedByReady) return;
     if (activePointerIdRef.current !== null && activePointerIdRef.current !== e.pointerId) return;
 
+    audio.unlockForMobile();
     const { x, y } = getSvgPointFromEvent(e);
-    const startDist = Math.hypot(x - gridPos.x, y - gridPos.y);
 
-    if (startDist > 75) {
-      setDrawingError('Empieza a arrastrar desde tu coche parpadeante en la salida.');
+    // Forgiving start zone: on Lap 1 touch near car on grid; on Lap 2..N touch near previous exit, finish line, or grid!
+    const distAnchor = Math.hypot(x - currentStartAnchor.x, y - currentStartAnchor.y);
+    const distGrid = Math.hypot(x - gridPos.x, y - gridPos.y);
+    const distFinishMid = Math.hypot(x - midStartLine.x, y - midStartLine.y);
+    const startDist =
+      activeDrawingLapNumber === 1
+        ? distGrid
+        : Math.min(distAnchor, distFinishMid, distGrid);
+    const maxStartDist = e.pointerType === 'touch' ? 105 : 80;
+
+    if (startDist > maxStartDist) {
+      setDrawingError(
+        activeDrawingLapNumber === 1
+          ? 'Empieza a arrastrar desde tu coche parpadeante en la salida.'
+          : `Empieza la Vuelta ${activeDrawingLapNumber}/${totalLaps} desde el marcador en la línea de meta.`
+      );
       audio.playBeep(220, 0.12, 'square');
+      haptics.errorBuzz();
       return;
     }
 
@@ -821,22 +988,32 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     setShowGuide(false);
     setDrawingError(null);
     setIsDrawing(true);
+    drawingSectorProgressRef.current = 0;
     setDrawingSectorProgress(0);
+    drawingLapsCompletedRef.current = [...(activePlayer.lapPaths || [])];
+    justSavedLapInMoveRef.current = false;
 
     const now = performance.now();
-    const firstPoint: Point = { x: gridPos.x, y: gridPos.y, t: now, speed: 2.2 };
+    const initSpeed = activeDrawingLapNumber > 1 ? 4.8 : 2.2;
+    const firstPoint: Point = {
+      x: currentStartAnchor.x,
+      y: currentStartAnchor.y,
+      t: now,
+      speed: initSpeed
+    };
     const initialList: Point[] = [firstPoint];
-    if (startDist > 6) {
-      initialList.push({ x, y, t: now + 8, speed: 2.4 });
+    if (distAnchor > 6) {
+      initialList.push({ x, y, t: now + 8, speed: Math.max(2.4, initSpeed) });
     }
 
     drawnPointsRef.current = initialList;
     setDrawnPoints([...initialList]);
     setHasDrawnPoints(true);
-    setActiveSpeed(2.2);
+    setActiveSpeed(initSpeed);
     setActiveMaxSafeSpeed(6.8);
     setActiveSafetyStatus('safe_corner');
 
+    haptics.lightTap();
     audio.playBeep(523.25, 0.07, 'sine');
   };
 
@@ -899,27 +1076,114 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       liveStatus = 'safe_corner';
     }
 
-    // Smooth F1 engine intake preview tone while drawing (varies smoothly with your finger speed, zero beeps!)
+    // Smooth F1 engine intake preview tone while drawing
     audio.updateDrawingEngine(clampedSpeed, liveStatus === 'danger_overspeed');
 
     setActiveMaxSafeSpeed(maxSafe);
     setActiveSafetyStatus(liveStatus);
 
-    let currentSector = drawingSectorProgress;
+    // Advance checkpoints synchronously via ref (zero stale closures!)
+    let currentSector = drawingSectorProgressRef.current;
     while (currentSector < track.checkpoints.length) {
       const targetCp = track.checkpoints[currentSector];
       if (
         checkSegmentCrossing(lastPt, newPoint, targetCp) ||
-        distToSegment(newPoint, targetCp.p1, targetCp.p2).dist < 10
+        distToSegment(newPoint, targetCp.p1, targetCp.p2).dist < 12
       ) {
         currentSector++;
+        drawingSectorProgressRef.current = currentSector;
         setDrawingSectorProgress(currentSector);
+        haptics.sectorPass();
       } else {
         break;
       }
     }
 
     setActiveSpeed(clampedSpeed);
+
+    // CONTINUOUS MULTI-LAP FINISH LINE CROSSING:
+    // If all sectors are cleared and finger crosses the start/finish line forward, save THIS lap immediately!
+    if (
+      currentSector >= track.checkpoints.length &&
+      activePath.length >= 12 &&
+      checkSegmentCrossing(lastPt, newPoint, track.startLine)
+    ) {
+      const gridAngle = track.startGrid[0].angle;
+      const drawVec = { x: newPoint.x - lastPt.x, y: newPoint.y - lastPt.y };
+      const dot = drawVec.x * Math.cos(gridAngle) + drawVec.y * Math.sin(gridAngle);
+
+      if (dot >= -0.2) {
+        const finalSmoothLap = buildFinalizedLapPath(activePath, drawVec);
+
+        if (redrawLapTarget !== null) {
+          // Replacing one specific lap cleanly
+          useGameStore.getState().replaceLapPath(activePlayer.id, redrawLapTarget, finalSmoothLap);
+          setInspectLapIndex(redrawLapTarget);
+          setRedrawLapTarget(null);
+          activePointerIdRef.current = null;
+          setIsDrawing(false);
+          audio.stopDrawingEngine();
+          audio.playBeep(587.33, 0.08, 'sine');
+          audio.playBeep(880.0, 0.16, 'sine');
+          haptics.finishLap();
+          drawnPointsRef.current = [];
+          setDrawnPoints([]);
+          setHasDrawnPoints(false);
+          setActiveSpeed(null);
+          setActiveMaxSafeSpeed(null);
+          drawingSectorProgressRef.current = 0;
+          setDrawingSectorProgress(0);
+          setLapSavedNotice(`✅ Vuelta ${redrawLapTarget + 1} actualizada`);
+          return;
+        }
+
+        // Save completed lap to store & synchronous ref
+        drawingLapsCompletedRef.current = [...drawingLapsCompletedRef.current, finalSmoothLap];
+        justSavedLapInMoveRef.current = true;
+        onPathDrawn(activePlayer.id, finalSmoothLap);
+        const completedCount = drawingLapsCompletedRef.current.length;
+
+        audio.playBeep(587.33 + completedCount * 45, 0.09, 'sine');
+        haptics.finishLap();
+
+        if (completedCount >= totalLaps) {
+          // ALL LAPS COMPLETED! Stop drawing cleanly & show Ready-to-Race panel
+          audio.playBeep(880.0, 0.18, 'sine');
+          audio.stopDrawingEngine();
+          activePointerIdRef.current = null;
+          setIsDrawing(false);
+          drawnPointsRef.current = [];
+          setDrawnPoints([]);
+          setHasDrawnPoints(false);
+          setActiveSpeed(null);
+          setActiveMaxSafeSpeed(null);
+          drawingSectorProgressRef.current = 0;
+          setDrawingSectorProgress(0);
+          setInspectLapIndex(0);
+          setLapSavedNotice(
+            totalLaps > 1
+              ? `🏁 ¡${totalLaps} vueltas guardadas! Cada vuelta tiene su propia trazada`
+              : '🏁 ¡Trazada guardada! Listo para correr'
+          );
+          return;
+        }
+
+        // MORE LAPS REMAINING: Keep dragging seamlessly into Lap N+1 without lifting finger!
+        drawingSectorProgressRef.current = 0;
+        setDrawingSectorProgress(0);
+        const nextLapStartPt: Point = {
+          x: newPoint.x,
+          y: newPoint.y,
+          t: now,
+          speed: Math.max(3.8, clampedSpeed)
+        };
+        drawnPointsRef.current = [nextLapStartPt];
+        setDrawnPoints([nextLapStartPt]);
+        setLapSavedNotice(
+          `✅ Vuelta ${completedCount} guardada · ¡Sigue dibujando V${completedCount + 1}/${totalLaps}!`
+        );
+      }
+    }
   };
 
   const handlePointerUp = (e?: React.PointerEvent<SVGSVGElement>) => {
@@ -932,14 +1196,32 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     setIsDrawing(false);
 
     const activePath = [...drawnPointsRef.current];
+    const justCompletedLap = justSavedLapInMoveRef.current;
+    justSavedLapInMoveRef.current = false;
 
-    if (activePath.length < 12) {
-      setDrawingError('La trazada es demasiado corta. Da una vuelta completa al circuito hasta cruzar la meta.');
+    // If the user crossed the finish line to save Lap K and then lifted their finger right after,
+    // cleanly pause before Lap K+1 with ZERO error!
+    if (justCompletedLap && activePath.length < 22 && drawingSectorProgressRef.current === 0) {
       drawnPointsRef.current = [];
       setDrawnPoints([]);
       setHasDrawnPoints(false);
       setActiveSpeed(null);
       setActiveMaxSafeSpeed(null);
+      drawingSectorProgressRef.current = 0;
+      setDrawingSectorProgress(0);
+      return;
+    }
+
+    if (activePath.length < 12) {
+      setDrawingError(
+        `La trazada de la Vuelta ${activeDrawingLapNumber} es demasiado corta. Completa el circuito hasta cruzar la meta.`
+      );
+      drawnPointsRef.current = [];
+      setDrawnPoints([]);
+      setHasDrawnPoints(false);
+      setActiveSpeed(null);
+      setActiveMaxSafeSpeed(null);
+      drawingSectorProgressRef.current = 0;
       setDrawingSectorProgress(0);
       return;
     }
@@ -969,7 +1251,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
     if (cpProgress < requiredCps) {
       setDrawingError(
-        `Faltan sectores (${cpProgress}/${requiredCps}). Sigue el circuito pasando por S1 → S2 → S3 antes de cruzar la meta.`
+        `Faltan sectores en V${activeDrawingLapNumber} (${cpProgress}/${requiredCps}). Sigue S1 → S2 → S3 hasta la meta.`
       );
       audio.playBeep(180, 0.2, 'triangle');
       drawnPointsRef.current = [];
@@ -977,6 +1259,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       setHasDrawnPoints(false);
       setActiveSpeed(null);
       setActiveMaxSafeSpeed(null);
+      drawingSectorProgressRef.current = 0;
       setDrawingSectorProgress(0);
       return;
     }
@@ -995,13 +1278,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       const distToStartLine = distToSegment(endPt, track.startLine.p1, track.startLine.p2).dist;
       if (distToStartLine <= 65) {
         const gridAngle = track.startGrid[0].angle;
-        const midStart = {
-          x: (track.startLine.p1.x + track.startLine.p2.x) * 0.5,
-          y: (track.startLine.p1.y + track.startLine.p2.y) * 0.5
-        };
         const acrossPt: Point = {
-          x: midStart.x + Math.cos(gridAngle) * 28,
-          y: midStart.y + Math.sin(gridAngle) * 28,
+          x: midStartLine.x + Math.cos(gridAngle) * 28,
+          y: midStartLine.y + Math.sin(gridAngle) * 28,
           t: endPt.t + 25,
           speed: Math.max(3.5, endPt.speed)
         };
@@ -1011,13 +1290,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     }
 
     if (finishCrossIdx === -1) {
-      setDrawingError('¡Casi! Cruza la línea blanca de META para cerrar la vuelta.');
+      setDrawingError(`¡Casi! Cruza la línea blanca de META para cerrar la Vuelta ${activeDrawingLapNumber}.`);
       audio.playBeep(180, 0.2, 'triangle');
       drawnPointsRef.current = [];
       setDrawnPoints([]);
       setHasDrawnPoints(false);
       setActiveSpeed(null);
       setActiveMaxSafeSpeed(null);
+      drawingSectorProgressRef.current = 0;
       setDrawingSectorProgress(0);
       return;
     }
@@ -1026,8 +1306,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     const fP2 = activePath[finishCrossIdx];
     const gridAngle = track.startGrid[0].angle;
     const drawVec = { x: fP2.x - fP1.x, y: fP2.y - fP1.y };
-    const gridVec = { x: Math.cos(gridAngle), y: Math.sin(gridAngle) };
-    const dot = drawVec.x * gridVec.x + drawVec.y * gridVec.y;
+    const dot = drawVec.x * Math.cos(gridAngle) + drawVec.y * Math.sin(gridAngle);
 
     if (dot < -0.2) {
       setDrawingError('Estás cruzando la meta en sentido contrario.');
@@ -1037,35 +1316,45 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       setHasDrawnPoints(false);
       setActiveSpeed(null);
       setActiveMaxSafeSpeed(null);
+      drawingSectorProgressRef.current = 0;
       setDrawingSectorProgress(0);
       return;
     }
 
-    const trimmedPath = activePath.slice(0, finishCrossIdx + 1);
-    const lastFinishPt = trimmedPath[trimmedPath.length - 1];
-    const dirLen = Math.hypot(drawVec.x, drawVec.y) || 1;
-    const ux = drawVec.x / dirLen;
-    const uy = drawVec.y / dirLen;
-
-    trimmedPath.push({
-      x: lastFinishPt.x + ux * 32,
-      y: lastFinishPt.y + uy * 32,
-      t: lastFinishPt.t + 20,
-      speed: Math.max(4.0, lastFinishPt.speed)
-    });
-
-    const finalSmoothPath = resampleAndSmoothPath(trimmedPath, 5);
+    const finalSmoothPath = buildFinalizedLapPath(activePath.slice(0, finishCrossIdx + 1), drawVec);
 
     audio.playBeep(587.33, 0.09, 'sine');
     audio.playBeep(880.0, 0.18, 'sine');
+    haptics.finishLap();
 
-    onPathDrawn(activePlayer.id, finalSmoothPath);
+    if (redrawLapTarget !== null) {
+      useGameStore.getState().replaceLapPath(activePlayer.id, redrawLapTarget, finalSmoothPath);
+      setInspectLapIndex(redrawLapTarget);
+      setLapSavedNotice(`✅ Vuelta ${redrawLapTarget + 1} actualizada`);
+      setRedrawLapTarget(null);
+    } else {
+      const nextCount = (activePlayer.lapPaths?.length || 0) + 1;
+      onPathDrawn(activePlayer.id, finalSmoothPath);
+      if (nextCount < totalLaps) {
+        setLapSavedNotice(
+          `✅ Vuelta ${nextCount} guardada · Toca la meta para dibujar V${nextCount + 1}/${totalLaps}`
+        );
+      } else {
+        setInspectLapIndex(0);
+        setLapSavedNotice(
+          totalLaps > 1
+            ? `🏁 ¡${totalLaps} vueltas guardadas! Listo para correr`
+            : '🏁 ¡Trazada guardada! Listo para correr'
+        );
+      }
+    }
 
     drawnPointsRef.current = [];
     setDrawnPoints([]);
     setHasDrawnPoints(false);
     setActiveSpeed(null);
     setActiveMaxSafeSpeed(null);
+    drawingSectorProgressRef.current = 0;
     setDrawingSectorProgress(0);
     setDrawingError(null);
   };
@@ -1077,9 +1366,18 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     setHasDrawnPoints(false);
     setActiveSpeed(null);
     setActiveMaxSafeSpeed(null);
+    drawingSectorProgressRef.current = 0;
     setDrawingSectorProgress(0);
     setDrawingError(null);
     audio.playBeep(330, 0.12, 'sawtooth');
+  };
+
+  const handleUndoLastLap = () => {
+    if (!activePlayer) return;
+    handleClear();
+    setRedrawLapTarget(null);
+    useGameStore.getState().removeLastLapPath(activePlayer.id);
+    setLapSavedNotice(null);
   };
 
   const handleRedrawCompleted = () => {
@@ -1089,8 +1387,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     setHasDrawnPoints(false);
     setActiveSpeed(null);
     setActiveMaxSafeSpeed(null);
+    drawingSectorProgressRef.current = 0;
     setDrawingSectorProgress(0);
     setDrawingError(null);
+    setRedrawLapTarget(null);
+    setInspectLapIndex(0);
+    setLapSavedNotice(null);
     audio.playBeep(330, 0.1, 'sine');
     useGameStore.getState().clearDrawnPaths();
   };
@@ -1138,12 +1440,25 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     return analyzeDrawnPathSafety(drawnPoints, track, grip);
   }, [drawnPoints, activePlayer, carStats, track]);
 
-  const completedHumanPlayer = players.find((p) => !p.isAI && p.drawnPath.length > 1);
+  const completedHumanPlayer = players.find(
+    (p) => !p.isAI && ((p.lapPaths?.length || 0) > 0 || p.drawnPath.length > 1)
+  );
+  const completedHumanLaps =
+    completedHumanPlayer?.lapPaths && completedHumanPlayer.lapPaths.length > 0
+      ? completedHumanPlayer.lapPaths
+      : completedHumanPlayer?.drawnPath?.length
+        ? [completedHumanPlayer.drawnPath]
+        : [];
+  const safeInspectLapIndex = Math.min(
+    Math.max(0, inspectLapIndex),
+    Math.max(0, completedHumanLaps.length - 1)
+  );
+  const inspectedLapPath = completedHumanLaps[safeInspectLapIndex] || [];
   const completedSafetyReport = React.useMemo(() => {
-    if (!completedHumanPlayer) return null;
+    if (!completedHumanPlayer || inspectedLapPath.length < 2) return null;
     const grip = carStats[completedHumanPlayer.carType]?.grip || 0.2;
-    return analyzeDrawnPathSafety(completedHumanPlayer.drawnPath, track, grip);
-  }, [completedHumanPlayer, carStats, track]);
+    return analyzeDrawnPathSafety(inspectedLapPath, track, grip);
+  }, [completedHumanPlayer, inspectedLapPath, carStats, track]);
 
   // Precompute the Perfect Lap Guide & Speed Callouts for the active player's car grip
   const activeCarGrip = activePlayer ? carStats[activePlayer.carType]?.grip || 0.2 : 0.2;
@@ -1195,7 +1510,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     <div
       className={`${
         isVirtualFullscreen
-          ? 'fixed inset-0 z-50 bg-slate-950 p-1.5 sm:p-3 flex flex-col items-center justify-between w-screen h-dvh overflow-hidden'
+          ? 'fixed inset-0 z-50 bg-slate-950 safe-fullscreen-pad sm:p-3 flex flex-col items-center justify-between w-screen h-dvh overflow-hidden'
           : 'flex flex-col items-center w-full bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-2xl p-2 sm:p-4'
       } transition-all duration-300`}
       id="game-canvas-container"
@@ -1203,13 +1518,13 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       {/* 3D R3F Viewport Wrapper — automatically adapts to 5:8 vertical on portrait phones or 8:5 horizontal on landscape! */}
       <div
         className={`relative border border-slate-800 rounded-xl shadow-inner overflow-hidden bg-slate-950 ${
-          isVirtualFullscreen ? 'flex-1 w-full flex items-center justify-center' : 'w-full'
+          isVirtualFullscreen ? 'flex-1 w-full flex items-center justify-center min-h-0' : 'w-full'
         }`}
         style={
           isVirtualFullscreen
             ? {
                 aspectRatio: usePortraitLayout ? '5 / 8' : '8 / 5',
-                maxHeight: 'calc(100dvh - 76px)',
+                maxHeight: '100%',
                 maxWidth: '100%'
               }
             : {
@@ -1217,192 +1532,342 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               }
         }
       >
-        {/* Top-left Quick Controls: Menu Exit, Fullscreen, Rotate 90°, Perfect Lap Demo & Camera Selector */}
-        <div className="absolute top-2.5 left-2.5 flex flex-wrap items-center gap-1.5 z-30">
-          {isVirtualFullscreen && (
-            <button
-              onClick={handleExitToMenu}
-              className="bg-slate-950/90 hover:bg-rose-950/90 border border-slate-800 hover:border-rose-500/60 text-slate-200 hover:text-white px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
-              title="Volver al menú principal"
-            >
-              <Home className="w-3.5 h-3.5 text-rose-400" />
-              <span>MENÚ</span>
-            </button>
-          )}
-
-          <button
-            onClick={() => {
-              audio.playBeep(600, 0.07, 'sine');
-              const container = document.getElementById('game-canvas-container');
-              if (!isVirtualFullscreen) {
-                container?.requestFullscreen?.().catch(() => {});
-                setIsVirtualFullscreen(true);
-              } else {
-                if (document.fullscreenElement) {
-                  document.exitFullscreen?.().catch(() => {});
-                }
-                setIsVirtualFullscreen(false);
-              }
-            }}
-            className="bg-slate-950/90 hover:bg-slate-900 border border-slate-800 hover:border-slate-700 text-white px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
-            title={isVirtualFullscreen ? 'Salir de pantalla completa' : 'Pantalla completa'}
-          >
-            {isVirtualFullscreen ? (
-              <>
-                <Minimize2 className="w-3.5 h-3.5 text-amber-400" />
-                <span className="text-amber-400">VENTANA</span>
-              </>
-            ) : (
-              <>
-                <Maximize2 className="w-3.5 h-3.5 text-emerald-400" />
-                <span className="text-emerald-400">PANTALLA COMPLETA</span>
-              </>
+        {/* Unified Non-Overlapping Top HUD Overlay (Clean on 360px iPhone SE, Android & Desktop!) */}
+        <div className="absolute top-0 inset-x-0 flex items-start justify-between gap-1.5 p-2 sm:p-2.5 z-30 pointer-events-none">
+          {/* Top-left Quick Controls */}
+          <div className="flex flex-wrap items-center gap-1 sm:gap-1.5 pointer-events-auto max-w-[56%] sm:max-w-[68%]">
+            {isVirtualFullscreen && (
+              <button
+                onClick={handleExitToMenu}
+                className="bg-slate-950/90 hover:bg-rose-950/90 active:scale-95 border border-slate-800 hover:border-rose-500/60 text-slate-200 hover:text-white px-2 py-1.5 sm:px-2.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1 sm:gap-1.5 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
+                title="Volver al menú principal"
+              >
+                <Home className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                <span className="hidden xs:inline sm:inline">MENÚ</span>
+              </button>
             )}
-          </button>
 
-          {isVirtualFullscreen && (
-            <button
-              onClick={() => {
-                audio.playBeep(520, 0.06, 'sine');
-                setManualOrientationOverride(!usePortraitLayout);
-              }}
-              className="bg-slate-950/90 hover:bg-slate-900 border border-slate-800 hover:border-slate-700 text-slate-200 px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
-              title="Girar orientación del circuito 90°"
-            >
-              <Smartphone
-                className={`w-3.5 h-3.5 text-cyan-400 transition-transform ${
-                  usePortraitLayout ? 'rotate-0' : 'rotate-90'
-                }`}
-              />
-              <span>{usePortraitLayout ? 'VISTA VERTICAL' : 'VISTA HORIZONTAL'}</span>
-            </button>
-          )}
-
-          {/* Botón de Vuelta Perfecta interactiva en fase de trazado */}
-          {phase === 'drawing' && (
-            <>
+            {/* Desktop window toggle (hidden on mobile phones where fullscreen is always optimal) */}
+            {!isMobileDevice && (
               <button
                 onClick={() => {
-                  setShowPerfectLap((prev) => !prev);
-                  setGhostFloatIdx(0);
+                  audio.playBeep(600, 0.07, 'sine');
+                  const container = document.getElementById('game-canvas-container');
+                  if (!isVirtualFullscreen) {
+                    container?.requestFullscreen?.().catch(() => {});
+                    setIsVirtualFullscreen(true);
+                  } else {
+                    if (document.fullscreenElement) {
+                      document.exitFullscreen?.().catch(() => {});
+                    }
+                    setIsVirtualFullscreen(false);
+                  }
                 }}
-                className={`px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold border ${
-                  showPerfectLap
-                    ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 shadow-emerald-500/20'
-                    : 'bg-slate-950/90 hover:bg-slate-900 border-slate-800 hover:border-emerald-500/50 text-slate-200'
-                }`}
-                title="Ver demostración de la Vuelta Perfecta con velocidades ideales"
+                className="bg-slate-950/90 hover:bg-slate-900 border border-slate-800 hover:border-slate-700 text-white px-2.5 py-1.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
+                title={isVirtualFullscreen ? 'Salir de pantalla completa' : 'Pantalla completa'}
               >
-                <Sparkles className={`w-3.5 h-3.5 ${showPerfectLap ? 'text-emerald-300' : 'text-amber-400'}`} />
-                <span>{showPerfectLap ? 'OCULTAR VUELTA PERFECTA' : 'VER VUELTA PERFECTA'}</span>
+                {isVirtualFullscreen ? (
+                  <>
+                    <Minimize2 className="w-3.5 h-3.5 text-amber-400" />
+                    <span className="text-amber-400">VENTANA</span>
+                  </>
+                ) : (
+                  <>
+                    <Maximize2 className="w-3.5 h-3.5 text-emerald-400" />
+                    <span className="text-emerald-400">PANTALLA COMPLETA</span>
+                  </>
+                )}
               </button>
+            )}
 
-              {showPerfectLap && activePlayer && !allPlayersReady && (
+            {isVirtualFullscreen && (
+              <button
+                onClick={() => {
+                  audio.playBeep(520, 0.06, 'sine');
+                  haptics.lightTap();
+                  setManualOrientationOverride(!usePortraitLayout);
+                }}
+                className="bg-slate-950/90 hover:bg-slate-900 active:scale-95 border border-slate-800 hover:border-slate-700 text-slate-200 px-2 py-1.5 sm:px-2.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1 sm:gap-1.5 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
+                title="Girar orientación del circuito 90°"
+              >
+                <Smartphone
+                  className={`w-3.5 h-3.5 text-cyan-400 transition-transform shrink-0 ${
+                    usePortraitLayout ? 'rotate-0' : 'rotate-90'
+                  }`}
+                />
+                <span className="hidden sm:inline">
+                  {usePortraitLayout ? 'VISTA VERTICAL' : 'VISTA HORIZONTAL'}
+                </span>
+                <span className="sm:hidden">{usePortraitLayout ? '90°' : '90°'}</span>
+              </button>
+            )}
+
+            {/* Botón de Vuelta Perfecta interactiva en fase de trazado */}
+            {phase === 'drawing' && (
+              <>
                 <button
                   onClick={() => {
-                    onPathDrawn(activePlayer.id, perfectLapGuide.perfectPath);
-                    drawnPointsRef.current = [];
-                    setDrawnPoints([]);
-                    setHasDrawnPoints(false);
-                    setActiveSpeed(null);
-                    setActiveMaxSafeSpeed(null);
-                    setDrawingError(null);
-                    setDrawingSectorProgress(track.checkpoints.length);
+                    haptics.lightTap();
+                    setShowPerfectLap((prev) => !prev);
+                    setGhostFloatIdx(0);
                   }}
-                  className="bg-amber-400 hover:bg-amber-300 text-slate-950 px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-transform hover:scale-[1.02] cursor-pointer text-[10px] sm:text-xs font-mono font-extrabold"
-                  title="Cargar esta Vuelta Perfecta para comprobar su velocidad real en carrera"
+                  className={`px-2 py-1.5 sm:px-2.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1 sm:gap-1.5 transition-all active:scale-95 cursor-pointer text-[10px] sm:text-xs font-mono font-bold border ${
+                    showPerfectLap
+                      ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 shadow-emerald-500/20'
+                      : 'bg-slate-950/90 hover:bg-slate-900 border-slate-800 hover:border-emerald-500/50 text-slate-200'
+                  }`}
+                  title="Ver demostración de la Vuelta Perfecta con velocidades ideales"
                 >
-                  <span>⚡ USAR ESTA VUELTA PERFECTA</span>
+                  <Sparkles className={`w-3.5 h-3.5 shrink-0 ${showPerfectLap ? 'text-emerald-300' : 'text-amber-400'}`} />
+                  <span className="hidden sm:inline">
+                    {showPerfectLap ? 'OCULTAR VUELTA PERFECTA' : 'VER VUELTA PERFECTA'}
+                  </span>
+                  <span className="sm:hidden">{showPerfectLap ? 'OCULTAR' : 'GUÍA PRO'}</span>
                 </button>
-              )}
-            </>
-          )}
 
-          {phase === 'racing' && (
-            <button
-              onClick={cycleCameraMode}
-              className="bg-slate-950/90 hover:bg-slate-900 border border-slate-800 hover:border-cyan-500/50 text-white px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
-              title="Alternar cámara de carrera (TV, Onboard F1, Persecución, Circuito)"
-            >
-              {cameraMode === 'helicopter' ? (
-                <>
-                  <Camera className="w-3.5 h-3.5 text-amber-400" />
-                  <span className="text-amber-400">TV DINÁMICA</span>
-                </>
-              ) : cameraMode === 'onboard' ? (
-                <>
-                  <Video className="w-3.5 h-3.5 text-rose-400" />
-                  <span className="text-rose-400">ONBOARD T-CAM F1</span>
-                </>
-              ) : cameraMode === 'chase' ? (
-                <>
-                  <Video className="w-3.5 h-3.5 text-cyan-400" />
-                  <span className="text-cyan-400">PERSECUCIÓN 3D</span>
-                </>
-              ) : (
-                <>
-                  <Eye className="w-3.5 h-3.5 text-emerald-400" />
-                  <span className="text-emerald-400">CIRCUITO COMPLETO</span>
-                </>
-              )}
-            </button>
-          )}
-
-          {/* Time-of-Day & Weather Graphics Switcher (Daylight GP / Golden Sunset / Wet Night GP) */}
-          <button
-            onClick={() => {
-              setLightingPreset((prev) =>
-                prev === 'day' ? 'sunset' : prev === 'sunset' ? 'night' : 'day'
-              );
-            }}
-            className="bg-slate-950/90 hover:bg-slate-900 border border-slate-800 hover:border-amber-500/50 text-white px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
-            title="Cambiar iluminación y clima del circuito (Día Real GP / Tarde Dorada / Noche Asfalto Mojado)"
-          >
-            {lightingPreset === 'day' ? (
-              <span className="text-emerald-300">☀️ DÍA REAL GP</span>
-            ) : lightingPreset === 'sunset' ? (
-              <span className="text-amber-300">🌅 TARDE DORADA</span>
-            ) : (
-              <span className="text-cyan-300">🌃 NOCHE WET GP</span>
+                {showPerfectLap && activePlayer && !isDrawingBlockedByReady && (
+                  <button
+                    onClick={() => {
+                      haptics.finishLap();
+                      const proLapPath = perfectLapGuide.perfectPath;
+                      if (redrawLapTarget !== null) {
+                        useGameStore
+                          .getState()
+                          .replaceLapPath(activePlayer.id, redrawLapTarget, proLapPath);
+                        setInspectLapIndex(redrawLapTarget);
+                        setLapSavedNotice(`✅ Vuelta ${redrawLapTarget + 1} cargada (Pro)`);
+                        setRedrawLapTarget(null);
+                      } else {
+                        const nextLapNum = (activePlayer.lapPaths?.length || 0) + 1;
+                        onPathDrawn(activePlayer.id, proLapPath);
+                        if (nextLapNum < totalLaps) {
+                          setLapSavedNotice(
+                            `✅ V${nextLapNum} Pro guardada · Dibuja V${nextLapNum + 1}/${totalLaps}`
+                          );
+                        } else {
+                          setInspectLapIndex(0);
+                          setLapSavedNotice(`🏁 ¡${totalLaps} vueltas listas!`);
+                        }
+                      }
+                      drawnPointsRef.current = [];
+                      setDrawnPoints([]);
+                      setHasDrawnPoints(false);
+                      setActiveSpeed(null);
+                      setActiveMaxSafeSpeed(null);
+                      setDrawingError(null);
+                      drawingSectorProgressRef.current = 0;
+                      setDrawingSectorProgress(0);
+                    }}
+                    className="bg-amber-400 hover:bg-amber-300 active:scale-95 text-slate-950 px-2.5 py-1.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-extrabold"
+                    title={`Cargar Vuelta Perfecta para la Vuelta ${activeDrawingLapNumber}`}
+                  >
+                    <span className="hidden sm:inline">
+                      ⚡ USAR PRO (V{activeDrawingLapNumber}/{totalLaps})
+                    </span>
+                    <span className="sm:hidden">⚡ PRO V{activeDrawingLapNumber}</span>
+                  </button>
+                )}
+              </>
             )}
-          </button>
 
-          {/* Interactive Lap Count Selector Pill during Drawing */}
-          {phase === 'drawing' && (
+            {phase === 'racing' && (
+              <button
+                onClick={() => {
+                  haptics.lightTap();
+                  cycleCameraMode();
+                }}
+                className="bg-slate-950/90 hover:bg-slate-900 active:scale-95 border border-slate-800 hover:border-cyan-500/50 text-white px-2 py-1.5 sm:px-2.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1 sm:gap-1.5 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
+                title="Alternar cámara de carrera (TV, Onboard F1, Persecución, Circuito)"
+              >
+                {cameraMode === 'helicopter' ? (
+                  <>
+                    <Camera className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                    <span className="text-amber-400">
+                      <span className="hidden sm:inline">TV DINÁMICA</span>
+                      <span className="sm:hidden">TV</span>
+                    </span>
+                  </>
+                ) : cameraMode === 'onboard' ? (
+                  <>
+                    <Video className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                    <span className="text-rose-400">
+                      <span className="hidden sm:inline">ONBOARD T-CAM F1</span>
+                      <span className="sm:hidden">T-CAM</span>
+                    </span>
+                  </>
+                ) : cameraMode === 'chase' ? (
+                  <>
+                    <Video className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                    <span className="text-cyan-400">
+                      <span className="hidden sm:inline">PERSECUCIÓN 3D</span>
+                      <span className="sm:hidden">CHASE</span>
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <Eye className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    <span className="text-emerald-400">
+                      <span className="hidden sm:inline">CIRCUITO COMPLETO</span>
+                      <span className="sm:hidden">MAPA</span>
+                    </span>
+                  </>
+                )}
+              </button>
+            )}
+
+            {/* Time-of-Day & Weather Graphics Switcher */}
             <button
-              type="button"
               onClick={() => {
-                const cycle = [1, 2, 3, 5];
-                const nextLaps = cycle[(cycle.indexOf(totalLaps) + 1) % cycle.length];
-                setTotalLaps(nextLaps);
-                audio.playBeep(420 + nextLaps * 35, 0.06, 'sine');
+                haptics.lightTap();
+                setLightingPreset((prev) =>
+                  prev === 'day' ? 'sunset' : prev === 'sunset' ? 'night' : 'day'
+                );
               }}
-              className="bg-slate-950/90 hover:bg-slate-900 border border-amber-500/40 hover:border-amber-400 text-amber-300 text-[10px] sm:text-xs font-mono font-extrabold px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 cursor-pointer shadow-lg transition-colors"
-              title="Clic para cambiar el número de vueltas del Gran Premio (1, 2, 3 o 5 vueltas)"
+              className="bg-slate-950/90 hover:bg-slate-900 active:scale-95 border border-slate-800 hover:border-amber-500/50 text-white px-2 py-1.5 sm:px-2.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
+              title="Cambiar iluminación y clima del circuito (Día Real GP / Tarde Dorada / Noche Asfalto Mojado)"
             >
-              <Flag className="w-3.5 h-3.5 text-amber-400" />
-              <span>
-                {totalLaps} {totalLaps === 1 ? 'VUELTA' : 'VUELTAS'}
-              </span>
+              {lightingPreset === 'day' ? (
+                <span className="text-emerald-300">
+                  ☀️ <span className="hidden sm:inline">DÍA REAL GP</span>
+                </span>
+              ) : lightingPreset === 'sunset' ? (
+                <span className="text-amber-300">
+                  🌅 <span className="hidden sm:inline">TARDE DORADA</span>
+                </span>
+              ) : (
+                <span className="text-cyan-300">
+                  🌃 <span className="hidden sm:inline">NOCHE WET GP</span>
+                </span>
+              )}
             </button>
-          )}
 
-          {/* Live Lap Counter Pill during Racing */}
-          {phase === 'racing' && (
-            <div className="bg-slate-950/95 border border-amber-500/50 text-white text-[10px] sm:text-xs font-mono px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 pointer-events-none shadow-lg">
-              <Flag className="w-3.5 h-3.5 text-amber-400" />
-              <span className="font-extrabold text-amber-300">
-                VUELTA {Math.min(totalLaps, activeCarObj?.lap || 1)} / {totalLaps}
-              </span>
-            </div>
-          )}
+            {/* Interactive Lap Count Selector Pill during Drawing */}
+            {phase === 'drawing' && (
+              <button
+                type="button"
+                onClick={() => {
+                  const cycle = [1, 2, 3, 5];
+                  const nextLaps = cycle[(cycle.indexOf(totalLaps) + 1) % cycle.length];
+                  setRedrawLapTarget(null);
+                  setInspectLapIndex(0);
+                  setTotalLaps(nextLaps);
+                  haptics.lightTap();
+                  audio.playBeep(420 + nextLaps * 35, 0.06, 'sine');
+                }}
+                className="bg-slate-950/90 hover:bg-slate-900 active:scale-95 border border-amber-500/40 hover:border-amber-400 text-amber-300 text-[10px] sm:text-xs font-mono font-extrabold px-2 py-1.5 sm:px-2.5 min-h-[34px] rounded-lg flex items-center gap-1 cursor-pointer shadow-lg transition-all"
+                title="Toca para cambiar el número de vueltas del Gran Premio (1, 2, 3 o 5 vueltas)"
+              >
+                <Flag className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                <span>{totalLaps}V</span>
+              </button>
+            )}
 
-          {/* Sector Counter Pill during Drawing */}
-          {phase === 'drawing' && !allPlayersReady && (
-            <div className="bg-slate-950/90 border border-slate-800 text-white text-[10px] sm:text-xs font-mono px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 pointer-events-none shadow-lg">
-              <span className="font-bold text-cyan-400">
-                S{drawingSectorProgress}/{track.checkpoints.length}
-              </span>
+            {/* Desktop Live Lap Counter Pill during Racing (compact mobile shows it cleanly in the right leaderboard + bottom dock) */}
+            {phase === 'racing' && (
+              <div className="hidden sm:flex bg-slate-950/95 border border-amber-500/50 text-white text-xs font-mono px-2.5 py-1.5 min-h-[34px] rounded-lg items-center gap-1.5 shadow-lg">
+                <Flag className="w-3.5 h-3.5 text-amber-400" />
+                <span className="font-extrabold text-amber-300">
+                  VUELTA {Math.min(totalLaps, activeCarObj?.lap || 1)} / {totalLaps}
+                </span>
+              </div>
+            )}
+
+            {/* Live Lap & Sector Counter Pill during Drawing */}
+            {phase === 'drawing' && !isDrawingBlockedByReady && (
+              <div className="bg-slate-950/90 border border-cyan-500/40 text-white text-[10px] sm:text-xs font-mono px-2 py-1.5 min-h-[34px] rounded-lg flex items-center gap-1.5 shadow-lg">
+                <span className="font-extrabold text-amber-300">
+                  V{activeDrawingLapNumber}/{totalLaps}
+                </span>
+                <span className="text-slate-600">·</span>
+                <span className="font-bold text-cyan-400">
+                  S{drawingSectorProgress}/{track.checkpoints.length}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Top-right Interactive Live Racing Leaderboard HUD — NEVER overlaps left buttons! */}
+          {phase === 'racing' && !countdownValue && (
+            <div className="pointer-events-auto bg-slate-950/90 border border-slate-800 rounded-xl p-1.5 sm:p-2 shadow-xl w-[156px] sm:w-auto sm:min-w-[195px] sm:max-w-[245px] shrink-0">
+              <div className="flex items-center justify-between gap-1 pb-1 mb-1 border-b border-slate-800 text-[9px] sm:text-[10px] font-mono text-slate-400 uppercase tracking-wider">
+                <span className="flex items-center gap-1 font-bold text-amber-300">
+                  <Trophy className="w-3 h-3 text-amber-400 shrink-0" />
+                  V{Math.min(totalLaps, activeCarObj?.lap || 1)}/{totalLaps}
+                </span>
+                <span className="text-[8.5px] sm:text-[9px] text-slate-500">Tocar = Seguir</span>
+              </div>
+              <div className="space-y-0.5 sm:space-y-1">
+                {[...activeCars]
+                  .sort((a, b) => {
+                    if (a.finished && !b.finished) return -1;
+                    if (!a.finished && b.finished) return 1;
+                    if (a.finished && b.finished) return (a.timeFinished || 0) - (b.timeFinished || 0);
+                    const pathA = racePathsRef.current[a.playerId]?.length || 1;
+                    const pathB = racePathsRef.current[b.playerId]?.length || 1;
+                    const progA = a.lap - 1 + a.targetIndex / pathA;
+                    const progB = b.lap - 1 + b.targetIndex / pathB;
+                    return progB - progA;
+                  })
+                  .map((car, rank) => {
+                    const p = players.find((player) => player.id === car.playerId);
+                    const pColor = p ? p.color || carStats[p.carType]?.color || '#3b82f6' : '#3b82f6';
+                    const speed = Math.round(Math.hypot(car.vx, car.vy) * F1_KMH_FACTOR);
+                    const isFocused = activeCarObj?.playerId === car.playerId;
+
+                    return (
+                      <button
+                        key={car.playerId}
+                        type="button"
+                        onClick={() => {
+                          haptics.lightTap();
+                          setFocusedPlayerId(car.playerId);
+                        }}
+                        className={`w-full flex items-center justify-between gap-1 sm:gap-2 px-1 sm:px-1.5 py-1 rounded-md text-[10px] sm:text-xs font-mono transition-colors cursor-pointer ${
+                          isFocused
+                            ? 'bg-slate-800/90 ring-1 ring-cyan-500/50'
+                            : 'hover:bg-slate-900/80'
+                        }`}
+                      >
+                        <div className="flex items-center gap-1 min-w-0">
+                          <span
+                            className={`w-3.5 h-3.5 sm:w-4 sm:h-4 rounded text-[9px] sm:text-[10px] font-bold flex items-center justify-center shrink-0 ${
+                              rank === 0
+                                ? 'bg-amber-400 text-slate-950'
+                                : rank === 1
+                                  ? 'bg-slate-300 text-slate-950'
+                                  : 'bg-slate-800 text-slate-300'
+                            }`}
+                          >
+                            {rank + 1}
+                          </span>
+                          <span
+                            className="w-2 h-2 sm:w-2.5 sm:h-2.5 rounded-full shrink-0"
+                            style={{ backgroundColor: pColor }}
+                          />
+                          <span className="text-white font-medium truncate text-[10px] sm:text-[11px]">
+                            {p?.name || 'Piloto'}
+                          </span>
+                        </div>
+                        <span className="text-[9.5px] sm:text-[10px] font-bold shrink-0 tabular-nums">
+                          {car.finished ? (
+                            <span className="text-emerald-400 flex items-center gap-0.5">
+                              <CheckCircle2 className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
+                              {((car.timeFinished || 0) / 1000).toFixed(1)}s
+                            </span>
+                          ) : car.disqualified ? (
+                            <span className="text-rose-400">Desc.</span>
+                          ) : car.offTrack ? (
+                            <span className="text-amber-400 font-extrabold">GRV {speed}</span>
+                          ) : (car.overspeedTimer || 0) > 0 ? (
+                            <span className="text-rose-400 font-extrabold">SUB {speed}</span>
+                          ) : (
+                            <span className="text-cyan-400">{speed}</span>
+                          )}
+                        </span>
+                      </button>
+                    );
+                  })}
+              </div>
             </div>
           )}
         </div>
@@ -1438,7 +1903,10 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             shadowFocus={
               activeCarObj ? [activeCarObj.x, 500 - activeCarObj.y] : [400, 250]
             }
+            carsStateRef={carsStateRef}
+            focusedPlayerId={focusedPlayerId}
             tightShadows={phase === 'racing' && cameraMode !== 'circuit'}
+            shadowMapSize={isMobileDevice ? 1024 : 2048}
           />
 
           <TrackMesh
@@ -1447,70 +1915,50 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             lightingPreset={lightingPreset}
           />
           <Environment3D track={track} lightingPreset={lightingPreset} />
-          <Skidmarks3D skidmarks={skidmarks} />
+          <Skidmarks3D skidmarksRef={skidmarksRef} />
 
-          {phase === 'racing'
-            ? activeCars.map((car) => {
-                const p = players.find((player) => player.id === car.playerId)!;
-                const stats = carStats[p.carType];
-                const speed = Math.hypot(car.vx, car.vy);
-                const isBraking = (car.brake ?? 0) > 0.18 && speed > 1.4;
-                const carSurf = getTrackSurfaceInfo({ x: car.x, y: car.y }, track);
+          {players.map((p, idx) => {
+            const grid = track.startGrid[idx] || track.startGrid[0];
+            const stats = carStats[p.carType];
+            const gridSurf = getTrackSurfaceInfo({ x: grid.x, y: grid.y }, track);
+            const isActiveCar =
+              phase === 'racing'
+                ? p.id === (targetCarId || players[0]?.id)
+                : p.id === activePlayer?.id;
 
-                return (
-                  <Car3D
-                    key={car.playerId}
-                    color={p.color || stats.color}
-                    position={[car.x, 500 - car.y, carSurf.elevationZ + 0.15]}
-                    angle={car.angle}
-                    driftAngle={car.driftAngle}
-                    steerAngle={car.steerAngle ?? 0}
-                    slipAngle={car.slipAngle ?? 0}
-                    longitudinalG={car.longitudinalG ?? 0}
-                    lateralG={car.lateralG ?? 0}
-                    bankAngle={carSurf.bankAngleRad}
-                    isDrifting={car.isDrifting}
-                    isBraking={isBraking}
-                    drsActive={Boolean(car.drsActive)}
-                    throttle={car.throttle ?? 0}
-                    name={p.name}
-                    active={p.id === activeCarObj?.playerId}
-                    speed={speed}
-                    showLabel={false}
-                  />
-                );
-              })
-            : players.map((p, idx) => {
-                const grid = track.startGrid[idx] || track.startGrid[0];
-                const stats = carStats[p.carType];
-                const isCurrent = p.id === activePlayer?.id;
-                const gridSurf = getTrackSurfaceInfo({ x: grid.x, y: grid.y }, track);
-
-                return (
-                  <Car3D
-                    key={p.id}
-                    color={p.color || stats.color}
-                    position={[grid.x, 500 - grid.y, gridSurf.elevationZ + 0.15]}
-                    angle={grid.angle}
-                    bankAngle={gridSurf.bankAngleRad}
-                    isDrifting={false}
-                    isBraking={false}
-                    name={p.name}
-                    active={isCurrent}
-                    speed={0}
-                    showLabel={false}
-                  />
-                );
-              })}
+            return (
+              <Car3D
+                key={p.id}
+                playerId={p.id}
+                carsStateRef={carsStateRef}
+                track={track}
+                isRacing={phase === 'racing'}
+                color={p.color || stats.color}
+                position={[grid.x, 500 - grid.y, gridSurf.elevationZ + 0.15]}
+                angle={grid.angle}
+                bankAngle={gridSurf.bankAngleRad}
+                isDrifting={false}
+                isBraking={false}
+                name={p.name}
+                active={isActiveCar}
+                speed={0}
+                showLabel={false}
+              />
+            );
+          })}
 
           {phase === 'racing' &&
             cameraMode !== 'onboard' &&
             players.map((p) => {
-              const rPath = racePathsRef.current[p.id] || p.drawnPath;
+              const carObj = activeCars.find((c) => c.playerId === p.id);
+              const carLap = carObj?.lap || 1;
+              const lapList = raceLapPathsRef.current[p.id];
+              const rPath =
+                (lapList && lapList[carLap - 1]) || racePathsRef.current[p.id] || p.drawnPath;
               if (rPath.length > 0) {
                 return (
                   <GlowingSpline
-                    key={`static-path-${p.id}`}
+                    key={`static-path-${p.id}-lap-${carLap}`}
                     path={rPath}
                     track={track}
                     colorOverride={p.color}
@@ -1521,12 +1969,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               return null;
             })}
 
-          <SmokeParticles particles={particles} />
+          <SmokeParticles particlesRef={particlesRef} />
 
           <CameraDirector
             phase={phase}
             activeCar={activeCarObj}
             allCars={activeCars}
+            carsStateRef={carsStateRef}
+            focusedPlayerId={focusedPlayerId}
             activePlayerGrid={gridPos}
             activeDrawingTip={activeDrawnTipObj}
             track={track}
@@ -1535,12 +1985,33 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             countdownValue={countdownValue}
           />
 
+          <CarScreenProjector
+            active={phase === 'racing'}
+            carsStateRef={carsStateRef}
+            players={players}
+            track={track}
+            focusedPlayerId={focusedPlayerId}
+            projectedCarsRef={projectedCarsRef}
+            onFrameProjectedRef={onOverlayFrameRef}
+          />
+
           <PostProcessingEffects
             preset={lightingPreset}
+            phase={phase}
             focusSpeed={activeCarObj ? Math.hypot(activeCarObj.vx, activeCarObj.vy) : 0}
+            isMobile={isMobileDevice}
           />
         </Canvas>
         </CanvasErrorBoundary>
+
+        {/* Dedicated High-DPI 2D Overlay Canvas Buffer: crisp car identity plates & off-screen directional indicators */}
+        <RacingOverlayCanvas
+          active={phase === 'racing'}
+          cameraMode={cameraMode}
+          countdownValue={countdownValue}
+          projectedCarsRef={projectedCarsRef}
+          onFrameProjectedRef={onOverlayFrameRef}
+        />
 
         {/* 3D TV Broadcast Replay Control Dock (Pause, Slow-Mo 0.25x/0.5x/1x/2x, Restart & Return to Podium) */}
         {phase === 'racing' && isReplaying && (
@@ -1672,96 +2143,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
         {/* Live Lap Split Notification Banner at Top Center during Multi-Lap Races */}
         {phase === 'racing' && !countdownValue && lapBannerText && (
-          <div className="absolute top-12 left-1/2 -translate-x-1/2 z-30 pointer-events-none animate-fadeIn">
-            <div className="bg-slate-950/95 border border-amber-400/60 text-amber-300 font-mono font-extrabold text-xs sm:text-sm px-4 py-1.5 rounded-xl shadow-2xl whitespace-nowrap">
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 z-30 pointer-events-none animate-fadeIn">
+            <div className="bg-slate-950/95 border border-amber-400/60 text-amber-300 font-mono font-extrabold text-[11px] sm:text-sm px-3.5 py-1.5 rounded-xl shadow-2xl whitespace-nowrap">
               {lapBannerText}
-            </div>
-          </div>
-        )}
-
-        {/* Interactive Live Racing Leaderboard HUD */}
-        {phase === 'racing' && !countdownValue && (
-          <div className="absolute top-2.5 right-2.5 bg-slate-950/90 border border-slate-800 rounded-xl p-2 shadow-xl z-20 min-w-[180px] max-w-[245px]">
-            <div className="flex items-center justify-between gap-1.5 pb-1 mb-1 border-b border-slate-800 text-[10px] font-mono text-slate-400 uppercase tracking-wider">
-              <span className="flex items-center gap-1">
-                <Trophy className="w-3.5 h-3.5 text-amber-400" />
-                GP · V{Math.min(totalLaps, activeCarObj?.lap || 1)}/{totalLaps}
-              </span>
-              <span className="text-[9px] text-slate-500">Clic = Seguir</span>
-            </div>
-            <div className="space-y-1">
-              {[...activeCars]
-                .sort((a, b) => {
-                  if (a.finished && !b.finished) return -1;
-                  if (!a.finished && b.finished) return 1;
-                  if (a.finished && b.finished) return (a.timeFinished || 0) - (b.timeFinished || 0);
-                  const pathA = racePathsRef.current[a.playerId]?.length || 1;
-                  const pathB = racePathsRef.current[b.playerId]?.length || 1;
-                  const progA = a.lap - 1 + a.targetIndex / pathA;
-                  const progB = b.lap - 1 + b.targetIndex / pathB;
-                  return progB - progA;
-                })
-                .map((car, rank) => {
-                  const p = players.find((player) => player.id === car.playerId);
-                  const pColor = p ? p.color || carStats[p.carType]?.color || '#3b82f6' : '#3b82f6';
-                  const speed = Math.round(Math.hypot(car.vx, car.vy) * F1_KMH_FACTOR);
-                  const isFocused = activeCarObj?.playerId === car.playerId;
-
-                  return (
-                    <button
-                      key={car.playerId}
-                      type="button"
-                      onClick={() => setFocusedPlayerId(car.playerId)}
-                      className={`w-full flex items-center justify-between gap-2 px-1.5 py-1 rounded-md text-xs font-mono transition-colors cursor-pointer ${
-                        isFocused
-                          ? 'bg-slate-800/90 ring-1 ring-cyan-500/50'
-                          : 'hover:bg-slate-900/80'
-                      }`}
-                    >
-                      <div className="flex items-center gap-1.5 truncate">
-                        <span
-                          className={`w-4 h-4 rounded text-[10px] font-bold flex items-center justify-center shrink-0 ${
-                            rank === 0
-                              ? 'bg-amber-400 text-slate-950'
-                              : rank === 1
-                                ? 'bg-slate-300 text-slate-950'
-                                : 'bg-slate-800 text-slate-300'
-                          }`}
-                        >
-                          {rank + 1}
-                        </span>
-                        <span
-                          className="w-2.5 h-2.5 rounded-full shrink-0"
-                          style={{ backgroundColor: pColor }}
-                        />
-                        <span className="text-white font-medium truncate text-[11px]">
-                          {p?.name || 'Piloto'}
-                        </span>
-                        {totalLaps > 1 && !car.finished && (
-                          <span className="text-[9px] text-slate-400 font-bold">
-                            V{car.lap}
-                          </span>
-                        )}
-                      </div>
-                      <span className="text-[10px] font-bold shrink-0 tabular-nums">
-                        {car.finished ? (
-                          <span className="text-emerald-400 flex items-center gap-0.5">
-                            <CheckCircle2 className="w-3 h-3" />{' '}
-                            {((car.timeFinished || 0) / 1000).toFixed(1)}s
-                          </span>
-                        ) : car.disqualified ? (
-                          <span className="text-rose-400">Desc.</span>
-                        ) : car.offTrack ? (
-                          <span className="text-amber-400 font-extrabold">GRAVA {speed}</span>
-                        ) : (car.overspeedTimer || 0) > 0 ? (
-                          <span className="text-rose-400 font-extrabold">¡SUBVIRAJE! {speed}</span>
-                        ) : (
-                          <span className="text-cyan-400">{speed} km/h</span>
-                        )}
-                      </span>
-                    </button>
-                  );
-                })}
             </div>
           </div>
         )}
@@ -1976,122 +2360,225 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                 opacity="0.9"
               />
 
-              {/* Direction Arrow at Start Grid */}
-              {activePlayer && !hasDrawnPoints && !allPlayersReady && (
+              {/* Direction Arrow at Current Lap Start Anchor */}
+              {activePlayer && !hasDrawnPoints && !isDrawingBlockedByReady && (
                 <g
-                  transform={`translate(${gridPos.x + Math.cos(gridPos.angle) * 34}, ${
-                    gridPos.y + Math.sin(gridPos.angle) * 34
-                  }) rotate(${(gridPos.angle * 180) / Math.PI})`}
-                  opacity="0.85"
+                  transform={`translate(${
+                    currentStartAnchor.x + Math.cos(currentStartAnchor.angle) * 34
+                  }, ${
+                    currentStartAnchor.y + Math.sin(currentStartAnchor.angle) * 34
+                  }) rotate(${(currentStartAnchor.angle * 180) / Math.PI})`}
+                  opacity="0.9"
                 >
                   <path d="M -8 -5 L 6 0 L -8 5 Z" fill="#fbbf24" />
                 </g>
               )}
 
-              {/* Completed paths of players with tactical segment coloring for human player */}
+              {/* Saved Per-Lap Paths: distinct reference trails while drawing + full tactical inspection when ready */}
               {players.map((p) => {
-                if (p.drawnPath.length > 1) {
-                  const isOwnCompleted = allPlayersReady && !p.isAI;
-                  if (isOwnCompleted && completedSafetyReport) {
-                    return (
-                      <g key={`completed-tactical-${p.id}`}>
-                        {p.drawnPath.slice(1).map((pt, idx) => {
-                          const p1 = p.drawnPath[idx];
-                          const segInfo = completedSafetyReport.segments[idx];
-                          const segColor = segInfo
-                            ? getSegmentSafetyColor(segInfo.status)
-                            : carStats[p.carType].color;
-                          return (
-                            <line
-                              key={`comp-seg-${idx}`}
-                              x1={p1.x}
-                              y1={p1.y}
-                              x2={pt.x}
-                              y2={pt.y}
-                              stroke={segColor}
-                              strokeWidth={
-                                segInfo?.status === 'danger_overspeed' ? '6' : '4.5'
-                              }
-                              strokeLinecap="round"
-                              opacity="0.9"
-                            />
-                          );
-                        })}
-                        {/* Danger Zone Badges on completed path */}
-                        {completedSafetyReport.dangerZones.map((dz, dzIdx) => (
-                          <g
-                            key={`comp-dz-${dzIdx}`}
-                            transform={
-                              usePortraitLayout ? `rotate(-90, ${dz.x}, ${dz.y})` : undefined
-                            }
-                          >
-                            <circle
-                              cx={dz.x}
-                              cy={dz.y}
-                              r="11"
-                              fill="#881337"
-                              stroke="#f43f5e"
-                              strokeWidth="2"
-                            />
-                            <text
-                              x={dz.x}
-                              y={dz.y + 4}
-                              textAnchor="middle"
-                              fill="#ffffff"
-                              fontSize="11"
-                              fontWeight="bold"
-                              fontFamily="monospace"
-                            >
-                              !
-                            </text>
+                const playerLaps =
+                  p.lapPaths && p.lapPaths.length > 0
+                    ? p.lapPaths
+                    : p.drawnPath.length > 1
+                      ? [p.drawnPath]
+                      : [];
+                if (playerLaps.length === 0) return null;
+
+                const lapTintPalette = ['#38bdf8', '#a78bfa', '#fbbf24', '#34d399', '#fb7185'];
+                const isOwnCompleted =
+                  isDrawingBlockedByReady && !p.isAI && p.id === completedHumanPlayer?.id;
+
+                return (
+                  <g key={`saved-laps-${p.id}`}>
+                    {playerLaps.map((lapPath, lapIdx) => {
+                      if (!lapPath || lapPath.length < 2) return null;
+                      // Hide the lap currently being redrawn so the user has a clean slate
+                      if (redrawLapTarget === lapIdx && p.id === activePlayer?.id) return null;
+
+                      const isInspectedLap =
+                        isOwnCompleted && lapIdx === safeInspectLapIndex && completedSafetyReport;
+
+                      if (isInspectedLap && completedSafetyReport) {
+                        return (
+                          <g key={`completed-tactical-${p.id}-v${lapIdx}`}>
+                            {lapPath.slice(1).map((pt, idx) => {
+                              const p1 = lapPath[idx];
+                              const segInfo = completedSafetyReport.segments[idx];
+                              const segColor = segInfo
+                                ? getSegmentSafetyColor(segInfo.status)
+                                : p.color || carStats[p.carType].color;
+                              return (
+                                <line
+                                  key={`comp-seg-${idx}`}
+                                  x1={p1.x}
+                                  y1={p1.y}
+                                  x2={pt.x}
+                                  y2={pt.y}
+                                  stroke={segColor}
+                                  strokeWidth={
+                                    segInfo?.status === 'danger_overspeed' ? '6' : '4.5'
+                                  }
+                                  strokeLinecap="round"
+                                  opacity="0.92"
+                                />
+                              );
+                            })}
+                            {completedSafetyReport.dangerZones.map((dz, dzIdx) => (
+                              <g
+                                key={`comp-dz-${dzIdx}`}
+                                transform={
+                                  usePortraitLayout ? `rotate(-90, ${dz.x}, ${dz.y})` : undefined
+                                }
+                              >
+                                <circle
+                                  cx={dz.x}
+                                  cy={dz.y}
+                                  r="11"
+                                  fill="#881337"
+                                  stroke="#f43f5e"
+                                  strokeWidth="2"
+                                />
+                                <text
+                                  x={dz.x}
+                                  y={dz.y + 4}
+                                  textAnchor="middle"
+                                  fill="#ffffff"
+                                  fontSize="11"
+                                  fontWeight="bold"
+                                  fontFamily="monospace"
+                                >
+                                  !
+                                </text>
+                              </g>
+                            ))}
                           </g>
-                        ))}
-                      </g>
-                    );
-                  }
-                  return (
-                    <path
-                      key={`completed-guide-${p.id}`}
-                      d={`M ${p.drawnPath.map((pt) => `${pt.x} ${pt.y}`).join(' L ')}`}
-                      fill="none"
-                      stroke={carStats[p.carType].color}
-                      strokeWidth="3"
-                      strokeLinecap="round"
-                      strokeLinejoin="round"
-                      opacity="0.35"
-                      strokeDasharray="5,6"
-                    />
-                  );
-                }
-                return null;
+                        );
+                      }
+
+                      // Reference trail for previously saved laps (distinct tint per lap!)
+                      const refColor =
+                        p.id === activePlayer?.id || !p.isAI
+                          ? lapTintPalette[lapIdx % lapTintPalette.length]
+                          : p.color || carStats[p.carType].color;
+                      const labelPt = lapPath[Math.min(lapPath.length - 1, Math.floor(lapPath.length * (0.2 + lapIdx * 0.08)))];
+                      return (
+                        <g key={`saved-lap-ref-${p.id}-v${lapIdx}`}>
+                          <path
+                            d={`M ${lapPath.map((pt) => `${pt.x} ${pt.y}`).join(' L ')}`}
+                            fill="none"
+                            stroke={refColor}
+                            strokeWidth="2.8"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            opacity={isOwnCompleted ? 0.34 : 0.42}
+                            strokeDasharray="6,6"
+                          />
+                          {labelPt && totalLaps > 1 && (
+                            <g
+                              transform={
+                                usePortraitLayout
+                                  ? `rotate(-90, ${labelPt.x}, ${labelPt.y})`
+                                  : undefined
+                              }
+                            >
+                              <circle
+                                cx={labelPt.x}
+                                cy={labelPt.y}
+                                r="8.5"
+                                fill="#090d16"
+                                stroke={refColor}
+                                strokeWidth="1.5"
+                                opacity="0.9"
+                              />
+                              <text
+                                x={labelPt.x}
+                                y={labelPt.y + 3}
+                                textAnchor="middle"
+                                fill={refColor}
+                                fontSize="8"
+                                fontWeight="bold"
+                                fontFamily="monospace"
+                              >
+                                V{lapIdx + 1}
+                              </text>
+                            </g>
+                          )}
+                        </g>
+                      );
+                    })}
+                  </g>
+                );
               })}
 
-              {/* Starting Anchor Beacon centered on active player's car */}
-              {activePlayer && !hasDrawnPoints && !allPlayersReady && (
+              {/* Starting Anchor Beacon centered on current lap start (Grid for V1, Finish Exit for V2..N) */}
+              {activePlayer && !hasDrawnPoints && !isDrawingBlockedByReady && (
                 <g>
                   <circle
-                    cx={gridPos.x}
-                    cy={gridPos.y}
-                    r="24"
-                    fill={carStats[activePlayer.carType].color}
-                    opacity="0.25"
+                    cx={currentStartAnchor.x}
+                    cy={currentStartAnchor.y}
+                    r="26"
+                    fill={
+                      activeDrawingLapNumber > 1
+                        ? '#fbbf24'
+                        : activePlayer.color || carStats[activePlayer.carType].color
+                    }
+                    opacity="0.26"
                   />
                   <circle
-                    cx={gridPos.x}
-                    cy={gridPos.y}
-                    r="15"
+                    cx={currentStartAnchor.x}
+                    cy={currentStartAnchor.y}
+                    r="16"
                     fill="none"
-                    stroke={carStats[activePlayer.carType].color}
+                    stroke={
+                      activeDrawingLapNumber > 1
+                        ? '#fbbf24'
+                        : activePlayer.color || carStats[activePlayer.carType].color
+                    }
                     strokeWidth="2.5"
                   />
                   <circle
-                    cx={gridPos.x}
-                    cy={gridPos.y}
-                    r="5.5"
+                    cx={currentStartAnchor.x}
+                    cy={currentStartAnchor.y}
+                    r="6"
                     fill="#ffffff"
-                    stroke={carStats[activePlayer.carType].color}
+                    stroke={
+                      activeDrawingLapNumber > 1
+                        ? '#f59e0b'
+                        : activePlayer.color || carStats[activePlayer.carType].color
+                    }
                     strokeWidth="2"
                   />
+                  {totalLaps > 1 && (
+                    <g
+                      transform={
+                        usePortraitLayout
+                          ? `rotate(-90, ${currentStartAnchor.x}, ${currentStartAnchor.y - 24})`
+                          : undefined
+                      }
+                    >
+                      <rect
+                        x={currentStartAnchor.x - 18}
+                        y={currentStartAnchor.y - 33}
+                        width="36"
+                        height="14"
+                        rx="4"
+                        fill="#090d16"
+                        stroke="#fbbf24"
+                        strokeWidth="1.2"
+                      />
+                      <text
+                        x={currentStartAnchor.x}
+                        y={currentStartAnchor.y - 23}
+                        textAnchor="middle"
+                        fill="#fde68a"
+                        fontSize="8.5"
+                        fontWeight="bold"
+                        fontFamily="monospace"
+                      >
+                        V{activeDrawingLapNumber}/{totalLaps}
+                      </text>
+                    </g>
+                  )}
                 </g>
               )}
 
@@ -2159,9 +2646,52 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           />
         )}
 
-        {/* Ready-to-Race Fullscreen Launch Banner with Tactical Corner Analysis! */}
-        {phase === 'drawing' && allPlayersReady && (
-          <div className="absolute inset-x-3 bottom-4 flex flex-col gap-2.5 bg-slate-950/95 border border-emerald-500/40 p-3.5 rounded-2xl shadow-2xl z-30 max-w-md mx-auto">
+        {/* Ready-to-Race Fullscreen Launch Banner with Per-Lap Tactical Selector & Analysis! */}
+        {phase === 'drawing' && isDrawingBlockedByReady && (
+          <div className="absolute inset-x-3 bottom-4 flex flex-col gap-2 bg-slate-950/95 border border-emerald-500/40 p-3.5 rounded-2xl shadow-2xl z-30 max-w-md mx-auto">
+            {/* Per-Lap Selector Tabs when racing more than 1 lap */}
+            {completedHumanLaps.length > 1 && (
+              <div className="flex items-center justify-between gap-1.5 pb-1 border-b border-slate-800/80">
+                <span className="text-[10px] font-mono text-slate-400 font-bold uppercase tracking-wider shrink-0">
+                  Trazadas ({completedHumanLaps.length}V):
+                </span>
+                <div className="flex items-center gap-1 overflow-x-auto">
+                  {completedHumanLaps.map((_, idx) => (
+                    <button
+                      key={`inspect-lap-${idx}`}
+                      type="button"
+                      onClick={() => {
+                        haptics.lightTap();
+                        setInspectLapIndex(idx);
+                      }}
+                      className={`px-2 py-1 rounded-md text-[10px] font-mono font-extrabold transition-all cursor-pointer ${
+                        safeInspectLapIndex === idx
+                          ? 'bg-cyan-500 text-slate-950 shadow'
+                          : 'bg-slate-900 border border-slate-800 text-slate-300 hover:border-slate-600'
+                      }`}
+                    >
+                      V{idx + 1}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    haptics.lightTap();
+                    setRedrawLapTarget(safeInspectLapIndex);
+                    setDrawingError(null);
+                    setLapSavedNotice(
+                      `Dibuja de nuevo la Vuelta ${safeInspectLapIndex + 1} desde la meta`
+                    );
+                  }}
+                  className="text-[10px] font-mono font-bold text-amber-300 hover:text-amber-200 bg-amber-500/10 border border-amber-500/30 px-2 py-1 rounded-md cursor-pointer whitespace-nowrap shrink-0"
+                  title={`Volver a dibujar solo la Vuelta ${safeInspectLapIndex + 1}`}
+                >
+                  Editar V{safeInspectLapIndex + 1}
+                </button>
+              </div>
+            )}
+
             {completedSafetyReport && (
               <div
                 className={`flex items-center justify-between gap-2 px-3 py-1.5 rounded-xl border text-[11px] font-mono ${
@@ -2177,9 +2707,10 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                     <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                   )}
                   <span className="font-bold">
+                    {completedHumanLaps.length > 1 ? `V${safeInspectLapIndex + 1}: ` : ''}
                     {completedSafetyReport.dangerZones.length > 0
-                      ? `${completedSafetyReport.dangerZones.length} curva(s) rápidas: riesgo de salir a la grava`
-                      : 'Frenada en curvas óptima · Trazada limpia'}
+                      ? `${completedSafetyReport.dangerZones.length} curva(s) rápidas`
+                      : 'Frenada en curvas óptima'}
                   </span>
                 </div>
                 <span className="font-extrabold shrink-0">
@@ -2187,9 +2718,10 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                 </span>
               </div>
             )}
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-2.5">
+            <div className="flex flex-col sm:flex-row items-center justify-center gap-2">
               <button
                 onClick={() => {
+                  haptics.countdownGo();
                   audio.playBeep(880, 0.15, 'sine');
                   if (onStartRace) {
                     onStartRace();
@@ -2197,17 +2729,17 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                     useGameStore.getState().setPhase('racing');
                   }
                 }}
-                className="w-full sm:w-auto flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-slate-950 font-extrabold py-2.5 px-5 rounded-xl shadow-lg transition-transform hover:scale-[1.02] text-sm cursor-pointer whitespace-nowrap"
+                className="w-full sm:w-auto flex-1 flex items-center justify-center gap-2 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 active:scale-[0.98] text-slate-950 font-extrabold py-2.5 px-5 min-h-[44px] rounded-xl shadow-lg transition-all text-sm cursor-pointer whitespace-nowrap"
               >
                 <Play className="w-4 h-4 fill-slate-950" />
                 ¡COMENZAR LA CARRERA!
               </button>
               <button
                 onClick={handleRedrawCompleted}
-                className="w-full sm:w-auto flex items-center justify-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold py-2.5 px-4 rounded-xl text-xs cursor-pointer whitespace-nowrap"
+                className="w-full sm:w-auto flex items-center justify-center gap-1.5 bg-slate-800 hover:bg-slate-700 active:scale-[0.98] text-slate-200 font-bold py-2.5 px-4 min-h-[42px] rounded-xl text-xs cursor-pointer whitespace-nowrap"
               >
                 <RotateCcw className="w-3.5 h-3.5" />
-                Repetir Trazada
+                {completedHumanLaps.length > 1 ? 'Repetir Todas' : 'Repetir Trazada'}
               </button>
             </div>
           </div>
@@ -2218,15 +2750,15 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           <div className="absolute top-14 left-3 right-3 max-w-lg mx-auto bg-slate-950/95 text-white text-xs p-3.5 rounded-xl flex items-start gap-2.5 shadow-2xl border border-slate-700 z-30">
             <HelpCircle className="w-4 h-4 shrink-0 text-amber-400 mt-0.5" />
             <div className="flex-1">
-              <p className="font-bold text-amber-300">Física Realista: F1 / NASCAR / Rally</p>
+              <p className="font-bold text-amber-300">Trazado Independiente por Vuelta · Física Real F1</p>
               <p className="text-slate-200 mt-0.5 text-[11px]">
-                • <strong>Indicadores en pista:</strong> Verás carteles con la velocidad óptima (<span className="text-cyan-400 font-bold">RECTA km/h</span> y <span className="text-emerald-400 font-bold">CURVA km/h</span>) desde el principio.
+                • <strong>Cada vuelta guarda su propia línea:</strong> Puedes dibujar todas las vueltas del tirón sin levantar el dedo al cruzar meta, o levantar tras cada vuelta y dibujar la siguiente con otra estrategia.
               </p>
               <p className="text-slate-200 mt-0.5 text-[11px]">
-                • <strong>Botón «Vuelta Perfecta»:</strong> Actívalo arriba para ver la línea ideal y un coche fantasma moviéndose a la velocidad exacta a la que debes dibujar.
+                • <strong>Indicadores en pista y «Vuelta Perfecta»:</strong> Sigue las velocidades óptimas (<span className="text-cyan-400 font-bold">RECTA km/h</span> y <span className="text-emerald-400 font-bold">CURVA km/h</span>) para no perder agarre.
               </p>
               <p className="text-rose-300 text-[10px] mt-1 font-semibold">
-                ⚠️ Si entras pasado de velocidad en una curva, la fuerza centrífuga abrirá tu trayectoria hacia el piano o la escapatoria de grava/hierba, frenándote de forma natural sin rebotes artificiales.
+                ⚠️ Si entras pasado de velocidad en una curva, la fuerza centrífuga abrirá tu trayectoria hacia el piano o la grava.
               </p>
             </div>
             <button
@@ -2238,13 +2770,18 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           </div>
         )}
 
-        {/* Non-blocking Top Toast for Drawing Feedback */}
-        {drawingError && (
+        {/* Non-blocking Top Toast for Drawing Feedback (Errors & Saved Lap Confirmations) */}
+        {drawingError ? (
           <div className="absolute top-14 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-rose-950/95 border border-rose-700 text-rose-100 px-3.5 py-2 rounded-lg text-[11px] sm:text-xs max-w-[92%] shadow-xl z-30 pointer-events-none">
             <AlertCircle className="w-4 h-4 shrink-0 text-rose-400" />
             <p className="font-sans font-semibold leading-tight">{drawingError}</p>
           </div>
-        )}
+        ) : lapSavedNotice && phase === 'drawing' ? (
+          <div className="absolute top-14 left-1/2 -translate-x-1/2 flex items-center gap-2 bg-emerald-950/95 border border-emerald-500/60 text-emerald-100 px-3.5 py-2 rounded-lg text-[11px] sm:text-xs max-w-[92%] shadow-xl z-30 pointer-events-none">
+            <CheckCircle2 className="w-4 h-4 shrink-0 text-emerald-400" />
+            <p className="font-sans font-semibold leading-tight">{lapSavedNotice}</p>
+          </div>
+        ) : null}
       </div>
 
       {/* Unified Bottom Telemetry & Controls Dock */}
@@ -2257,20 +2794,25 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               backgroundColor:
                 phase === 'drawing'
                   ? activePlayer
-                    ? carStats[activePlayer.carType].color
+                    ? activePlayer.color || carStats[activePlayer.carType].color
                     : '#10b981'
                   : activeCarObj
-                    ? carStats[
-                        players.find((p) => p.id === activeCarObj.playerId)?.carType || 'balanced'
-                      ].color
+                    ? (() => {
+                        const focused = players.find((p) => p.id === activeCarObj.playerId);
+                        return focused
+                          ? focused.color || carStats[focused.carType].color
+                          : '#10b981';
+                      })()
                     : '#10b981'
             }}
           />
           <span className="font-bold text-white text-xs whitespace-nowrap">
             {phase === 'drawing'
-              ? allPlayersReady
-                ? '¡Trazada Lista!'
-                : `Turno: ${activePlayer?.name || 'Piloto'}`
+              ? isDrawingBlockedByReady
+                ? `¡${totalLaps} ${totalLaps === 1 ? 'Vuelta Lista' : 'Vueltas Listas'}!`
+                : redrawLapTarget !== null
+                  ? `Editando V${redrawLapTarget + 1}/${totalLaps}`
+                  : `${activePlayer?.name || 'Piloto'} · V${activeDrawingLapNumber}/${totalLaps}`
               : `${players.find((p) => p.id === activeCarObj?.playerId)?.name || 'Carrera'}`}
           </span>
         </div>
@@ -2285,13 +2827,19 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               >
                 {getLiveTacticalMessage(activeSafetyStatus, activeSpeed, activeMaxSafeSpeed)}
               </span>
-            ) : allPlayersReady ? (
+            ) : isDrawingBlockedByReady ? (
               <span className="text-[11px] text-emerald-400 font-bold">
-                Pulsa ¡COMENZAR LA CARRERA! para competir
+                Revisa cada vuelta (V1..V{totalLaps}) o pulsa ¡COMENZAR!
               </span>
+            ) : activeDrawingLapNumber > 1 ? (
+              <p className="text-[11px] text-amber-300 font-semibold text-center truncate">
+                Dibuja la Vuelta {activeDrawingLapNumber}/{totalLaps} desde la línea de meta
+              </p>
             ) : (
               <p className="text-[11px] text-amber-400 font-semibold text-center truncate">
-                Mira las velocidades en pista o pulsa «Vuelta Perfecta»
+                {totalLaps > 1
+                  ? `Dibuja las ${totalLaps} vueltas seguidas o vuelta a vuelta`
+                  : 'Mira las velocidades en pista o pulsa «Vuelta Perfecta»'}
               </p>
             )
           ) : (
@@ -2370,11 +2918,11 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           )}
         </div>
 
-        {/* Right side: Action Buttons & Live F1 Pit-Wall Strategy Modes */}
-        <div className="flex gap-1.5 items-center justify-end shrink-0">
+        {/* Right side: Action Buttons & Live F1 Pit-Wall Strategy Modes (Thumb-friendly >= 38px targets for Android & iPhone) */}
+        <div className="flex flex-wrap gap-1.5 items-center justify-end shrink-0 w-full sm:w-auto">
           {phase === 'racing' && !isReplaying && (
             <div
-              className="flex items-center gap-1 bg-slate-900 border border-slate-800 p-0.5 rounded-lg"
+              className="flex flex-1 sm:flex-initial items-center gap-1 bg-slate-900 border border-slate-800 p-0.5 rounded-lg"
               title="Estrategia en tiempo real: Ataque ERS (+potencia), Ritmo GP (equilibrado) o Cuidar Gomas (+agarre en curva)"
             >
               {[
@@ -2388,9 +2936,10 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                   onClick={() => {
                     setPaceMode(m.id);
                     paceModeRef.current = m.id;
+                    haptics.lightTap();
                     audio.playBeep(m.id === 'attack' ? 780 : m.id === 'conserve' ? 460 : 600, 0.05, 'sine');
                   }}
-                  className={`px-2 py-0.5 rounded text-[10px] font-mono font-extrabold transition-colors cursor-pointer whitespace-nowrap ${
+                  className={`flex-1 sm:flex-initial px-2.5 py-2 sm:py-1 min-h-[36px] sm:min-h-0 rounded text-[10px] font-mono font-extrabold transition-all active:scale-95 cursor-pointer whitespace-nowrap ${
                     paceMode === m.id ? m.activeCls : 'text-slate-400 hover:text-white'
                   }`}
                 >
@@ -2403,11 +2952,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           {phase === 'drawing' && (
             <button
               onClick={() => {
+                haptics.lightTap();
                 audio.playBeep(showPerfectLap ? 480 : 760, 0.07, 'sine');
                 setShowPerfectLap((prev) => !prev);
                 setGhostFloatIdx(0);
               }}
-              className={`flex items-center gap-1 border text-[11px] font-bold px-2.5 py-1 rounded-lg cursor-pointer transition-colors whitespace-nowrap ${
+              className={`flex items-center justify-center gap-1 border text-[11px] font-bold px-2.5 py-2 sm:py-1 min-h-[38px] sm:min-h-0 rounded-lg cursor-pointer transition-all active:scale-95 whitespace-nowrap ${
                 showPerfectLap
                   ? 'bg-emerald-950/90 border-emerald-500 text-emerald-300'
                   : 'bg-slate-900 hover:bg-slate-800 border-slate-800 text-emerald-400'
@@ -2421,20 +2971,54 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           {phase === 'drawing' && (
             <button
               onClick={() => {
+                haptics.lightTap();
                 audio.playBeep(550, 0.07, 'sine');
                 setShowGuide(!showGuide);
               }}
-              className="flex items-center gap-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 text-[11px] font-bold px-2.5 py-1 rounded-lg cursor-pointer transition-colors whitespace-nowrap"
+              className="flex items-center justify-center gap-1 bg-slate-900 hover:bg-slate-800 border border-slate-800 text-slate-300 text-[11px] font-bold px-2.5 py-2 sm:py-1 min-h-[38px] sm:min-h-0 rounded-lg cursor-pointer transition-all active:scale-95 whitespace-nowrap"
             >
               <HelpCircle className="w-3.5 h-3.5 text-amber-400" />
               Guía
             </button>
           )}
 
+          {phase === 'drawing' && redrawLapTarget !== null && (
+            <button
+              onClick={() => {
+                haptics.lightTap();
+                handleClear();
+                setRedrawLapTarget(null);
+              }}
+              className="flex items-center justify-center gap-1 bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] font-bold px-3 py-2 sm:py-1 min-h-[38px] sm:min-h-0 rounded-lg transition-all active:scale-95 cursor-pointer whitespace-nowrap"
+            >
+              Cancelar V{redrawLapTarget + 1}
+            </button>
+          )}
+
+          {phase === 'drawing' &&
+            redrawLapTarget === null &&
+            !isDrawingBlockedByReady &&
+            activePlayerSavedLaps.length > 0 &&
+            !hasDrawnPoints && (
+              <button
+                onClick={() => {
+                  haptics.lightTap();
+                  handleUndoLastLap();
+                }}
+                className="flex items-center justify-center gap-1 bg-amber-600/90 hover:bg-amber-600 text-slate-950 text-[11px] font-extrabold px-3 py-2 sm:py-1 min-h-[38px] sm:min-h-0 rounded-lg transition-all active:scale-95 cursor-pointer whitespace-nowrap"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Deshacer V{activePlayerSavedLaps.length}
+              </button>
+            )}
+
           {phase === 'drawing' && hasDrawnPoints && (
             <button
-              onClick={handleClear}
-              className="flex items-center gap-1 bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-bold px-3 py-1 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
+              onClick={() => {
+                haptics.lightTap();
+                handleClear();
+              }}
+              className="flex items-center justify-center gap-1 bg-rose-600 hover:bg-rose-700 text-white text-[11px] font-bold px-3 py-2 sm:py-1 min-h-[38px] sm:min-h-0 rounded-lg transition-all active:scale-95 cursor-pointer whitespace-nowrap"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               Borrar
@@ -2443,8 +3027,11 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
           {phase === 'racing' && (
             <button
-              onClick={cycleCameraMode}
-              className="flex items-center gap-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-cyan-400 text-[11px] font-bold px-2.5 py-1 rounded-lg cursor-pointer transition-colors whitespace-nowrap"
+              onClick={() => {
+                haptics.lightTap();
+                cycleCameraMode();
+              }}
+              className="flex items-center justify-center gap-1 bg-slate-900 hover:bg-slate-800 border border-slate-700 text-cyan-400 text-[11px] font-bold px-3 py-2 sm:py-1 min-h-[36px] sm:min-h-0 rounded-lg cursor-pointer transition-all active:scale-95 whitespace-nowrap"
             >
               <Camera className="w-3.5 h-3.5" />
               Vista

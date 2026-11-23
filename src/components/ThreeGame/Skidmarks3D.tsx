@@ -1,4 +1,5 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef } from 'react';
+import { useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 
 export interface SkidmarkPoint {
@@ -11,23 +12,44 @@ export interface SkidmarkPoint {
 }
 
 interface Skidmarks3DProps {
-  skidmarks: SkidmarkPoint[];
+  skidmarks?: SkidmarkPoint[];
+  skidmarksRef?: React.MutableRefObject<SkidmarkPoint[]>;
 }
 
 const _dummy = new THREE.Object3D();
+const MAX_MARKS = 1100;
 
-export const Skidmarks3D: React.FC<Skidmarks3DProps> = ({ skidmarks }) => {
+export const Skidmarks3D: React.FC<Skidmarks3DProps> = ({ skidmarks, skidmarksRef }) => {
   const instancedMeshRef = useRef<THREE.InstancedMesh>(null);
+  const lastLenRef = useRef<number>(-1);
+  const lastTailXRef = useRef<number>(NaN);
+  const lastTailYRef = useRef<number>(NaN);
 
-  useEffect(() => {
+  useFrame(() => {
     const mesh = instancedMeshRef.current;
     if (!mesh) return;
 
-    const maxMarks = 1100;
+    const list = skidmarksRef ? skidmarksRef.current : skidmarks || [];
+    const len = list.length;
+    const tail = len > 0 ? list[len - 1] : null;
+    const tailX = tail ? tail.x : NaN;
+    const tailY = tail ? tail.y : NaN;
+
+    if (
+      len === lastLenRef.current &&
+      (len === 0 || (tailX === lastTailXRef.current && tailY === lastTailYRef.current))
+    ) {
+      return;
+    }
+
+    lastLenRef.current = len;
+    lastTailXRef.current = tailX;
+    lastTailYRef.current = tailY;
+
     let instanceIdx = 0;
 
-    for (let i = 0; i < skidmarks.length && instanceIdx + 1 < maxMarks; i++) {
-      const sm = skidmarks[i];
+    for (let i = 0; i < len && instanceIdx + 1 < MAX_MARKS; i++) {
+      const sm = list[i];
       const heading = sm.angle !== undefined ? -sm.angle : 0;
       const elevation = (sm.z ?? 0.55) + 0.08;
 
@@ -52,12 +74,12 @@ export const Skidmarks3D: React.FC<Skidmarks3DProps> = ({ skidmarks }) => {
 
     mesh.count = instanceIdx;
     mesh.instanceMatrix.needsUpdate = true;
-  }, [skidmarks]);
+  });
 
   return (
     <instancedMesh
       ref={instancedMeshRef}
-      args={[undefined, undefined, 1100]}
+      args={[undefined, undefined, MAX_MARKS]}
       frustumCulled={false}
     >
       <planeGeometry args={[1, 1]} />
