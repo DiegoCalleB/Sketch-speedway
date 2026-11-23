@@ -23,7 +23,7 @@ export const CAR_STATS: Record<CarType, CarStats> = {
   },
   balanced: {
     name: 'Grip F1',
-    color: '#f97316', // Neon Orange
+    color: '#0ea5e9', // Electric F1 Racing Blue
     maxSpeed: 8.1,
     acceleration: 0.20,
     grip: 0.08,
@@ -36,20 +36,26 @@ interface GameState {
   phase: GamePhase;
   selectedTrack: Track;
   gameMode: 'solo' | 'ai' | 'multiplayer';
+  totalLaps: number;
   players: Player[];
   activePlayerIndex: number;
   raceResults: RaceResultItem[] | null;
   telemetries: Record<string, PlayerTelemetry>;
+  isReplaying: boolean;
   
   // Actions
   setPhase: (phase: GamePhase) => void;
   setSelectedTrack: (track: Track) => void;
   setGameMode: (mode: 'solo' | 'ai' | 'multiplayer') => void;
+  setTotalLaps: (laps: number) => void;
   setupPlayers: (playersSetup: { name: string; carType: CarType; isAI: boolean; aiArchetype?: AIArchetype }[]) => void;
   setDrawnPath: (playerId: string, path: Point[]) => void;
   setActivePlayerIndex: (idx: number) => void;
   setRaceResults: (results: RaceResultItem[] | null) => void;
   setTelemetries: (telemetries: Record<string, PlayerTelemetry>) => void;
+  startReplay: () => void;
+  stopReplay: () => void;
+  clearDrawnPaths: () => void;
   restartGame: () => void;
   goToMenu: () => void;
 }
@@ -58,37 +64,47 @@ export const useGameStore = create<GameState>((set, get) => ({
   phase: 'menu',
   selectedTrack: TRACKS[0],
   gameMode: 'ai',
+  totalLaps: 3,
   players: [],
   activePlayerIndex: 0,
   raceResults: null,
   telemetries: {},
+  isReplaying: false,
 
   setPhase: (phase) => set({ phase }),
   setSelectedTrack: (selectedTrack) => set({ selectedTrack }),
   setGameMode: (gameMode) => set({ gameMode }),
+  setTotalLaps: (totalLaps) => set({ totalLaps }),
   
   setupPlayers: (playersSetup) => {
-    const list: Player[] = playersSetup.map((p, idx) => ({
-      id: `p-${idx}-${Date.now()}`,
-      name: p.name,
-      color: CAR_STATS[p.carType].color,
-      carType: p.carType,
-      drawnPath: [],
-      isAI: p.isAI,
-      aiArchetype: p.aiArchetype || (idx % 2 === 0 ? 'apex_master' : 'aggressive'),
-      isReady: p.isAI, // AI is always ready
-      raceTime: 0,
-      finished: false,
-      currentLap: 1,
-      disqualified: false
-    }));
+    const aiPalette = ['#f59e0b', '#e11d48', '#a855f7', '#10b981'];
+    const list: Player[] = playersSetup.map((p, idx) => {
+      const baseColor = CAR_STATS[p.carType].color;
+      const usedByFirst = idx > 0 && playersSetup[0].carType === p.carType;
+      const distinctColor = p.isAI && usedByFirst ? aiPalette[idx % aiPalette.length] : baseColor;
+      return {
+        id: `p-${idx}-${Date.now()}`,
+        name: p.name,
+        color: distinctColor,
+        carType: p.carType,
+        drawnPath: [],
+        isAI: p.isAI,
+        aiArchetype: p.aiArchetype || (idx % 2 === 0 ? 'apex_master' : 'aggressive'),
+        isReady: p.isAI, // AI is always ready
+        raceTime: 0,
+        finished: false,
+        currentLap: 1,
+        disqualified: false
+      };
+    });
 
     set({
       players: list,
       activePlayerIndex: 0,
       phase: 'drawing',
       raceResults: null,
-      telemetries: {}
+      telemetries: {},
+      isReplaying: false
     });
   },
 
@@ -123,14 +139,47 @@ export const useGameStore = create<GameState>((set, get) => ({
   setRaceResults: (raceResults) => set({ raceResults }),
   setTelemetries: (telemetries) => set({ telemetries }),
 
+  startReplay: () => {
+    set({
+      isReplaying: true,
+      phase: 'racing'
+    });
+  },
+
+  stopReplay: () => {
+    set({
+      isReplaying: false,
+      phase: 'results'
+    });
+  },
+
   goToMenu: () => {
     set({
       phase: 'menu',
       players: [],
       raceResults: null,
       telemetries: {},
-      activePlayerIndex: 0
+      activePlayerIndex: 0,
+      isReplaying: false
     });
+  },
+
+  clearDrawnPaths: () => {
+    set((state) => ({
+      players: state.players.map((p) => ({
+        ...p,
+        drawnPath: [],
+        isReady: p.isAI,
+        finished: false,
+        raceTime: 0,
+        disqualified: false
+      })),
+      raceResults: null,
+      telemetries: {},
+      activePlayerIndex: 0,
+      isReplaying: false,
+      phase: 'drawing'
+    }));
   },
 
   restartGame: () => {
@@ -149,6 +198,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         raceResults: null,
         telemetries: {},
         activePlayerIndex: 0,
+        isReplaying: false,
         phase: 'drawing'
       }));
     } else {
@@ -158,6 +208,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         raceResults: null,
         telemetries: {},
         activePlayerIndex: 0,
+        isReplaying: false,
         phase: 'menu'
       });
     }

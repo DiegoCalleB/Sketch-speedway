@@ -77,11 +77,11 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
     return aiTelemetry.samples[idx];
   }, [aiTelemetry, replayProgress]);
 
-  // Export JSON Report for Academic Review
+  // Export JSON Telemetry Report
   const handleExportJSON = () => {
     const dataReport = {
-      project: "ApexAI Racing Lab - TFM Videojuegos con IA",
-      version: "2.0-Academic",
+      project: "Draw Race - F1 Telemetry Pro",
+      version: "1.0.0",
       track: {
         id: track.id,
         name: track.name,
@@ -129,13 +129,13 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
           </div>
           <div>
             <div className="text-sm font-bold tracking-tight text-white flex items-center gap-2">
-              APEX TELEMETRY LAB
+              TELEMETRÍA F1 PRO
               <span className="text-[10px] font-mono text-cyan-400 bg-cyan-950/60 border border-cyan-800 px-1.5 py-0.5 rounded">
-                TFM ACADEMIC SUITE
+                FIA TELEMETRY
               </span>
             </div>
             <div className="text-xs text-slate-400">
-              Análisis cinemático de trazada, fuerzas G y optimización de ápice en {track.name}
+              Análisis cinemático de trazada, fuerzas G y paso por vértice en {track.name}
             </div>
           </div>
         </div>
@@ -164,7 +164,7 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
               activeTab === 'academic' ? 'bg-cyan-500 text-slate-950 font-semibold' : 'text-slate-300 hover:text-white'
             }`}
           >
-            Rúbrica TFM
+            Superlicencia FIA
           </button>
         </div>
 
@@ -539,19 +539,19 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
           </div>
         )}
 
-        {/* TAB 3: Academic Evaluation Rubric */}
+        {/* TAB 3: FIA Driver Superlicense Evaluation */}
         {activeTab === 'academic' && (
           <div className="grid md:grid-cols-3 gap-6">
             <div className="p-6 bg-slate-900 border border-slate-800 rounded-2xl space-y-3 md:col-span-2">
-              <h3 className="text-base font-semibold text-white">Evaluación de Competencias TFM</h3>
+              <h3 className="text-base font-semibold text-white">Evaluación de Pilotaje FIA</h3>
               <p className="text-xs text-slate-400">
-                Criterios de validación cinemática y algorítmica para el modelado de vehículos autónomos.
+                Métricas de ingeniero de pista basadas en tu trazada real, vértices de curva y suavidad de aceleración.
               </p>
 
               <div className="space-y-4 pt-2">
                 <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
                   <div className="flex justify-between items-center text-sm font-medium">
-                    <span className="text-slate-200">1. Optimización Geométrica de Curvatura (Late Apex)</span>
+                    <span className="text-slate-200">1. Precisión en Vértices de Curva (Late Apex)</span>
                     <span className="font-mono text-cyan-400">{playerTelemetry?.apexScore ?? 84}/100</span>
                   </div>
                   <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
@@ -561,13 +561,13 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                     />
                   </div>
                   <p className="text-[11px] text-slate-400">
-                    Evalúa la aproximación al ápice interior en el vértice geométrico tardío y el ensanchamiento en salida de curva para maximizar la tracción.
+                    Evalúa tu aproximación al ápice interior y la apertura a la salida de curva para maximizar la aceleración.
                   </p>
                 </div>
 
                 <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
                   <div className="flex justify-between items-center text-sm font-medium">
-                    <span className="text-slate-200">2. Derivada Temporal de la Aceleración (Jerk / Suavidad)</span>
+                    <span className="text-slate-200">2. Suavidad y Control de Tracción</span>
                     <span className="font-mono text-emerald-400">{playerTelemetry?.smoothnessScore ?? 89}/100</span>
                   </div>
                   <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
@@ -577,20 +577,20 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                     />
                   </div>
                   <p className="text-[11px] text-slate-400">
-                    Mide la continuidad de la aceleración longitudinal evitando correcciones bruscas que provocarían pérdida de tracción según el círculo de fricción.
+                    Mide la progresividad de tu velocidad evitando frenazos o tirones bruscos que desgastan los neumáticos.
                   </p>
                 </div>
 
                 <div className="p-4 bg-slate-950/60 rounded-xl border border-slate-800 space-y-2">
                   <div className="flex justify-between items-center text-sm font-medium">
-                    <span className="text-slate-200">3. Eficiencia en la Ventana de Rebufo Aerodinámico</span>
+                    <span className="text-slate-200">3. Aprovechamiento de Rebufo & DRS</span>
                     <span className="font-mono text-amber-400">92/100</span>
                   </div>
                   <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
                     <div className="bg-amber-500 h-full rounded-full" style={{ width: '92%' }} />
                   </div>
                   <p className="text-[11px] text-slate-400">
-                    Calcula el tiempo relativo rodando a rebufo (&lt; 45 píxeles de distancia angular) obteniendo la reducción de arrastre parasitario inducido.
+                    Evalúa el tiempo de empuje en rectas con mínima resistencia aerodinámica y máxima velocidad punta.
                   </p>
                 </div>
               </div>
@@ -601,25 +601,26 @@ export const TelemetryLab: React.FC<TelemetryLabProps> = ({
                 <div className="w-10 h-10 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center text-amber-400">
                   <Trophy className="w-5 h-5" />
                 </div>
-                <h4 className="text-sm font-bold text-white">Dictamen de Calificación TFM</h4>
+                <h4 className="text-sm font-bold text-white">Puntuación Superlicencia F1</h4>
                 <div className="text-3xl font-extrabold font-mono text-amber-400">
-                  9.8 <span className="text-sm font-normal text-slate-400">/ 10</span>
+                  {(((playerTelemetry?.apexScore ?? 88) + (playerTelemetry?.smoothnessScore ?? 90)) / 20).toFixed(1)}{' '}
+                  <span className="text-sm font-normal text-slate-400">/ 10</span>
                 </div>
                 <div className="text-xs font-semibold text-emerald-400 uppercase tracking-wide">
-                  Matrícula de Honor (Sobresaliente)
+                  Licencia FIA Grado A · Piloto Pro
                 </div>
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  El sistema cumple con creces los requisitos teóricos y empíricos: integración de modelos de fricción no lineal, algoritmos de optimización de splines para trazada ideal, simulación multirreactiva 3D y análisis de telemetría por sectores.
+                  Análisis completo de trazada geométrica, frenada progresiva en curva y tracción a la salida de cada sector del Gran Premio.
                 </p>
               </div>
 
               <div className="pt-4 border-t border-slate-800">
                 <button
                   onClick={handleExportJSON}
-                  className="w-full py-2.5 px-3 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-xs rounded-xl transition-colors flex items-center justify-center gap-2"
+                  className="w-full py-2.5 px-3 bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-semibold text-xs rounded-xl transition-colors flex items-center justify-center gap-2 cursor-pointer"
                 >
                   <Download className="w-4 h-4" />
-                  Descargar Informe Académico
+                  Exportar Telemetría (JSON)
                 </button>
               </div>
             </div>

@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
 import { GamePhase, Track, Player, CarType, CarStats, AIArchetype, RaceResultItem } from '../types';
 import { motion } from 'motion/react';
-import { Trophy, Users, Cpu, Sliders, Volume2, VolumeX, Play, RotateCcw, HelpCircle, Check, Flag, Car, Zap, Sparkles, Activity } from 'lucide-react';
+import { Trophy, Users, Cpu, Sliders, Volume2, VolumeX, Play, RotateCcw, HelpCircle, Check, Flag, Car, Zap, Sparkles, Activity, Video } from 'lucide-react';
 import { audio } from '../utils/audio';
 import { TelemetryLab } from './TelemetryLab';
 import { useGameStore } from '../store/gameStore';
+import { PWAInstallButton } from './PWAControls';
 
 interface GameUIProps {
   phase: GamePhase;
@@ -39,9 +40,53 @@ export const GameUI: React.FC<GameUIProps> = ({
   raceResults,
   onRestart,
 }) => {
+  const totalLaps = useGameStore((s) => s.totalLaps);
+  const setTotalLaps = useGameStore((s) => s.setTotalLaps);
   const [isMuted, setIsMuted] = useState(audio.getMuted());
   const [selectedAiArchetype, setSelectedAiArchetype] = useState<AIArchetype>('apex_master');
   const [resultsTab, setResultsTab] = useState<'podium' | 'telemetry'>('podium');
+
+  // Official Track Records (best single lap time in ms per trackId, persisted in localStorage)
+  const [trackRecords, setTrackRecords] = useState<Record<string, number>>(() => {
+    try {
+      const saved = localStorage.getItem('drawrace_f1_records_v1');
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [newRecordPlayerId, setNewRecordPlayerId] = useState<string | null>(null);
+
+  React.useEffect(() => {
+    if (phase === 'results' && raceResults && raceResults.length > 0) {
+      const validHumanResults = raceResults.filter((r) => {
+        const pl = players.find((p) => p.id === r.playerId);
+        const lapMetric = r.bestLap || r.time;
+        return pl && !pl.isAI && r.finished && !r.disqualified && lapMetric > 1000 && lapMetric < 900000;
+      });
+      if (validHumanResults.length > 0) {
+        const bestHuman = validHumanResults.reduce((best, curr) =>
+          (curr.bestLap || curr.time) < (best.bestLap || best.time) ? curr : best
+        );
+        const bestHumanLap = bestHuman.bestLap || bestHuman.time;
+        const prevBest = trackRecords[selectedTrack.id];
+        if (!prevBest || bestHumanLap < prevBest) {
+          const updated = { ...trackRecords, [selectedTrack.id]: bestHumanLap };
+          setTrackRecords(updated);
+          setNewRecordPlayerId(bestHuman.playerId);
+          try {
+            localStorage.setItem('drawrace_f1_records_v1', JSON.stringify(updated));
+          } catch {
+            // ignore storage errors
+          }
+        } else {
+          setNewRecordPlayerId(null);
+        }
+      }
+    } else if (phase !== 'results') {
+      setNewRecordPlayerId(null);
+    }
+  }, [phase, raceResults, selectedTrack.id]);
   
   // Local state for player registration form
   const [playersForm, setPlayersForm] = useState<{[key: number]: { name: string; carType: CarType }}>({
@@ -128,14 +173,17 @@ export const GameUI: React.FC<GameUIProps> = ({
           </div>
         </div>
 
-        {/* Audio controls */}
-        <button
-          onClick={handleMuteToggle}
-          className="flex items-center gap-1.5 px-2.5 py-1 sm:px-3.5 sm:py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 text-slate-300 transition-colors cursor-pointer"
-        >
-          {isMuted ? <VolumeX className="w-3.5 h-3.5 text-rose-400" /> : <Volume2 className="w-3.5 h-3.5 text-emerald-400" />}
-          <span className="text-[10px] sm:text-xs font-mono font-bold">{isMuted ? 'MUTE' : 'SONIDO'}</span>
-        </button>
+        {/* Audio & Install App controls */}
+        <div className="flex items-center gap-2">
+          <PWAInstallButton />
+          <button
+            onClick={handleMuteToggle}
+            className="flex items-center gap-1.5 px-2.5 py-1 sm:px-3.5 sm:py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 text-slate-300 transition-colors cursor-pointer"
+          >
+            {isMuted ? <VolumeX className="w-3.5 h-3.5 text-rose-400" /> : <Volume2 className="w-3.5 h-3.5 text-emerald-400" />}
+            <span className="text-[10px] sm:text-xs font-mono font-bold">{isMuted ? 'MUTE' : 'SONIDO'}</span>
+          </button>
+        </div>
       </div>
 
       {/* PHASE 1: CHOOSE TRACK & MODE */}
@@ -168,11 +216,18 @@ export const GameUI: React.FC<GameUIProps> = ({
                     }`}
                   >
                     <div className="flex-1">
-                      <div className="flex items-center gap-2">
-                        <span className="font-bold text-white font-sans">{tk.name}</span>
-                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${diffColor}`}>
-                          {tk.difficulty}
-                        </span>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-white font-sans">{tk.name}</span>
+                          <span className={`text-[10px] font-bold px-2 py-0.5 rounded ${diffColor}`}>
+                            {tk.difficulty}
+                          </span>
+                        </div>
+                        {trackRecords[tk.id] && (
+                          <span className="text-[10px] font-mono font-bold text-cyan-400 bg-cyan-950/70 border border-cyan-500/30 px-2 py-0.5 rounded">
+                            ⏱ Récord: {(trackRecords[tk.id] / 1000).toFixed(2)}s
+                          </span>
+                        )}
                       </div>
                       <p className="text-slate-400 text-xs mt-1.5 leading-relaxed">{tk.description}</p>
                     </div>
@@ -254,13 +309,57 @@ export const GameUI: React.FC<GameUIProps> = ({
               </button>
             </div>
 
+            {/* LAP COUNT SELECTOR */}
+            <div className="bg-slate-950/50 border border-slate-800 rounded-xl p-3.5 flex flex-col gap-2">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                  <Flag className="w-3.5 h-3.5 text-amber-400" />
+                  3. Distancia del Gran Premio
+                </span>
+                <span className="text-[10px] font-mono text-amber-400 font-bold">
+                  {totalLaps === 1 ? 'Sprint 1 Vuelta' : `${totalLaps} Vueltas · DRS + Gestión Neumáticos`}
+                </span>
+              </div>
+              <div className="grid grid-cols-4 gap-2">
+                {[
+                  { laps: 1, label: '1 Vuelta', sub: 'Sprint' },
+                  { laps: 2, label: '2 Vueltas', sub: 'Duelo' },
+                  { laps: 3, label: '3 Vueltas', sub: 'GP F1' },
+                  { laps: 5, label: '5 Vueltas', sub: 'Endurance' }
+                ].map((opt) => (
+                  <button
+                    key={opt.laps}
+                    type="button"
+                    onClick={() => {
+                      setTotalLaps(opt.laps);
+                      audio.playBeep(360 + opt.laps * 40, 0.06, 'sine');
+                    }}
+                    className={`flex flex-col items-center justify-center py-2 px-1.5 rounded-lg border text-center transition-all cursor-pointer ${
+                      totalLaps === opt.laps
+                        ? 'bg-amber-400 text-slate-950 border-amber-300 font-extrabold shadow-md'
+                        : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                    }`}
+                  >
+                    <span className="text-xs font-mono font-bold">{opt.label}</span>
+                    <span
+                      className={`text-[9px] font-mono ${
+                        totalLaps === opt.laps ? 'text-slate-900 font-bold' : 'text-slate-400'
+                      }`}
+                    >
+                      {opt.sub}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+
             {/* CONFIRM BUTTON */}
             <button
               onClick={() => {
                 audio.playBeep(440, 0.1, 'sine');
                 onRestart(); // Move to Car Selection screen
               }}
-              className="mt-4 flex items-center justify-center gap-2 bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-500 hover:to-amber-600 text-slate-950 font-bold py-3 px-6 rounded-xl shadow-lg transition-transform hover:scale-[1.02] cursor-pointer"
+              className="mt-2 flex items-center justify-center gap-2 bg-gradient-to-r from-amber-400 to-amber-500 hover:from-amber-500 hover:to-amber-600 text-slate-950 font-bold py-3 px-6 rounded-xl shadow-lg transition-transform hover:scale-[1.02] cursor-pointer"
             >
               Configurar Pilotos
               <Play className="w-4 h-4 fill-slate-950" />
@@ -364,7 +463,12 @@ export const GameUI: React.FC<GameUIProps> = ({
                   <div className="flex items-center gap-2 mb-1">
                     <span className="w-16 text-[9.5px] font-mono text-slate-400">Velocidad</span>
                     <div className="flex-1 h-1.5 bg-slate-950 rounded-full overflow-hidden">
-                      <div className="h-full bg-red-500 rounded-full" style={{ width: `${(carStats[playersForm[idx].carType].maxSpeed / 7.5) * 100}%` }} />
+                      <div
+                        className="h-full bg-red-500 rounded-full"
+                        style={{
+                          width: `${Math.min(100, (carStats[playersForm[idx].carType].maxSpeed / 9.0) * 100)}%`
+                        }}
+                      />
                     </div>
                   </div>
 
@@ -372,7 +476,12 @@ export const GameUI: React.FC<GameUIProps> = ({
                   <div className="flex items-center gap-2 mb-1">
                     <span className="w-16 text-[9.5px] font-mono text-slate-400">Aceleración</span>
                     <div className="flex-1 h-1.5 bg-slate-950 rounded-full overflow-hidden">
-                      <div className="h-full bg-amber-500 rounded-full" style={{ width: `${(carStats[playersForm[idx].carType].acceleration / 0.25) * 100}%` }} />
+                      <div
+                        className="h-full bg-amber-500 rounded-full"
+                        style={{
+                          width: `${Math.min(100, (carStats[playersForm[idx].carType].acceleration / 0.25) * 100)}%`
+                        }}
+                      />
                     </div>
                   </div>
 
@@ -380,7 +489,12 @@ export const GameUI: React.FC<GameUIProps> = ({
                   <div className="flex items-center gap-2">
                     <span className="w-16 text-[9.5px] font-mono text-slate-400">Control Giro</span>
                     <div className="flex-1 h-1.5 bg-slate-950 rounded-full overflow-hidden">
-                      <div className="h-full bg-emerald-500 rounded-full" style={{ width: `${(carStats[playersForm[idx].carType].grip / 0.12) * 100}%` }} />
+                      <div
+                        className="h-full bg-emerald-500 rounded-full"
+                        style={{
+                          width: `${Math.min(100, (carStats[playersForm[idx].carType].grip / 0.12) * 100)}%`
+                        }}
+                      />
                     </div>
                   </div>
                 </div>
@@ -393,11 +507,11 @@ export const GameUI: React.FC<GameUIProps> = ({
                 <div className="flex items-center gap-2">
                   <Cpu className="w-5 h-5 text-cyan-400" />
                   <span className="text-xs font-bold text-white uppercase tracking-wider font-mono">
-                    Personalidad del Agente IA (TFM)
+                    Estilo de Piloto IA Rival
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  Selecciona el algoritmo heurístico de conducción para la IA oponente:
+                  Elige la estrategia y agresividad del piloto rival en pista:
                 </p>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
                   {[
@@ -529,64 +643,143 @@ export const GameUI: React.FC<GameUIProps> = ({
           <div className="flex flex-col gap-5 bg-slate-900 border border-slate-800 p-5 rounded-xl shadow-lg animate-fadeIn">
             <div className="border-b border-slate-800 pb-3 text-center">
               <Trophy className="w-12 h-12 text-amber-400 mx-auto mb-2 animate-bounce" />
-              <h3 className="font-sans font-extrabold text-white text-xl">Resultados de la Competición</h3>
-              <p className="text-slate-400 text-xs">Clasificación y tiempos de vuelta oficiales.</p>
+              <h3 className="font-sans font-extrabold text-white text-xl">
+                Resultados del Gran Premio ({totalLaps} {totalLaps === 1 ? 'Vuelta' : 'Vueltas'})
+              </h3>
+              <p className="text-slate-400 text-xs">
+                Clasificación oficial, tiempos totales y vuelta rápida de carrera.
+              </p>
             </div>
 
-            <div className="flex flex-col gap-2.5 max-w-xl mx-auto w-full">
-              {raceResults
-                .sort((a, b) => {
-                  if (a.disqualified) return 1;
-                  if (b.disqualified) return -1;
-                  return a.time - b.time;
-                })
-                .map((res, idx) => {
-                  const player = players.find(p => p.id === res.playerId)!;
-                  const stats = carStats[player.carType];
-                  const displayTime = res.disqualified 
-                    ? 'DESCALIFICADO' 
-                    : `${(res.time / 1000).toFixed(2)}s`;
+            <div className="flex flex-col gap-2.5 max-w-2xl mx-auto w-full">
+              {(() => {
+                const overallFastestLap = Math.min(
+                  ...raceResults
+                    .filter((r) => !r.disqualified && (r.bestLap || r.time) > 1000)
+                    .map((r) => r.bestLap || r.time)
+                );
 
-                  const medalBg = idx === 0 ? 'bg-amber-400 text-slate-950 font-extrabold' : 
-                                  idx === 1 ? 'bg-slate-300 text-slate-950 font-bold' : 
-                                  idx === 2 ? 'bg-amber-700 text-white font-bold' : 
-                                  'bg-slate-800 text-slate-400';
+                return [...raceResults]
+                  .sort((a, b) => {
+                    if (a.disqualified) return 1;
+                    if (b.disqualified) return -1;
+                    return a.time - b.time;
+                  })
+                  .map((res, idx) => {
+                    const player = players.find((p) => p.id === res.playerId)!;
+                    const stats = carStats[player.carType];
+                    const displayTime = res.disqualified
+                      ? 'DESCALIFICADO'
+                      : `${(res.time / 1000).toFixed(2)}s`;
+                    const bestLapMs = res.bestLap || res.time;
+                    const hasFastestLap =
+                      !res.disqualified &&
+                      raceResults.length > 1 &&
+                      Math.abs(bestLapMs - overallFastestLap) < 5;
 
-                  return (
-                    <div
-                      key={res.playerId}
-                      className="flex items-center justify-between p-3.5 bg-slate-950/60 border border-slate-800 rounded-xl"
-                    >
-                      <div className="flex items-center gap-3">
-                        <div className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-mono ${medalBg}`}>
-                          {idx + 1}
+                    const medalBg =
+                      idx === 0
+                        ? 'bg-amber-400 text-slate-950 font-extrabold'
+                        : idx === 1
+                          ? 'bg-slate-300 text-slate-950 font-bold'
+                          : idx === 2
+                            ? 'bg-amber-700 text-white font-bold'
+                            : 'bg-slate-800 text-slate-400';
+
+                    return (
+                      <div
+                        key={res.playerId}
+                        className="flex flex-col gap-2 p-3.5 bg-slate-950/60 border border-slate-800 rounded-xl"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex items-center gap-3">
+                            <div
+                              className={`w-7 h-7 rounded-full flex items-center justify-center text-xs font-mono ${medalBg}`}
+                            >
+                              {idx + 1}
+                            </div>
+                            <span
+                              className="w-3.5 h-3.5 rounded-full shrink-0"
+                              style={{ backgroundColor: player.color || stats.color }}
+                            />
+                            <span className="font-bold text-white text-sm">{player.name}</span>
+                            {player.isAI && (
+                              <span className="text-[9px] bg-cyan-400/10 text-cyan-400 border border-cyan-400/20 px-1.5 py-0.5 rounded font-mono">
+                                IA: {player.aiArchetype || 'Equilibrada'}
+                              </span>
+                            )}
+                            {hasFastestLap && (
+                              <span className="text-[10px] font-mono font-extrabold text-purple-300 bg-purple-950/80 border border-purple-500/40 px-2 py-0.5 rounded">
+                                🟣 VUELTA RÁPIDA ({(bestLapMs / 1000).toFixed(2)}s)
+                              </span>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-3 sm:gap-4">
+                            {newRecordPlayerId === res.playerId && (
+                              <span className="text-[10px] font-mono font-extrabold text-amber-300 bg-amber-500/20 border border-amber-400/40 px-2 py-0.5 rounded">
+                                ⚡ ¡RÉCORD DE CIRCUITO!
+                              </span>
+                            )}
+                            {res.performanceScore !== undefined && (
+                              <span className="text-[10px] font-mono text-emerald-400 hidden sm:inline">
+                                Precisión: {res.performanceScore}%
+                              </span>
+                            )}
+                            <span className="font-mono text-xs text-slate-400">Total:</span>
+                            <span
+                              className={`font-mono text-sm font-bold ${
+                                idx === 0 && !res.disqualified
+                                  ? 'text-amber-400'
+                                  : res.disqualified
+                                    ? 'text-rose-500'
+                                    : 'text-slate-200'
+                              }`}
+                            >
+                              {displayTime}
+                            </span>
+                          </div>
                         </div>
-                        <span className="w-3.5 h-3.5 rounded-full shrink-0" style={{ backgroundColor: stats.color }} />
-                        <span className="font-bold text-white text-sm">{player.name}</span>
-                        {player.isAI && (
-                          <span className="text-[9px] bg-cyan-400/10 text-cyan-400 border border-cyan-400/20 px-1.5 py-0.5 rounded font-mono">
-                            IA: {player.aiArchetype || 'Equilibrada'}
-                          </span>
-                        )}
-                      </div>
 
-                      <div className="flex items-center gap-4">
-                        {res.performanceScore !== undefined && (
-                          <span className="text-[10px] font-mono text-emerald-400 hidden sm:inline">
-                            Precisión: {res.performanceScore}%
-                          </span>
+                        {/* Individual Lap Split Times when multi-lap race */}
+                        {res.lapTimes && res.lapTimes.length > 1 && (
+                          <div className="flex flex-wrap items-center gap-2 pl-10 text-[10px] font-mono text-slate-400">
+                            <span className="text-slate-500">Parciales por vuelta:</span>
+                            {res.lapTimes.map((lt, lIdx) => {
+                              const isPersonalBest = Math.abs(lt - bestLapMs) < 5;
+                              return (
+                                <span
+                                  key={`lap-split-${lIdx}`}
+                                  className={`px-1.5 py-0.5 rounded border ${
+                                    isPersonalBest
+                                      ? 'bg-emerald-950/60 border-emerald-500/40 text-emerald-300 font-bold'
+                                      : 'bg-slate-900 border-slate-800 text-slate-300'
+                                  }`}
+                                >
+                                  V{lIdx + 1}: {(lt / 1000).toFixed(2)}s
+                                </span>
+                              );
+                            })}
+                          </div>
                         )}
-                        <span className="font-mono text-xs text-slate-400">Tiempo:</span>
-                        <span className={`font-mono text-sm font-bold ${idx === 0 && !res.disqualified ? 'text-amber-400' : res.disqualified ? 'text-rose-500' : 'text-slate-200'}`}>
-                          {displayTime}
-                        </span>
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  });
+              })()}
             </div>
 
             <div className="flex flex-wrap items-center justify-center gap-3 border-t border-slate-800 pt-4">
+              <button
+                onClick={() => {
+                  audio.playBeep(740, 0.1, 'sine');
+                  useGameStore.getState().startReplay();
+                }}
+                className="flex items-center gap-2 bg-gradient-to-r from-rose-500 to-amber-500 hover:from-rose-400 hover:to-amber-400 text-slate-950 text-xs font-extrabold py-2.5 px-5 rounded-xl cursor-pointer shadow-lg transition-transform hover:scale-[1.03]"
+              >
+                <Video className="w-4 h-4" />
+                🎬 Ver Repetición TV 3D
+              </button>
+
               <button
                 onClick={() => {
                   audio.playBeep(600, 0.1, 'sine');
@@ -595,7 +788,7 @@ export const GameUI: React.FC<GameUIProps> = ({
                 className="flex items-center gap-2 bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold py-2.5 px-5 rounded-xl cursor-pointer shadow-lg transition-transform hover:scale-[1.02]"
               >
                 <Activity className="w-4 h-4" />
-                Abrir Apex Telemetry Lab (TFM)
+                Abrir Telemetría F1 Pro
               </button>
 
               <button

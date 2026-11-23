@@ -551,15 +551,15 @@ export function getMaxSafeCornerSpeed(
   if (!onAsphalt) {
     return 2.4; // Grass/off-track severely limits safe speed
   }
-  // Good racing line (wide entry, clipping apex) can reduce effective curvature down to 62% of raw centerline curvature
-  const effectiveCurvature = Math.max(pathCurvatureRadPerPx, trackCurvatureRadPerPx * 0.62);
-  if (effectiveCurvature < 0.0022) {
-    return 7.5; // Straightaway — full speed allowed!
+  // Good Out-In-Out racing line widens the corner radius and reduces effective curvature down to 50% of centerline curvature
+  const effectiveCurvature = Math.max(pathCurvatureRadPerPx * 0.92, trackCurvatureRadPerPx * 0.50);
+  if (effectiveCurvature < 0.0024) {
+    return 7.5; // Straightaway — full F1 top speed allowed!
   }
   // Friction circle physical limit: v_max = sqrt(mu / kappa)
-  const gripFactor = 0.088 * Math.pow(carGrip / 0.075, 0.55);
+  const gripFactor = 0.095 * Math.pow(carGrip / 0.075, 0.55);
   const vMax = Math.sqrt(gripFactor / effectiveCurvature);
-  return Math.max(2.1, Math.min(7.5, vMax));
+  return Math.max(2.35, Math.min(7.5, vMax));
 }
 
 // Evaluate a drawn path for overspeed corners and optimal straight segments
@@ -976,7 +976,7 @@ export interface PerfectLapCallout {
 
 export const F1_KMH_FACTOR = 46;
 
-// Compute the "Perfect Lap" ideal path and key corner/straight speed callout badges for any track
+// Compute the "Perfect Lap" qualifying path (Out-In-Out racing line + late F1 braking + early full throttle exit)
 export function getPerfectLapGuide(
   track: Track,
   carGrip: number = 0.08,
@@ -986,14 +986,31 @@ export function getPerfectLapGuide(
   callouts: PerfectLapCallout[];
 } {
   const basePath = generateAIPath(track, 220, 'apex_master', gridIdx);
-  const perfectPath: Point[] = [];
-  let accumT = 0;
 
-  for (let i = 0; i < basePath.length; i++) {
-    const curr = basePath[i];
-    const prev = basePath[Math.max(0, i - 3)];
-    const next = basePath[Math.min(basePath.length - 1, i + 3)];
-    const ahead = basePath[Math.min(basePath.length - 1, i + 7)];
+  // Apply 2 passes of racing-line chord straightening (Out-In-Out minimum curvature line) while keeping on asphalt
+  const straightened: TrackPoint[] = basePath.map((p) => ({ x: p.x, y: p.y }));
+  for (let pass = 0; pass < 2; pass++) {
+    for (let i = 2; i < straightened.length - 2; i++) {
+      const prev = straightened[i - 2];
+      const curr = straightened[i];
+      const next = straightened[i + 2];
+      const cand = {
+        x: curr.x * 0.46 + (prev.x + next.x) * 0.27,
+        y: curr.y * 0.46 + (prev.y + next.y) * 0.27
+      };
+      const surf = getTrackSurfaceInfo(cand, track);
+      if (surf.onAsphalt && surf.distFromCenter <= surf.halfWidth * 0.86) {
+        straightened[i] = cand;
+      }
+    }
+  }
+
+  // Compute local maximum grip speed at each node along the straightened Out-In-Out line
+  const rawMaxSpeeds: number[] = [];
+  for (let i = 0; i < straightened.length; i++) {
+    const curr = straightened[i];
+    const prev = straightened[Math.max(0, i - 3)];
+    const next = straightened[Math.min(straightened.length - 1, i + 3)];
 
     const d1 = Math.hypot(curr.x - prev.x, curr.y - prev.y) || 1;
     const d2 = Math.hypot(next.x - curr.x, next.y - curr.y) || 1;
@@ -1003,19 +1020,45 @@ export function getPerfectLapGuide(
     if (diff > Math.PI) diff = Math.PI * 2 - diff;
     const localCurv = diff / ((d1 + d2) * 0.5);
 
-    const d3 = Math.hypot(ahead.x - curr.x, ahead.y - curr.y) || 1;
-    const a3 = Math.atan2(ahead.y - curr.y, ahead.x - curr.x);
-    let diffAhead = Math.abs(a3 - a1);
-    if (diffAhead > Math.PI) diffAhead = Math.PI * 2 - diffAhead;
-    const aheadCurv = diffAhead / d3;
-
     const surf = getTrackSurfaceInfo(curr, track);
-    const safeHere = getMaxSafeCornerSpeed(localCurv, surf.trackCurvature, carGrip, true);
-    const safeAhead = getMaxSafeCornerSpeed(aheadCurv, surf.trackCurvature * 0.85, carGrip, true);
+    const maxSafe = getMaxSafeCornerSpeed(localCurv, surf.trackCurvature, carGrip, true);
 
-    const idealSpeed = Math.max(2.4, Math.min(7.35, Math.min(safeHere, safeAhead) * 0.98));
-    const stepDist = i === 0 ? 0 : Math.hypot(curr.x - basePath[i - 1].x, curr.y - basePath[i - 1].y);
-    accumT += (stepDist / idealSpeed) * 14;
+    // Push 99% of the physical tire limit in corners and full 7.45 (343 km/h) on straights!
+    const targetV = localCurv < 0.0032 && surf.trackCurvature < 0.0042
+      ? 7.45
+      : Math.max(3.35, Math.min(7.45, maxSafe * 0.99));
+    rawMaxSpeeds.push(targetV);
+  }
+
+  // Backward pass (Late F1 Carbon-Ceramic Braking before corners) & Forward pass (Full-Throttle Exit)
+  const finalSpeeds = [...rawMaxSpeeds];
+  for (let i = finalSpeeds.length - 2; i >= 0; i--) {
+    const stepDist = Math.hypot(
+      straightened[i + 1].x - straightened[i].x,
+      straightened[i + 1].y - straightened[i].y
+    );
+    // Late F1 braking deceleration envelope
+    finalSpeeds[i] = Math.min(finalSpeeds[i], finalSpeeds[i + 1] + stepDist * 0.095);
+  }
+  for (let i = 1; i < finalSpeeds.length; i++) {
+    const stepDist = Math.hypot(
+      straightened[i].x - straightened[i - 1].x,
+      straightened[i].y - straightened[i - 1].y
+    );
+    // Crisp F1 exit acceleration envelope
+    finalSpeeds[i] = Math.min(finalSpeeds[i], finalSpeeds[i - 1] + stepDist * 0.115);
+  }
+
+  const perfectPath: Point[] = [];
+  let accumT = 0;
+
+  for (let i = 0; i < straightened.length; i++) {
+    const curr = straightened[i];
+    const idealSpeed = finalSpeeds[i];
+    const stepDist =
+      i === 0 ? 0 : Math.hypot(curr.x - straightened[i - 1].x, curr.y - straightened[i - 1].y);
+    // Match exact human drawing speed formula: rawSpeed = (dist / dt) * 15.5 => dt = (dist * 15.5) / idealSpeed
+    accumT += (stepDist * 15.5) / Math.max(2.0, idealSpeed);
 
     perfectPath.push({
       x: curr.x,
@@ -1042,8 +1085,7 @@ export function getPerfectLapGuide(
       if (perfectPath[i].speed > maxPt.speed) maxPt = perfectPath[i];
     }
 
-    // Decide whether this sector is best represented by a braking corner apex or a high-speed F1 straight
-    if (minPt.speed < 4.5) {
+    if (minPt.speed < 5.3) {
       const kmh = Math.round(minPt.speed * F1_KMH_FACTOR);
       callouts.push({
         x: minPt.x,

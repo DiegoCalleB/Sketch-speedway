@@ -10,7 +10,8 @@ import {
   CarStats,
   TelemetrySample,
   PlayerTelemetry,
-  RaceResultItem
+  RaceResultItem,
+  PaceStrategyMode
 } from '../types';
 import {
   checkSegmentCrossing,
@@ -25,10 +26,12 @@ import {
   F1_KMH_FACTOR,
   SegmentSafetyInfo
 } from '../utils/tracks';
+import { stepVehiclePhysics, resolveCarCollisions } from '../utils/vehiclePhysics';
 import { useGameStore } from '../store/gameStore';
 import { audio } from '../utils/audio';
 import {
   Play,
+  Pause,
   RotateCcw,
   AlertCircle,
   HelpCircle,
@@ -42,16 +45,20 @@ import {
   Eye,
   Smartphone,
   AlertTriangle,
-  Sparkles
+  Sparkles,
+  Home
 } from 'lucide-react';
 
+import { CanvasErrorBoundary } from './CanvasErrorBoundary';
 import { TrackMesh } from './ThreeGame/TrackMesh';
 import { Environment3D } from './ThreeGame/Environment3D';
 import { Car3D } from './ThreeGame/Car3D';
 import { GlowingSpline } from './ThreeGame/GlowingSpline';
 import { SmokeParticles } from './ThreeGame/SmokeParticles';
-import { Skidmarks3D } from './ThreeGame/Skidmarks3D';
+import { Skidmarks3D, SkidmarkPoint } from './ThreeGame/Skidmarks3D';
 import { CameraDirector, RaceCameraMode } from './ThreeGame/CameraDirector';
+import { SceneAtmosphere, LightingPreset } from './ThreeGame/SceneAtmosphere';
+import { PostProcessingEffects } from './ThreeGame/PostProcessingEffects';
 
 import * as THREE from 'three';
 
@@ -66,46 +73,6 @@ interface GameCanvasProps {
   onRaceFinished: (results: RaceResultItem[]) => void;
   onRestart: () => void;
 }
-
-// Orbiting Daylight Sun component for crisp stadium shadows
-const OrbitingDaylightSun = () => {
-  const sunRef = useRef<THREE.DirectionalLight>(null);
-
-  React.useEffect(() => {
-    let frameId = 0;
-    const tick = () => {
-      if (sunRef.current) {
-        const elapsed = Date.now() * 0.0002;
-        const radius = 320;
-        const x = 400 + Math.cos(elapsed) * radius;
-        const y = 250 + Math.sin(elapsed) * radius;
-        sunRef.current.position.set(x, y, 360);
-        sunRef.current.target.position.set(400, 250, 0);
-        sunRef.current.target.updateMatrixWorld();
-      }
-      frameId = requestAnimationFrame(tick);
-    };
-    tick();
-    return () => cancelAnimationFrame(frameId);
-  }, []);
-
-  return (
-    <directionalLight
-      ref={sunRef}
-      intensity={1.55}
-      color="#fffbeb"
-      castShadow
-      shadow-mapSize={[2048, 2048]}
-      shadow-camera-left={-440}
-      shadow-camera-right={440}
-      shadow-camera-top={320}
-      shadow-camera-bottom={-320}
-      shadow-camera-near={0.5}
-      shadow-camera-far={1000}
-      shadow-bias={-0.0005}
-    />
-  );
-};
 
 export const GameCanvas: React.FC<GameCanvasProps> = ({
   track,
@@ -137,9 +104,28 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const [countdownValue, setCountdownValue] = useState<string | null>(null);
   const [drawingSectorProgress, setDrawingSectorProgress] = useState(0);
   const [cameraMode, setCameraMode] = useState<RaceCameraMode>('helicopter');
+  const [lightingPreset, setLightingPreset] = useState<LightingPreset>('day');
   const [focusedPlayerId, setFocusedPlayerId] = useState<string | null>(null);
 
+  // Multi-Lap & Real-Time F1 Pit-Wall Strategy states
+  const totalLaps = useGameStore((s) => s.totalLaps);
+  const setTotalLaps = useGameStore((s) => s.setTotalLaps);
+  const [paceMode, setPaceMode] = useState<PaceStrategyMode>('balanced');
+  const paceModeRef = useRef<PaceStrategyMode>('balanced');
+  const [lapBannerText, setLapBannerText] = useState<string | null>(null);
+  const lapBannerTimerRef = useRef<any>(null);
+
+  // 3D TV Broadcast Replay states
+  const isReplaying = useGameStore((s) => s.isReplaying);
+  const [isReplayPaused, setIsReplayPaused] = useState(false);
+  const [replaySpeed, setReplaySpeed] = useState<number>(1);
+  const isReplayPausedRef = useRef(false);
+  const replaySpeedRef = useRef(1);
+  const [canvasResetKey, setCanvasResetKey] = useState(0);
+
   const svgTrackGroupRef = useRef<SVGGElement>(null);
+  const raceSessionIdRef = useRef(0);
+  const activePointerIdRef = useRef<number | null>(null);
 
   // Automatically detect screen portrait vs landscape on resize unless manually overridden
   useEffect(() => {
@@ -173,20 +159,35 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     return () => clearTimeout(timer);
   }, [drawingError]);
 
+  // Android / mobile lifecycle: suspend Web Audio & pause delta spikes when app moves to background
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        audio.suspendForBackground();
+      } else {
+        lastFrameTimeRef.current = performance.now();
+        audio.resumeFromBackground();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, []);
+
   // Core drawing vectors
   const [drawnPoints, setDrawnPoints] = useState<Point[]>([]);
   const drawnPointsRef = useRef<Point[]>([]);
 
   // Simulation physics reactive states
   const [activeCars, setActiveCars] = useState<RaceCarState[]>([]);
-  const [skidmarks, setSkidmarks] = useState<{ x: number; y: number; color: string; alpha: number }[]>([]);
+  const [skidmarks, setSkidmarks] = useState<SkidmarkPoint[]>([]);
   const [particles, setParticles] = useState<Particle[]>([]);
 
   // Simulation refs for loop synchronization
   const carsStateRef = useRef<RaceCarState[]>([]);
   const racePathsRef = useRef<Record<string, Point[]>>({});
+  const flyingPathsRef = useRef<Record<string, Point[]>>({});
   const particlesRef = useRef<Particle[]>([]);
-  const skidmarksRef = useRef<{ x: number; y: number; color: string; alpha: number }[]>([]);
+  const skidmarksRef = useRef<SkidmarkPoint[]>([]);
   const animationFrameRef = useRef<number | null>(null);
   const raceStartTimeRef = useRef<number>(0);
   const lastFrameTimeRef = useRef<number>(0);
@@ -269,26 +270,49 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       startRaceCountdown();
     }
     return () => {
+      raceSessionIdRef.current++;
       isRacingRef.current = false;
       if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
       if (finishCountdownTimerRef.current) clearTimeout(finishCountdownTimerRef.current);
+      if (lapBannerTimerRef.current) clearTimeout(lapBannerTimerRef.current);
       audio.stopAll();
     };
   }, [phase, track, players]);
 
   const startRaceCountdown = async () => {
+    const sessionId = ++raceSessionIdRef.current;
     isRacingRef.current = false;
     audio.stopAll();
     simulationTickRef.current = 0;
     telemetrySamplesRef.current = {};
     racePathsRef.current = {};
+    flyingPathsRef.current = {};
+    setPaceMode('balanced');
+    paceModeRef.current = 'balanced';
+    setLapBannerText(null);
     if (finishCountdownTimerRef.current) clearTimeout(finishCountdownTimerRef.current);
+    if (lapBannerTimerRef.current) clearTimeout(lapBannerTimerRef.current);
 
     players.forEach((p, idx) => {
       if (p.isAI && p.drawnPath.length === 0) {
         p.drawnPath = generateAIPath(track, 320, p.aiArchetype || 'apex_master', idx);
       }
-      racePathsRef.current[p.id] = resampleAndSmoothPath(p.drawnPath, 5);
+      const smoothed = resampleAndSmoothPath(p.drawnPath, 5);
+      racePathsRef.current[p.id] = smoothed;
+
+      // Build a Flying-Lap path for Laps 2..N where the main straight start zone carries full straightaway exit speed instead of standing-start speed
+      const exitStraightSpeed =
+        smoothed.length > 4
+          ? Math.max(6.0, smoothed[smoothed.length - 3]?.speed || 6.4)
+          : 6.4;
+      flyingPathsRef.current[p.id] = smoothed.map((pt, ptIdx) => {
+        if (ptIdx < 20) {
+          const blend = ptIdx / 20;
+          const boosted = exitStraightSpeed * (1 - blend * 0.35) + pt.speed * (blend * 0.35);
+          return { ...pt, speed: Math.max(pt.speed, boosted) };
+        }
+        return pt;
+      });
     });
 
     const initialCars: RaceCarState[] = players.map((p, idx) => {
@@ -311,7 +335,20 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         checkpointPassed: -1,
         lap: 1,
         bounceCooldown: 0,
-        slipstreamActive: false
+        slipstreamActive: false,
+        lapStartTime: 0,
+        lapTimes: [],
+        bestLapTime: null,
+        tireHealth: 100,
+        ersBattery: 100,
+        drsActive: false,
+        angularVelocity: 0,
+        steerAngle: 0,
+        slipAngle: 0,
+        longitudinalG: 0,
+        lateralG: 0,
+        throttle: 0,
+        brake: 0
       };
     });
 
@@ -323,27 +360,42 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     setSkidmarks([]);
 
     const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const isReplayActive = useGameStore.getState().isReplaying;
 
-    for (let count = 3; count > 0; count--) {
-      setCountdownValue(count.toString());
-      audio.playCountdownTick();
-      await delay(750);
+    if (!isReplayActive) {
+      for (let count = 3; count > 0; count--) {
+        if (raceSessionIdRef.current !== sessionId) return;
+        setCountdownValue(count.toString());
+        audio.playCountdownTick();
+        await delay(750);
+        if (raceSessionIdRef.current !== sessionId) return;
+      }
+
+      if (raceSessionIdRef.current !== sessionId) return;
+      setCountdownValue('¡YA!');
+      audio.playCountdownGo();
+      setTimeout(() => {
+        if (raceSessionIdRef.current === sessionId) {
+          setCountdownValue(null);
+        }
+      }, 650);
+    } else {
+      setCountdownValue(null);
     }
 
-    setCountdownValue('¡YA!');
-    audio.playCountdownGo();
+    if (raceSessionIdRef.current !== sessionId) return;
+
     const now = performance.now();
     raceStartTimeRef.current = now;
     lastFrameTimeRef.current = now;
+    carsStateRef.current.forEach((c) => {
+      c.lapStartTime = now;
+    });
     isRacingRef.current = true;
 
     players.forEach((p) => {
       audio.startEngine(p.id);
     });
-
-    setTimeout(() => {
-      setCountdownValue(null);
-    }, 650);
 
     runSimulationLoop();
   };
@@ -354,7 +406,15 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     const now = performance.now();
     const dtMs = now - lastFrameTimeRef.current;
     lastFrameTimeRef.current = now;
-    const dtFactor = Math.max(0.4, Math.min(2.2, dtMs / 16.667));
+
+    // Allow freezing 3D replay at any frame while still rotating/switching cameras!
+    if (useGameStore.getState().isReplaying && isReplayPausedRef.current) {
+      animationFrameRef.current = requestAnimationFrame(runSimulationLoop);
+      return;
+    }
+
+    const speedMult = useGameStore.getState().isReplaying ? replaySpeedRef.current : 1;
+    const dtFactor = Math.max(0.1, Math.min(3.5, (dtMs / 16.667) * speedMult));
 
     simulationTickRef.current++;
     updateSimulationPhysics(dtFactor, now);
@@ -377,7 +437,10 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       }, 4500);
     }
 
-    if (elapsed > 32000) {
+    const activeTotalLaps = Math.max(1, useGameStore.getState().totalLaps);
+    const maxRaceTimeoutMs = 32000 * activeTotalLaps;
+
+    if (elapsed > maxRaceTimeoutMs) {
       carsStateRef.current.forEach((c) => {
         if (!c.finished && !c.disqualified) {
           c.finished = true;
@@ -391,6 +454,17 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       isRacingRef.current = false;
       if (finishCountdownTimerRef.current) clearTimeout(finishCountdownTimerRef.current);
       audio.stopAll();
+
+      // If in 3D TV Replay mode, loop the replay seamlessly after 1.5s without overwriting official race results
+      if (useGameStore.getState().isReplaying) {
+        finishCountdownTimerRef.current = setTimeout(() => {
+          if (useGameStore.getState().isReplaying) {
+            startRaceCountdown();
+          }
+        }, 1400);
+        return;
+      }
+
       audio.playVictoryJingle();
 
       const telemetryMap: Record<string, PlayerTelemetry> = {};
@@ -400,7 +474,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         telemetryMap[p.id] = {
           playerId: p.id,
           playerName: p.name,
-          color: carStats[p.carType].color,
+          color: p.color || carStats[p.carType].color,
           carType: p.carType,
           samples,
           apexScore: evalMetrics.apexScore,
@@ -415,13 +489,24 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
       const finalResults: RaceResultItem[] = carsStateRef.current.map((c) => {
         const pTel = telemetryMap[c.playerId];
+        const totalMs = Math.round(c.timeFinished || 999999);
+        const recordedLaps =
+          c.lapTimes && c.lapTimes.length > 0
+            ? c.lapTimes.map((lt) => Math.round(lt))
+            : [Math.round(totalMs / activeTotalLaps)];
+        const bestLapMs = c.bestLapTime
+          ? Math.round(c.bestLapTime)
+          : Math.min(...recordedLaps);
         return {
           playerId: c.playerId,
           finished: c.finished,
-          time: Math.round(c.timeFinished || 999999),
+          time: totalMs,
           disqualified: c.disqualified,
           telemetry: pTel?.samples,
-          performanceScore: pTel ? Math.round((pTel.apexScore + pTel.smoothnessScore) / 2) : 82
+          performanceScore: pTel ? Math.round((pTel.apexScore + pTel.smoothnessScore) / 2) : 82,
+          lapTimes: recordedLaps,
+          bestLap: bestLapMs,
+          totalLaps: activeTotalLaps
         };
       });
 
@@ -454,270 +539,118 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       }
 
       const stats = carStats[player.carType];
+      const isHumanDriver = !player.isAI;
+      const activeStrategy: PaceStrategyMode = isHumanDriver ? paceModeRef.current : 'balanced';
 
-      // 1. Forward-Projecting Waypoint Follower (Never gets stuck if car slides wide onto gravel/grass!)
-      let idx = car.targetIndex;
-      const searchWindow = Math.min(path.length - 1, idx + 22);
-      let bestIdx = idx;
-      let bestDist = Math.hypot(path[idx].x - car.x, path[idx].y - car.y);
+      const oldX = car.x;
+      const oldY = car.y;
 
-      for (let k = idx + 1; k <= searchWindow; k++) {
-        const d = Math.hypot(path[k].x - car.x, path[k].y - car.y);
-        if (d < bestDist + 2.5 || d < 16) {
-          bestDist = d;
-          bestIdx = k;
-        }
-      }
-      if (bestIdx === idx && bestDist < 48 && idx < path.length - 1) {
-        bestIdx = idx + 1;
-      }
-      car.targetIndex = bestIdx;
-      idx = bestIdx;
-
-      const currentSpeed = Math.hypot(car.vx, car.vy);
-      const lookAheadSteps = Math.max(5, Math.min(11, Math.round(4.5 + currentSpeed * 0.9)));
-      const steerIdx = Math.min(path.length - 1, idx + lookAheadSteps);
-      const baseTargetPt = path[steerIdx];
-
-      // 2. Compute local corner curvature
-      const prevW = path[Math.max(0, idx - 2)];
-      const currW = path[idx];
-      const nextW = path[Math.min(path.length - 1, idx + 4)];
-      const a1 = Math.atan2(currW.y - prevW.y, currW.x - prevW.x);
-      const a2 = Math.atan2(nextW.y - currW.y, nextW.x - currW.x);
-      let signedTurn = a2 - a1;
-      while (signedTurn > Math.PI) signedTurn -= Math.PI * 2;
-      while (signedTurn < -Math.PI) signedTurn += Math.PI * 2;
-      const absCurvature = Math.abs(signedTurn);
-      const spanDist = Math.max(12, Math.hypot(nextW.x - prevW.x, nextW.y - prevW.y));
-      const pathCurvatureRadPerPx = absCurvature / spanDist;
-
-      // 3. Target speed from drawn path + braking look-ahead
-      const lookBrakeIdx = Math.min(path.length - 1, idx + 6);
-      const rawDrawnSpeed = path[idx].speed * 0.65 + path[lookBrakeIdx].speed * 0.35;
-      let targetSpeed = rawDrawnSpeed;
-
-      // 4. Aerodynamic Slipstream (Rebufo)
-      let slipstreamActive = false;
-      cars.forEach((otherCar, oIdx) => {
-        if (carIdx !== oIdx && !otherCar.finished && !otherCar.disqualified) {
-          const dX = otherCar.x - car.x;
-          const dY = otherCar.y - car.y;
-          const dist = Math.hypot(dX, dY);
-          if (dist > 13 && dist < 54) {
-            const headingToOther = Math.atan2(dY, dX);
-            let diffHead = Math.abs(headingToOther - car.angle);
-            if (diffHead > Math.PI) diffHead = Math.PI * 2 - diffHead;
-            if (diffHead < 0.55) {
-              slipstreamActive = true;
-            }
-          }
-        }
-      });
-      car.slipstreamActive = slipstreamActive;
-
-      if (slipstreamActive) {
-        targetSpeed *= 1.14;
-        if (Math.random() < 0.25) {
-          active_particles.push({
-            x: car.x - Math.cos(car.angle) * 9,
-            y: car.y - Math.sin(car.angle) * 9,
-            vx: (Math.random() - 0.5) * 0.5,
-            vy: (Math.random() - 0.5) * 0.5,
-            color: '#38bdf8',
-            size: 2.2,
-            alpha: 0.75,
-            life: 0,
-            maxLife: 10
-          });
-        }
-      }
-
-      // 5. Surface check & physical corner speed limit
-      const surface = getTrackSurfaceInfo({ x: car.x, y: car.y }, track);
-      car.offTrack = !surface.onAsphalt;
-
-      const maxSafeSpeed = getMaxSafeCornerSpeed(
-        pathCurvatureRadPerPx,
-        surface.trackCurvature,
-        stats.grip,
-         true
+      // 1. Sub-stepped Rigid-Body Newtonian Vehicle Physics (Ackermann, Pacejka Friction Circle, Downforce & Drag)
+      const phys = stepVehiclePhysics(
+        car,
+        path,
+        stats,
+        track,
+        cars,
+        carIdx,
+        activeStrategy,
+        dtFactor
       );
 
-      // 6. Realistic F1 / NASCAR / Rally Centrifugal Excursion:
-      // Entering a corner too fast pushes your racing line WIDE toward the outside kerb/gravel/grass!
-      const overspeedRatio = rawDrawnSpeed / Math.max(1.2, maxSafeSpeed);
-      const isCornerZone = absCurvature > 0.045 || surface.trackCurvature > 0.004;
+      const newSpeed = phys.newSpeed;
+      const isDriftingNow = phys.isDrifting;
+      const isOverspeedWide = phys.isOverspeedWide;
+      const slipstreamActive = phys.slipstreamActive;
+      const centrifugalForce = phys.centrifugalForce;
 
-      if (overspeedRatio > 1.12 && isCornerZone) {
-        const addedFrames = Math.min(34, Math.round((overspeedRatio - 1.08) * 38));
-        car.overspeedTimer = Math.max(car.overspeedTimer || 0, addedFrames);
-      } else if ((car.overspeedTimer || 0) > 0) {
-        car.overspeedTimer = Math.max(0, (car.overspeedTimer || 0) - dtFactor);
+      // 2. Aerodynamic Slipstream wake particles
+      if (slipstreamActive && Math.random() < 0.25) {
+        active_particles.push({
+          x: car.x - Math.cos(car.angle) * 9,
+          y: car.y - Math.sin(car.angle) * 9,
+          vx: (Math.random() - 0.5) * 0.5,
+          vy: (Math.random() - 0.5) * 0.5,
+          color: '#38bdf8',
+          size: 2.2,
+          alpha: 0.75,
+          life: 0,
+          maxLife: 10
+        });
       }
 
-      const isOverspeedWide = (car.overspeedTimer || 0) > 0;
-      const wideExcursionPx = isOverspeedWide
-        ? Math.min(30, 10 + (car.overspeedTimer || 0) * 0.65)
-        : 0;
-
-      const targetPt = {
-        x: baseTargetPt.x + surface.outwardEdgeVec.x * wideExcursionPx,
-        y: baseTargetPt.y + surface.outwardEdgeVec.y * wideExcursionPx
-      };
-
-      const dx = targetPt.x - car.x;
-      const dy = targetPt.y - car.y;
-      const targetAngle = Math.atan2(dy, dx);
-
-      // Natural terrain drag: Asphalt = 100%, Kerb/Piano = 75%, Gravel/Grass Runoff = 44%
-      const surfaceSpeedMult = surface.onAsphalt
-        ? isOverspeedWide
-          ? 0.76
-          : 1.0
-        : surface.onCurbOrGrass
-          ? 0.68
-          : 0.44;
-
-      // Apex Mastery Bonus: Taking a corner at controlled speed on asphalt gives a crisp exit boost!
-      const isApexBoost =
-        surface.onAsphalt && !isOverspeedWide && isCornerZone && overspeedRatio >= 0.75 && overspeedRatio <= 1.05;
-      const apexMult = isApexBoost ? 1.07 : 1.0;
-
-      const activeMaxSpeed =
-        stats.maxSpeed * surfaceSpeedMult * apexMult * (slipstreamActive ? 1.12 : 1.0);
-      targetSpeed = Math.min(targetSpeed * surfaceSpeedMult * apexMult, activeMaxSpeed);
-
-      const centrifugalForce =
-        Math.max(absCurvature, surface.trackCurvature * 22) * currentSpeed * 0.4;
-      const isDriftingNow =
-        isOverspeedWide || (centrifugalForce > stats.grip && currentSpeed > 2.0);
-      car.isDrifting = isDriftingNow;
-
-      const targetVx = Math.cos(targetAngle) * targetSpeed;
-      const targetVy = Math.sin(targetAngle) * targetSpeed;
-
-      const baseSteerRate = isDriftingNow
-        ? stats.acceleration * (0.55 + stats.driftRecovery * 0.35)
-        : stats.acceleration * 1.18;
-      const steerRate = Math.min(0.65, baseSteerRate * dtFactor);
-
-      car.vx += (targetVx - car.vx) * steerRate;
-      car.vy += (targetVy - car.vy) * steerRate;
-
-      const effectiveTurnSign =
-        Math.abs(signedTurn) > 0.03 ? Math.sign(signedTurn) : surface.trackTurnSign || 1;
-
-      const newSpeed = Math.hypot(car.vx, car.vy);
-      const velocityAngle = newSpeed > 0.05 ? Math.atan2(car.vy, car.vx) : car.angle;
-      car.angle = velocityAngle;
-
-      const targetDriftAngle = isDriftingNow
-        ? THREE.MathUtils.clamp(
-            effectiveTurnSign *
-              Math.max(0.16, centrifugalForce - stats.grip) *
-              (isOverspeedWide ? 3.0 : 2.4),
-            -0.52,
-            0.52
-          )
-        : 0;
-      car.driftAngle += (targetDriftAngle - car.driftAngle) * Math.min(1, 0.22 * dtFactor);
-
+      // 3. Real Tire Smoke & Dual Rear-Wheel Skidmarks along true chassis orientation
       if (isDriftingNow) {
-        if (Math.random() < (isOverspeedWide ? 0.8 : 0.6)) {
+        const cosA = Math.cos(car.angle);
+        const sinA = Math.sin(car.angle);
+        if (Math.random() < (isOverspeedWide ? 0.85 : 0.6)) {
           active_particles.push({
-            x: car.x - Math.cos(velocityAngle) * 7,
-            y: car.y - Math.sin(velocityAngle) * 7,
+            x: car.x - cosA * 6.5,
+            y: car.y - sinA * 6.5,
             vx: (Math.random() - 0.5) * 0.8 - car.vx * 0.08,
             vy: (Math.random() - 0.5) * 0.8 - car.vy * 0.08,
-            color: car.offTrack ? '#d97706' : isOverspeedWide ? '#fb7185' : 'rgba(226, 232, 240, 0.5)',
-            size: Math.random() * 4.2 + 3,
-            alpha: 0.75,
+            color: car.offTrack ? '#d6c7a1' : 'rgba(226, 232, 240, 0.58)',
+            size: Math.random() * 4.2 + 3.0,
+            alpha: 0.74,
             life: 0,
             maxLife: Math.random() * 18 + 12
           });
         }
 
-        const perpX = -Math.sin(velocityAngle) * 2.3;
-        const perpY = Math.cos(velocityAngle) * 2.3;
-        const rearX = car.x - Math.cos(velocityAngle) * 3.2;
-        const rearY = car.y - Math.sin(velocityAngle) * 3.2;
-        active_skidmarks.push(
-          {
-            x: rearX + perpX,
-            y: rearY + perpY,
-            color: car.offTrack ? '#78350f' : '#090d16',
-            alpha: 0.45
-          },
-          {
-            x: rearX - perpX,
-            y: rearY - perpY,
-            color: car.offTrack ? '#78350f' : '#090d16',
-            alpha: 0.45
-          }
-        );
+        const rearX = car.x - cosA * 4.0;
+        const rearY = car.y - sinA * 4.0;
+        active_skidmarks.push({
+          x: rearX,
+          y: rearY,
+          z: phys.surfaceElevationZ,
+          angle: car.angle,
+          color: car.offTrack ? '#78350f' : '#080a0f',
+          alpha: 0.48
+        });
 
         audio.updateScreech(
           car.playerId,
-          Math.min(1, isOverspeedWide ? 0.85 : centrifugalForce * 1.3)
+          Math.min(1, isOverspeedWide ? 0.88 : Math.min(1, Math.abs(car.slipAngle ?? 0) * 3.8))
         );
       } else {
         audio.updateScreech(car.playerId, 0);
       }
 
-      // Kick up gravel & grass debris whenever off-track!
-      if (car.offTrack && newSpeed > 0.5 && Math.random() < 0.65) {
+      // 4. Authentic Formula 1 Titanium Skid-Block Floor Sparks at >265 km/h or riding kerbs!
+      if (!car.offTrack && newSpeed > 5.75 && Math.random() < (phys.onCurbOrGrass ? 0.65 : 0.34)) {
+        const sparkX = car.x - Math.cos(car.angle) * 6.2 + (Math.random() - 0.5) * 2.2;
+        const sparkY = car.y - Math.sin(car.angle) * 6.2 + (Math.random() - 0.5) * 2.2;
         active_particles.push({
-          x: car.x - Math.cos(velocityAngle) * 5,
-          y: car.y - Math.sin(velocityAngle) * 5,
-          vx: (Math.random() - 0.5) * 1.6 - car.vx * 0.15,
-          vy: (Math.random() - 0.5) * 1.6 - car.vy * 0.15,
-          color: surface.onCurbOrGrass ? '#f59e0b' : '#22c55e',
-          size: Math.random() * 2.8 + 1.8,
-          alpha: 0.88,
+          x: sparkX,
+          y: sparkY,
+          vx: -car.vx * 0.32 + (Math.random() - 0.5) * 1.4,
+          vy: -car.vy * 0.32 + (Math.random() - 0.5) * 1.4,
+          color: '#fbbf24',
+          size: 2.6,
+          alpha: 1.0,
           life: 0,
-          maxLife: 15
+          maxLife: 7 + Math.random() * 6
         });
       }
 
-      audio.updateEngine(car.playerId, newSpeed / 5.2, car.offTrack);
+      // 5. Kick up warm FIA limestone gravel dust clouds whenever off-track!
+      if (car.offTrack && newSpeed > 0.5 && Math.random() < 0.78) {
+        active_particles.push({
+          x: car.x - Math.cos(car.angle) * 5.5 + (Math.random() - 0.5) * 3.0,
+          y: car.y - Math.sin(car.angle) * 5.5 + (Math.random() - 0.5) * 3.0,
+          vx: (Math.random() - 0.5) * 1.4 - car.vx * 0.12,
+          vy: (Math.random() - 0.5) * 1.4 - car.vy * 0.12,
+          color: '#d6c7a1',
+          size: Math.random() * 4.5 + 3.2,
+          alpha: 0.85,
+          life: 0,
+          maxLife: 18 + Math.random() * 8
+        });
+      }
 
-      const oldX = car.x;
-      const oldY = car.y;
-      car.x = Math.max(12, Math.min(track.width - 12, car.x + car.vx * dtFactor));
-      car.y = Math.max(12, Math.min(track.height - 12, car.y + car.vy * dtFactor));
+      const isFocusedCar = car.playerId === (focusedPlayerId || players[0]?.id);
+      audio.updateEngine(car.playerId, newSpeed / 5.0, car.offTrack, phys.isBraking, isFocusedCar);
 
-      // 8. Car-to-car wheel-to-wheel elastic rub
-      cars.forEach((otherCar, otherIdx) => {
-        if (carIdx !== otherIdx && !otherCar.finished && !otherCar.disqualified) {
-          const cDist = Math.hypot(car.x - otherCar.x, car.y - otherCar.y);
-          if (cDist < 13 && cDist > 0.01) {
-            const overlap = (13 - cDist) * 0.55;
-            const pushX = (car.x - otherCar.x) / cDist;
-            const pushY = (car.y - otherCar.y) / cDist;
-            car.x += pushX * overlap;
-            car.y += pushY * overlap;
-            otherCar.x -= pushX * overlap;
-            otherCar.y -= pushY * overlap;
-
-            if (Math.random() < 0.3) {
-              active_particles.push({
-                x: (car.x + otherCar.x) * 0.5,
-                y: (car.y + otherCar.y) * 0.5,
-                vx: (Math.random() - 0.5) * 2,
-                vy: (Math.random() - 0.5) * 2,
-                color: '#fbbf24',
-                size: 2.4,
-                alpha: 1,
-                life: 0,
-                maxLife: 10
-              });
-            }
-          }
-        }
-      });
-
-      // 9. Checkpoint & Finish Line Crossing Detection
+      // 9. Checkpoint & Finish Line Crossing Detection (Silent, no intrusive checkpoint beeps!)
       const nextCpIdx = car.checkpointPassed + 1;
       if (nextCpIdx < track.checkpoints.length) {
         const targetCp = track.checkpoints[nextCpIdx];
@@ -727,7 +660,6 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           cpDist < 12
         ) {
           car.checkpointPassed = nextCpIdx;
-          audio.playBeep(659.25, 0.05, 'triangle');
         }
       }
 
@@ -739,33 +671,112 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         track.startLine
       );
       if (
-        (crossedFinish && (car.checkpointPassed >= track.checkpoints.length - 1 || lapProgress > 0.75)) ||
+        (crossedFinish && (car.checkpointPassed >= track.checkpoints.length - 1 || lapProgress > 0.72)) ||
         car.targetIndex >= path.length - 2
       ) {
-        car.finished = true;
-        car.timeFinished = now - raceStartTimeRef.current;
-        audio.stopEngine(car.playerId);
-        audio.stopScreech(car.playerId);
-        audio.playBeep(1046.5, 0.22, 'sine');
+        const activeTotalLaps = Math.max(1, useGameStore.getState().totalLaps);
+        const lapStart = car.lapStartTime || raceStartTimeRef.current;
+        const completedLapMs = Math.max(1500, now - lapStart);
+        car.lapTimes = [...(car.lapTimes || []), completedLapMs];
+        car.bestLapTime = car.bestLapTime
+          ? Math.min(car.bestLapTime, completedLapMs)
+          : completedLapMs;
+        car.lapStartTime = now;
+
+        if (car.lap < activeTotalLaps) {
+          // Advance to Next Flying Lap seamlessly!
+          const finishedLapNum = car.lap;
+          car.lap += 1;
+          car.checkpointPassed = -1;
+
+          // If AI driver, subtly vary its racing line on subsequent laps for realistic wheel-to-wheel battles
+          if (player.isAI) {
+            const rawAiNext = generateAIPath(
+              track,
+              320,
+              player.aiArchetype || 'apex_master',
+              (carIdx + car.lap) % 4
+            );
+            const smoothedAiNext = resampleAndSmoothPath(rawAiNext, 5);
+            const exitSpd = Math.max(6.2, smoothedAiNext[smoothedAiNext.length - 3]?.speed || 6.5);
+            flyingPathsRef.current[car.playerId] = smoothedAiNext.map((pt, ptIdx) =>
+              ptIdx < 20
+                ? { ...pt, speed: Math.max(pt.speed, exitSpd * (1 - ptIdx / 28) + pt.speed * (ptIdx / 28)) }
+                : pt
+            );
+          }
+
+          const nextFlyingPath = flyingPathsRef.current[car.playerId] || path;
+          racePathsRef.current[car.playerId] = nextFlyingPath;
+
+          // Find closest continuation waypoint on the main straight in the first 28% of the flying lap path
+          const searchLimit = Math.max(6, Math.floor(nextFlyingPath.length * 0.28));
+          let bestResumeIdx = 2;
+          let minResumeDist = Infinity;
+          for (let r = 1; r <= searchLimit; r++) {
+            const d = Math.hypot(nextFlyingPath[r].x - car.x, nextFlyingPath[r].y - car.y);
+            if (d < minResumeDist) {
+              minResumeDist = d;
+              bestResumeIdx = r;
+            }
+          }
+          car.targetIndex = Math.min(nextFlyingPath.length - 3, bestResumeIdx + 2);
+
+          if (car.playerId === (focusedPlayerId || players[0]?.id)) {
+            const isFinalLap = car.lap === activeTotalLaps;
+            const splitStr = `${(completedLapMs / 1000).toFixed(2)}s`;
+            setLapBannerText(
+              isFinalLap
+                ? `🔔 ¡ÚLTIMA VUELTA! (V${car.lap}/${activeTotalLaps}) · V${finishedLapNum}: ${splitStr}`
+                : `🏁 VUELTA ${finishedLapNum}: ${splitStr} · VUELTA ${car.lap} / ${activeTotalLaps}`
+            );
+            if (lapBannerTimerRef.current) clearTimeout(lapBannerTimerRef.current);
+            lapBannerTimerRef.current = setTimeout(() => setLapBannerText(null), 2600);
+          }
+        } else {
+          // Completed Final Lap of the Grand Prix!
+          car.finished = true;
+          car.timeFinished = now - raceStartTimeRef.current;
+          audio.stopEngine(car.playerId);
+          audio.stopScreech(car.playerId);
+          audio.playBeep(1046.5, 0.22, 'sine');
+        }
       }
 
-      // 10. Telemetry sampling
+      // 10. Real Rigid-Body Telemetry sampling
       if (tick % 4 === 0) {
         if (!telemetrySamplesRef.current[car.playerId]) {
           telemetrySamplesRef.current[car.playerId] = [];
         }
-        const latG = Math.min(3.5, centrifugalForce * 2.2);
+        const latG = Math.min(4.8, Math.abs(car.lateralG ?? centrifugalForce * 2.2));
         telemetrySamplesRef.current[car.playerId].push({
           timestamp: Math.round(now - raceStartTimeRef.current),
           x: Math.round(car.x),
           y: Math.round(car.y),
           speed: Number(newSpeed.toFixed(2)),
           lateralG: Number(latG.toFixed(2)),
-          longitudinalG: Number((car.vx * 0.1).toFixed(2)),
+          longitudinalG: Number((car.longitudinalG ?? 0).toFixed(2)),
           isDrifting: isDriftingNow,
           slipstreamActive,
-          distToCenterline: Math.round(surface.distFromCenter),
+          distToCenterline: Math.round(phys.distFromCenter),
           lapProgress: Number(Math.min(1, lapProgress).toFixed(3))
+        });
+      }
+    });
+
+    // Symmetric Momentum-Conserving Car-to-Car Rigid-Body Collisions
+    resolveCarCollisions(cars, (sx, sy) => {
+      for (let sp = 0; sp < 3; sp++) {
+        active_particles.push({
+          x: sx,
+          y: sy,
+          vx: (Math.random() - 0.5) * 2.8,
+          vy: (Math.random() - 0.5) * 2.8,
+          color: '#fbbf24',
+          size: 2.4,
+          alpha: 1,
+          life: 0,
+          maxLife: 9
         });
       }
     });
@@ -789,6 +800,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   // --- DRAWING GESTURE HANDLERS ---
   const handlePointerDown = (e: React.PointerEvent<SVGSVGElement>) => {
     if (phase !== 'drawing' || !activePlayer || allPlayersReady) return;
+    if (activePointerIdRef.current !== null && activePointerIdRef.current !== e.pointerId) return;
 
     const { x, y } = getSvgPointFromEvent(e);
     const startDist = Math.hypot(x - gridPos.x, y - gridPos.y);
@@ -799,6 +811,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       return;
     }
 
+    activePointerIdRef.current = e.pointerId;
     try {
       e.currentTarget.setPointerCapture(e.pointerId);
     } catch {
@@ -829,6 +842,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
   const handlePointerMove = (e: React.PointerEvent<SVGSVGElement>) => {
     if (!isDrawing || phase !== 'drawing' || !activePlayer) return;
+    if (activePointerIdRef.current !== null && e.pointerId !== activePointerIdRef.current) return;
 
     const { x, y } = getSvgPointFromEvent(e);
     const now = performance.now();
@@ -877,25 +891,16 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     let liveStatus: SegmentSafetyInfo['status'] = 'safe_corner';
     if (ratio > 1.15) {
       liveStatus = 'danger_overspeed';
-      if (Math.random() < 0.28) {
-        audio.playBeep(175, 0.035, 'sawtooth');
-      }
     } else if (ratio > 0.92 && isCornerSection) {
       liveStatus = 'warning_drift';
-      if (Math.random() < 0.14) {
-        audio.playBeep(260 + clampedSpeed * 55, 0.02, 'triangle');
-      }
     } else if (!isCornerSection) {
       liveStatus = clampedSpeed >= 3.8 ? 'optimal_straight' : 'slow_straight';
-      if (Math.random() < 0.14) {
-        audio.playBeep(240 + clampedSpeed * 80, 0.02, 'sine');
-      }
     } else {
       liveStatus = 'safe_corner';
-      if (Math.random() < 0.14) {
-        audio.playBeep(220 + clampedSpeed * 65, 0.02, 'sine');
-      }
     }
+
+    // Smooth F1 engine intake preview tone while drawing (varies smoothly with your finger speed, zero beeps!)
+    audio.updateDrawingEngine(clampedSpeed, liveStatus === 'danger_overspeed');
 
     setActiveMaxSafeSpeed(maxSafe);
     setActiveSafetyStatus(liveStatus);
@@ -909,7 +914,6 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       ) {
         currentSector++;
         setDrawingSectorProgress(currentSector);
-        audio.playBeep(620 + currentSector * 80, 0.07, 'triangle');
       } else {
         break;
       }
@@ -918,7 +922,12 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     setActiveSpeed(clampedSpeed);
   };
 
-  const handlePointerUp = () => {
+  const handlePointerUp = (e?: React.PointerEvent<SVGSVGElement>) => {
+    if (e && activePointerIdRef.current !== null && e.pointerId !== activePointerIdRef.current) {
+      return;
+    }
+    activePointerIdRef.current = null;
+    audio.stopDrawingEngine();
     if (!isDrawing) return;
     setIsDrawing(false);
 
@@ -1062,6 +1071,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   };
 
   const handleClear = () => {
+    activePointerIdRef.current = null;
     drawnPointsRef.current = [];
     setDrawnPoints([]);
     setHasDrawnPoints(false);
@@ -1073,14 +1083,41 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   };
 
   const handleRedrawCompleted = () => {
+    activePointerIdRef.current = null;
+    drawnPointsRef.current = [];
+    setDrawnPoints([]);
+    setHasDrawnPoints(false);
+    setActiveSpeed(null);
+    setActiveMaxSafeSpeed(null);
+    setDrawingSectorProgress(0);
+    setDrawingError(null);
     audio.playBeep(330, 0.1, 'sine');
-    useGameStore.getState().restartGame();
+    useGameStore.getState().clearDrawnPaths();
+  };
+
+  const handleExitToMenu = () => {
+    raceSessionIdRef.current++;
+    isRacingRef.current = false;
+    activePointerIdRef.current = null;
+    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    if (finishCountdownTimerRef.current) clearTimeout(finishCountdownTimerRef.current);
+    if (lapBannerTimerRef.current) clearTimeout(lapBannerTimerRef.current);
+    audio.stopAll();
+    if (document.fullscreenElement) {
+      document.exitFullscreen?.().catch(() => {});
+    }
+    useGameStore.getState().goToMenu();
   };
 
   const cycleCameraMode = () => {
-    audio.playBeep(700, 0.07, 'sine');
     setCameraMode((prev) =>
-      prev === 'helicopter' ? 'chase' : prev === 'chase' ? 'circuit' : 'helicopter'
+      prev === 'helicopter'
+        ? 'onboard'
+        : prev === 'onboard'
+          ? 'chase'
+          : prev === 'chase'
+            ? 'circuit'
+            : 'helicopter'
     );
   };
 
@@ -1127,9 +1164,9 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       setGhostFloatIdx((prev) => {
         const len = perfectLapGuide.perfectPath.length;
         const currIdx = Math.min(len - 1, Math.floor(prev));
-        const ptSpeed = perfectLapGuide.perfectPath[currIdx]?.speed || 6;
-        // Advance proportional to the ideal speed at this point so the user sees fast straights & slow corners
-        const next = prev + ptSpeed * dt * 2.8;
+        const ptSpeed = perfectLapGuide.perfectPath[currIdx]?.speed || 6.5;
+        // Fast F1 qualifying pace along the Perfect Lap line
+        const next = prev + ptSpeed * dt * 5.2;
         return next >= len - 1 ? 0 : next;
       });
       rafId = requestAnimationFrame(animateGhost);
@@ -1180,8 +1217,19 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               }
         }
       >
-        {/* Top-left Quick Controls: Fullscreen, Rotate 90°, Perfect Lap Demo & Camera Selector */}
+        {/* Top-left Quick Controls: Menu Exit, Fullscreen, Rotate 90°, Perfect Lap Demo & Camera Selector */}
         <div className="absolute top-2.5 left-2.5 flex flex-wrap items-center gap-1.5 z-30">
+          {isVirtualFullscreen && (
+            <button
+              onClick={handleExitToMenu}
+              className="bg-slate-950/90 hover:bg-rose-950/90 border border-slate-800 hover:border-rose-500/60 text-slate-200 hover:text-white px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
+              title="Volver al menú principal"
+            >
+              <Home className="w-3.5 h-3.5 text-rose-400" />
+              <span>MENÚ</span>
+            </button>
+          )}
+
           <button
             onClick={() => {
               audio.playBeep(600, 0.07, 'sine');
@@ -1232,34 +1280,59 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
           {/* Botón de Vuelta Perfecta interactiva en fase de trazado */}
           {phase === 'drawing' && (
-            <button
-              onClick={() => {
-                audio.playBeep(showPerfectLap ? 480 : 760, 0.08, 'sine');
-                setShowPerfectLap((prev) => !prev);
-                setGhostFloatIdx(0);
-              }}
-              className={`px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold border ${
-                showPerfectLap
-                  ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 shadow-emerald-500/20'
-                  : 'bg-slate-950/90 hover:bg-slate-900 border-slate-800 hover:border-emerald-500/50 text-slate-200'
-              }`}
-              title="Ver demostración de la Vuelta Perfecta con velocidades ideales"
-            >
-              <Sparkles className={`w-3.5 h-3.5 ${showPerfectLap ? 'text-emerald-300' : 'text-amber-400'}`} />
-              <span>{showPerfectLap ? 'OCULTAR VUELTA PERFECTA' : 'VER VUELTA PERFECTA'}</span>
-            </button>
+            <>
+              <button
+                onClick={() => {
+                  setShowPerfectLap((prev) => !prev);
+                  setGhostFloatIdx(0);
+                }}
+                className={`px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold border ${
+                  showPerfectLap
+                    ? 'bg-emerald-500/20 border-emerald-400 text-emerald-300 shadow-emerald-500/20'
+                    : 'bg-slate-950/90 hover:bg-slate-900 border-slate-800 hover:border-emerald-500/50 text-slate-200'
+                }`}
+                title="Ver demostración de la Vuelta Perfecta con velocidades ideales"
+              >
+                <Sparkles className={`w-3.5 h-3.5 ${showPerfectLap ? 'text-emerald-300' : 'text-amber-400'}`} />
+                <span>{showPerfectLap ? 'OCULTAR VUELTA PERFECTA' : 'VER VUELTA PERFECTA'}</span>
+              </button>
+
+              {showPerfectLap && activePlayer && !allPlayersReady && (
+                <button
+                  onClick={() => {
+                    onPathDrawn(activePlayer.id, perfectLapGuide.perfectPath);
+                    drawnPointsRef.current = [];
+                    setDrawnPoints([]);
+                    setHasDrawnPoints(false);
+                    setActiveSpeed(null);
+                    setActiveMaxSafeSpeed(null);
+                    setDrawingError(null);
+                    setDrawingSectorProgress(track.checkpoints.length);
+                  }}
+                  className="bg-amber-400 hover:bg-amber-300 text-slate-950 px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-transform hover:scale-[1.02] cursor-pointer text-[10px] sm:text-xs font-mono font-extrabold"
+                  title="Cargar esta Vuelta Perfecta para comprobar su velocidad real en carrera"
+                >
+                  <span>⚡ USAR ESTA VUELTA PERFECTA</span>
+                </button>
+              )}
+            </>
           )}
 
           {phase === 'racing' && (
             <button
               onClick={cycleCameraMode}
               className="bg-slate-950/90 hover:bg-slate-900 border border-slate-800 hover:border-cyan-500/50 text-white px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
-              title="Alternar cámara de carrera"
+              title="Alternar cámara de carrera (TV, Onboard F1, Persecución, Circuito)"
             >
               {cameraMode === 'helicopter' ? (
                 <>
                   <Camera className="w-3.5 h-3.5 text-amber-400" />
                   <span className="text-amber-400">TV DINÁMICA</span>
+                </>
+              ) : cameraMode === 'onboard' ? (
+                <>
+                  <Video className="w-3.5 h-3.5 text-rose-400" />
+                  <span className="text-rose-400">ONBOARD T-CAM F1</span>
                 </>
               ) : cameraMode === 'chase' ? (
                 <>
@@ -1275,36 +1348,105 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             </button>
           )}
 
+          {/* Time-of-Day & Weather Graphics Switcher (Daylight GP / Golden Sunset / Wet Night GP) */}
+          <button
+            onClick={() => {
+              setLightingPreset((prev) =>
+                prev === 'day' ? 'sunset' : prev === 'sunset' ? 'night' : 'day'
+              );
+            }}
+            className="bg-slate-950/90 hover:bg-slate-900 border border-slate-800 hover:border-amber-500/50 text-white px-2.5 py-1.5 rounded-lg shadow-lg flex items-center gap-1.5 transition-colors cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
+            title="Cambiar iluminación y clima del circuito (Día Real GP / Tarde Dorada / Noche Asfalto Mojado)"
+          >
+            {lightingPreset === 'day' ? (
+              <span className="text-emerald-300">☀️ DÍA REAL GP</span>
+            ) : lightingPreset === 'sunset' ? (
+              <span className="text-amber-300">🌅 TARDE DORADA</span>
+            ) : (
+              <span className="text-cyan-300">🌃 NOCHE WET GP</span>
+            )}
+          </button>
+
+          {/* Interactive Lap Count Selector Pill during Drawing */}
+          {phase === 'drawing' && (
+            <button
+              type="button"
+              onClick={() => {
+                const cycle = [1, 2, 3, 5];
+                const nextLaps = cycle[(cycle.indexOf(totalLaps) + 1) % cycle.length];
+                setTotalLaps(nextLaps);
+                audio.playBeep(420 + nextLaps * 35, 0.06, 'sine');
+              }}
+              className="bg-slate-950/90 hover:bg-slate-900 border border-amber-500/40 hover:border-amber-400 text-amber-300 text-[10px] sm:text-xs font-mono font-extrabold px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 cursor-pointer shadow-lg transition-colors"
+              title="Clic para cambiar el número de vueltas del Gran Premio (1, 2, 3 o 5 vueltas)"
+            >
+              <Flag className="w-3.5 h-3.5 text-amber-400" />
+              <span>
+                {totalLaps} {totalLaps === 1 ? 'VUELTA' : 'VUELTAS'}
+              </span>
+            </button>
+          )}
+
+          {/* Live Lap Counter Pill during Racing */}
+          {phase === 'racing' && (
+            <div className="bg-slate-950/95 border border-amber-500/50 text-white text-[10px] sm:text-xs font-mono px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 pointer-events-none shadow-lg">
+              <Flag className="w-3.5 h-3.5 text-amber-400" />
+              <span className="font-extrabold text-amber-300">
+                VUELTA {Math.min(totalLaps, activeCarObj?.lap || 1)} / {totalLaps}
+              </span>
+            </div>
+          )}
+
           {/* Sector Counter Pill during Drawing */}
           {phase === 'drawing' && !allPlayersReady && (
             <div className="bg-slate-950/90 border border-slate-800 text-white text-[10px] sm:text-xs font-mono px-2.5 py-1.5 rounded-lg flex items-center gap-1.5 pointer-events-none shadow-lg">
-              <Flag className="w-3.5 h-3.5 text-amber-400" />
-              <span className="font-bold text-amber-400">
-                {drawingSectorProgress}/{track.checkpoints.length}
+              <span className="font-bold text-cyan-400">
+                S{drawingSectorProgress}/{track.checkpoints.length}
               </span>
             </div>
           )}
         </div>
 
+        <CanvasErrorBoundary onReset={() => setCanvasResetKey((k) => k + 1)}>
         <Canvas
+          key={canvasResetKey}
           shadows
+          dpr={[1, 2]}
           gl={{ antialias: true, powerPreference: 'high-performance' }}
+          onCreated={({ gl }) => {
+            gl.domElement.addEventListener(
+              'webglcontextlost',
+              (e) => {
+                e.preventDefault();
+                setCanvasResetKey((k) => k + 1);
+              },
+              false
+            );
+          }}
           style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
         >
           <PerspectiveCamera
             makeDefault
             position={[400, 250, 536.7]}
             fov={50}
-            near={1}
-            far={2500}
+            near={0.6}
+            far={2800}
           />
 
-          <ambientLight intensity={0.65} />
-          <hemisphereLight args={['#bae6fd', '#14532d', 0.55]} />
-          <OrbitingDaylightSun />
+          <SceneAtmosphere
+            preset={lightingPreset}
+            shadowFocus={
+              activeCarObj ? [activeCarObj.x, 500 - activeCarObj.y] : [400, 250]
+            }
+            tightShadows={phase === 'racing' && cameraMode !== 'circuit'}
+          />
 
-          <TrackMesh track={track} />
-          <Environment3D track={track} />
+          <TrackMesh
+            track={track}
+            countdownValue={countdownValue}
+            lightingPreset={lightingPreset}
+          />
+          <Environment3D track={track} lightingPreset={lightingPreset} />
           <Skidmarks3D skidmarks={skidmarks} />
 
           {phase === 'racing'
@@ -1312,23 +1454,25 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                 const p = players.find((player) => player.id === car.playerId)!;
                 const stats = carStats[p.carType];
                 const speed = Math.hypot(car.vx, car.vy);
-                const rPath = racePathsRef.current[car.playerId] || p.drawnPath;
-                const isBraking =
-                  speed > 1.8 &&
-                  car.targetIndex < rPath.length &&
-                  rPath[car.targetIndex].speed < speed * 0.92;
+                const isBraking = (car.brake ?? 0) > 0.18 && speed > 1.4;
                 const carSurf = getTrackSurfaceInfo({ x: car.x, y: car.y }, track);
 
                 return (
                   <Car3D
                     key={car.playerId}
-                    color={stats.color}
+                    color={p.color || stats.color}
                     position={[car.x, 500 - car.y, carSurf.elevationZ + 0.15]}
                     angle={car.angle}
                     driftAngle={car.driftAngle}
+                    steerAngle={car.steerAngle ?? 0}
+                    slipAngle={car.slipAngle ?? 0}
+                    longitudinalG={car.longitudinalG ?? 0}
+                    lateralG={car.lateralG ?? 0}
                     bankAngle={carSurf.bankAngleRad}
                     isDrifting={car.isDrifting}
                     isBraking={isBraking}
+                    drsActive={Boolean(car.drsActive)}
+                    throttle={car.throttle ?? 0}
                     name={p.name}
                     active={p.id === activeCarObj?.playerId}
                     speed={speed}
@@ -1345,7 +1489,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                 return (
                   <Car3D
                     key={p.id}
-                    color={stats.color}
+                    color={p.color || stats.color}
                     position={[grid.x, 500 - grid.y, gridSurf.elevationZ + 0.15]}
                     angle={grid.angle}
                     bankAngle={gridSurf.bankAngleRad}
@@ -1360,6 +1504,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               })}
 
           {phase === 'racing' &&
+            cameraMode !== 'onboard' &&
             players.map((p) => {
               const rPath = racePathsRef.current[p.id] || p.drawnPath;
               if (rPath.length > 0) {
@@ -1367,6 +1512,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                   <GlowingSpline
                     key={`static-path-${p.id}`}
                     path={rPath}
+                    track={track}
                     colorOverride={p.color}
                     isCompleted={true}
                   />
@@ -1386,8 +1532,104 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
             track={track}
             cameraMode={cameraMode}
             isPortrait={usePortraitLayout}
+            countdownValue={countdownValue}
+          />
+
+          <PostProcessingEffects
+            preset={lightingPreset}
+            focusSpeed={activeCarObj ? Math.hypot(activeCarObj.vx, activeCarObj.vy) : 0}
           />
         </Canvas>
+        </CanvasErrorBoundary>
+
+        {/* 3D TV Broadcast Replay Control Dock (Pause, Slow-Mo 0.25x/0.5x/1x/2x, Restart & Return to Podium) */}
+        {phase === 'racing' && isReplaying && (
+          <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 flex flex-wrap items-center justify-center gap-1.5 sm:gap-2 bg-slate-950/95 border border-rose-500/50 px-3 py-2 rounded-2xl shadow-2xl max-w-[96%]">
+            <div className="flex items-center gap-1.5 pr-1.5 border-r border-slate-800">
+              <span className="w-2.5 h-2.5 rounded-full bg-rose-500 animate-ping" />
+              <span className="text-[10px] sm:text-xs font-mono font-extrabold text-rose-400 tracking-wider uppercase whitespace-nowrap">
+                REPETICIÓN TV 3D
+              </span>
+            </div>
+
+            <button
+              onClick={() => {
+                const nextPaused = !isReplayPaused;
+                setIsReplayPaused(nextPaused);
+                isReplayPausedRef.current = nextPaused;
+                if (nextPaused) {
+                  audio.stopAll();
+                }
+              }}
+              className="flex items-center gap-1 bg-slate-800 hover:bg-slate-700 text-white px-2.5 py-1 rounded-lg text-[10px] sm:text-xs font-mono font-bold cursor-pointer transition-colors"
+              title={isReplayPaused ? 'Reanudar repetición' : 'Congelar imagen 3D'}
+            >
+              {isReplayPaused ? (
+                <>
+                  <Play className="w-3.5 h-3.5 text-emerald-400 fill-emerald-400" />
+                  <span>PLAY</span>
+                </>
+              ) : (
+                <>
+                  <Pause className="w-3.5 h-3.5 text-amber-400" />
+                  <span>PAUSA</span>
+                </>
+              )}
+            </button>
+
+            <div className="flex items-center gap-1 bg-slate-900 border border-slate-800 p-0.5 rounded-lg">
+              {[
+                { val: 0.25, label: '0.25x' },
+                { val: 0.5, label: '0.5x' },
+                { val: 1, label: '1x' },
+                { val: 2, label: '2x' }
+              ].map((spd) => (
+                <button
+                  key={spd.val}
+                  onClick={() => {
+                    setReplaySpeed(spd.val);
+                    replaySpeedRef.current = spd.val;
+                    audio.playBeep(500 + spd.val * 120, 0.05, 'sine');
+                  }}
+                  className={`px-2 py-0.5 rounded text-[10px] font-mono font-bold transition-colors cursor-pointer ${
+                    replaySpeed === spd.val
+                      ? 'bg-cyan-500 text-slate-950'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                  title={`Velocidad ${spd.label}`}
+                >
+                  {spd.label}
+                </button>
+              ))}
+            </div>
+
+            <button
+              onClick={() => {
+                setIsReplayPaused(false);
+                isReplayPausedRef.current = false;
+                startRaceCountdown();
+              }}
+              className="flex items-center gap-1 bg-slate-800 hover:bg-slate-700 text-slate-200 px-2.5 py-1 rounded-lg text-[10px] sm:text-xs font-mono font-bold cursor-pointer transition-colors"
+              title="Reiniciar repetición desde la salida"
+            >
+              <RotateCcw className="w-3.5 h-3.5 text-cyan-400" />
+              <span className="hidden sm:inline">Reiniciar</span>
+            </button>
+
+            <button
+              onClick={() => {
+                raceSessionIdRef.current++;
+                isRacingRef.current = false;
+                audio.stopAll();
+                useGameStore.getState().stopReplay();
+              }}
+              className="flex items-center gap-1 bg-amber-400 hover:bg-amber-300 text-slate-950 px-3 py-1 rounded-lg text-[10px] sm:text-xs font-mono font-extrabold cursor-pointer transition-transform hover:scale-[1.02] whitespace-nowrap"
+            >
+              <Trophy className="w-3.5 h-3.5" />
+              <span>Volver al Podio</span>
+            </button>
+          </div>
+        )}
 
         {/* Overhead FIA 5-Light Race Countdown Gantry (Elevated at top so it NEVER blocks the cars or track!) */}
         {phase === 'racing' && countdownValue && (
@@ -1428,13 +1670,22 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           </div>
         )}
 
+        {/* Live Lap Split Notification Banner at Top Center during Multi-Lap Races */}
+        {phase === 'racing' && !countdownValue && lapBannerText && (
+          <div className="absolute top-12 left-1/2 -translate-x-1/2 z-30 pointer-events-none animate-fadeIn">
+            <div className="bg-slate-950/95 border border-amber-400/60 text-amber-300 font-mono font-extrabold text-xs sm:text-sm px-4 py-1.5 rounded-xl shadow-2xl whitespace-nowrap">
+              {lapBannerText}
+            </div>
+          </div>
+        )}
+
         {/* Interactive Live Racing Leaderboard HUD */}
         {phase === 'racing' && !countdownValue && (
-          <div className="absolute top-2.5 right-2.5 bg-slate-950/90 border border-slate-800 rounded-xl p-2 shadow-xl z-20 min-w-[165px] max-w-[225px]">
+          <div className="absolute top-2.5 right-2.5 bg-slate-950/90 border border-slate-800 rounded-xl p-2 shadow-xl z-20 min-w-[180px] max-w-[245px]">
             <div className="flex items-center justify-between gap-1.5 pb-1 mb-1 border-b border-slate-800 text-[10px] font-mono text-slate-400 uppercase tracking-wider">
               <span className="flex items-center gap-1">
                 <Trophy className="w-3.5 h-3.5 text-amber-400" />
-                Posiciones
+                GP · V{Math.min(totalLaps, activeCarObj?.lap || 1)}/{totalLaps}
               </span>
               <span className="text-[9px] text-slate-500">Clic = Seguir</span>
             </div>
@@ -1446,11 +1697,13 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                   if (a.finished && b.finished) return (a.timeFinished || 0) - (b.timeFinished || 0);
                   const pathA = racePathsRef.current[a.playerId]?.length || 1;
                   const pathB = racePathsRef.current[b.playerId]?.length || 1;
-                  return b.targetIndex / pathB - a.targetIndex / pathA;
+                  const progA = a.lap - 1 + a.targetIndex / pathA;
+                  const progB = b.lap - 1 + b.targetIndex / pathB;
+                  return progB - progA;
                 })
                 .map((car, rank) => {
                   const p = players.find((player) => player.id === car.playerId);
-                  const pColor = p ? carStats[p.carType]?.color || '#3b82f6' : '#3b82f6';
+                  const pColor = p ? p.color || carStats[p.carType]?.color || '#3b82f6' : '#3b82f6';
                   const speed = Math.round(Math.hypot(car.vx, car.vy) * F1_KMH_FACTOR);
                   const isFocused = activeCarObj?.playerId === car.playerId;
 
@@ -1484,6 +1737,11 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                         <span className="text-white font-medium truncate text-[11px]">
                           {p?.name || 'Piloto'}
                         </span>
+                        {totalLaps > 1 && !car.finished && (
+                          <span className="text-[9px] text-slate-400 font-bold">
+                            V{car.lap}
+                          </span>
+                        )}
                       </div>
                       <span className="text-[10px] font-bold shrink-0 tabular-nums">
                         {car.finished ? (
@@ -2037,40 +2295,111 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               </p>
             )
           ) : (
-            <div className="flex items-center gap-3 font-mono text-xs tabular-nums">
-              <span className="text-cyan-400 font-bold">{focusedSpeedKmh} km/h</span>
+            <div className="flex items-center gap-2.5 sm:gap-3 font-mono text-xs tabular-nums">
+              {/* Pro F1 10-LED RPM Shift Light Bar */}
+              <div className="hidden xs:flex items-center gap-0.5 bg-slate-950 px-1.5 py-1 rounded border border-slate-800">
+                {[1, 2, 3, 4, 5, 6, 7, 8, 9, 10].map((led) => {
+                  const gearFloor = (focusedGear - 1) * 43;
+                  const rpmRatio =
+                    focusedSpeedKmh > 10
+                      ? Math.min(1, Math.max(0.2, (focusedSpeedKmh - gearFloor) / 43))
+                      : 0;
+                  const isLit = focusedSpeedKmh > 15 && led <= Math.ceil(rpmRatio * 10);
+                  const ledColor =
+                    led <= 4
+                      ? 'bg-emerald-400 shadow-[0_0_5px_#34d399]'
+                      : led <= 7
+                        ? 'bg-rose-500 shadow-[0_0_5px_#f43f5e]'
+                        : 'bg-cyan-400 shadow-[0_0_6px_#22d3ee]';
+                  return (
+                    <span
+                      key={led}
+                      className={`w-1.5 h-2.5 rounded-[1px] transition-colors ${
+                        isLit ? ledColor : 'bg-slate-800'
+                      }`}
+                    />
+                  );
+                })}
+              </div>
+
+              <span className="text-cyan-400 font-extrabold">{focusedSpeedKmh} km/h</span>
               <span className="text-slate-700">·</span>
-              <span className="text-amber-400 font-bold">{focusedGear}ª</span>
-              <span className="text-slate-700 hidden sm:inline">·</span>
+              <span className="bg-slate-950 border border-amber-500/40 text-amber-400 font-black px-1.5 py-0.5 rounded text-[11px]">
+                {focusedGear}ª
+              </span>
+              <span className="bg-slate-950 border border-slate-800 text-slate-300 font-bold px-1.5 py-0.5 rounded text-[10px]">
+                V{Math.min(totalLaps, activeCarObj?.lap || 1)}/{totalLaps}
+              </span>
               <span
-                className={`hidden sm:inline font-bold text-[11px] ${
+                className="bg-slate-950 border border-slate-800 text-emerald-400 font-bold px-1.5 py-0.5 rounded text-[10px] hidden sm:inline"
+                title="Salud y agarre de los neumáticos Pirelli"
+              >
+                🛞 {Math.round(activeCarObj?.tireHealth ?? 100)}%
+              </span>
+              <span
+                className="bg-slate-950 border border-slate-800 text-cyan-300 font-bold px-1.5 py-0.5 rounded text-[10px] hidden sm:inline"
+                title="Batería Híbrida ERS MGU-K"
+              >
+                🔋 {Math.round(activeCarObj?.ersBattery ?? 100)}%
+              </span>
+              <span className="text-slate-700 hidden md:inline">·</span>
+              <span
+                className={`hidden md:inline font-bold text-[11px] ${
                   activeCarObj?.offTrack
                     ? 'text-rose-400'
                     : (activeCarObj?.overspeedTimer || 0) > 0
                       ? 'text-amber-400'
                       : activeCarObj?.isDrifting
                         ? 'text-amber-300'
-                        : activeCarObj?.slipstreamActive
+                        : activeCarObj?.slipstreamActive || activeCarObj?.drsActive
                           ? 'text-cyan-400'
                           : 'text-emerald-400'
                 }`}
               >
                 {activeCarObj?.offTrack
-                  ? '⚠️ ESCAPATORIA DE GRAVA / HIERBA (-56% VEL)'
+                  ? '⚠️ GRAVA (-56%)'
                   : (activeCarObj?.overspeedTimer || 0) > 0
-                    ? '⚠️ SUBVIRAJE EN CURVA (ABRIÉNDOSE)'
-                    : activeCarObj?.isDrifting
-                      ? 'APOYO EN PERALTE AL LÍMITE'
-                      : activeCarObj?.slipstreamActive
-                        ? 'REBUFO +14%'
-                        : 'TRACCIÓN EN ASFALTO ÓPTIMA'}
+                    ? '⚠️ SUBVIRAJE'
+                    : activeCarObj?.slipstreamActive
+                      ? '⚡ DRS + REBUFO'
+                      : activeCarObj?.drsActive
+                        ? '⚡ DRS ABIERTO'
+                        : 'AGARRE ÓPTIMO'}
               </span>
             </div>
           )}
         </div>
 
-        {/* Right side: Action Buttons */}
-        <div className="flex gap-1.5 justify-end shrink-0">
+        {/* Right side: Action Buttons & Live F1 Pit-Wall Strategy Modes */}
+        <div className="flex gap-1.5 items-center justify-end shrink-0">
+          {phase === 'racing' && !isReplaying && (
+            <div
+              className="flex items-center gap-1 bg-slate-900 border border-slate-800 p-0.5 rounded-lg"
+              title="Estrategia en tiempo real: Ataque ERS (+potencia), Ritmo GP (equilibrado) o Cuidar Gomas (+agarre en curva)"
+            >
+              {[
+                { id: 'attack' as PaceStrategyMode, label: '⚡ ATAQUE', activeCls: 'bg-rose-500 text-white' },
+                { id: 'balanced' as PaceStrategyMode, label: '⚖️ RITMO', activeCls: 'bg-cyan-500 text-slate-950' },
+                { id: 'conserve' as PaceStrategyMode, label: '🛞 GOMAS', activeCls: 'bg-emerald-500 text-slate-950' }
+              ].map((m) => (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => {
+                    setPaceMode(m.id);
+                    paceModeRef.current = m.id;
+                    audio.playBeep(m.id === 'attack' ? 780 : m.id === 'conserve' ? 460 : 600, 0.05, 'sine');
+                  }}
+                  className={`px-2 py-0.5 rounded text-[10px] font-mono font-extrabold transition-colors cursor-pointer whitespace-nowrap ${
+                    paceMode === m.id ? m.activeCls : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+          )}
+
           {phase === 'drawing' && (
             <button
               onClick={() => {

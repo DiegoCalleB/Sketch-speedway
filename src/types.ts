@@ -72,6 +72,8 @@ export interface PlayerTelemetry {
   maxLateralG: number;
 }
 
+export type PaceStrategyMode = 'attack' | 'balanced' | 'conserve';
+
 export interface RaceResultItem {
   playerId: string;
   finished: boolean;
@@ -79,6 +81,9 @@ export interface RaceResultItem {
   disqualified: boolean;
   telemetry?: TelemetrySample[];
   performanceScore?: number;
+  lapTimes?: number[];
+  bestLap?: number;
+  totalLaps?: number;
 }
 
 export interface Player {
@@ -115,6 +120,20 @@ export interface RaceCarState {
   bounceCooldown: number; // frames to ignore wall collisions after bouncing
   slipstreamActive?: boolean;
   overspeedTimer?: number; // frames of grip loss penalty when entering a corner too fast
+  lapStartTime?: number;
+  lapTimes?: number[];
+  bestLapTime?: number | null;
+  tireHealth?: number;     // 100% down to 40% across multi-lap stints
+  ersBattery?: number;     // 100% down to 0% hybrid MGU-K battery
+  drsActive?: boolean;
+  // Rigid-body vehicle physics telemetry & kinematics
+  angularVelocity?: number; // rad/s chassis yaw rate
+  steerAngle?: number;      // rad front wheel Ackermann steering angle
+  slipAngle?: number;       // rad true body slip angle (heading vs velocity vector)
+  longitudinalG?: number;   // forward/braking G-force (-5.0 to +2.5)
+  lateralG?: number;        // cornering lateral G-force (-4.5 to +4.5)
+  throttle?: number;        // 0..1 driver throttle application
+  brake?: number;           // 0..1 driver brake pressure
 }
 
 export interface Particle {
