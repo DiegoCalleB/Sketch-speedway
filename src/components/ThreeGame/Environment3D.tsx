@@ -1,73 +1,168 @@
 import React, { useMemo, useRef, useEffect } from 'react';
 import { useFrame, useThree } from '@react-three/fiber';
 import * as THREE from 'three';
-import { Track } from '../../types';
-import { getTrackBankingProfile } from '../../utils/tracks';
+import { Track, Player, RaceCarState, WeatherCondition } from '../../types';
+import { getTrackBankingProfile, getTrackSurfaceInfo } from '../../utils/tracks';
 import { LightingPreset } from './SceneAtmosphere';
 
 interface Environment3DProps {
   track: Track;
   lightingPreset?: LightingPreset;
+  weather?: WeatherCondition;
+  carsStateRef?: React.MutableRefObject<RaceCarState[]>;
+  players?: Player[];
 }
 
-// High-resolution organic European / Vice Coast Autodrome countryside grass & soil texture
-const createNaturalTerrainTexture = (maxAnisotropy: number, preset: LightingPreset) => {
-  const size = 512;
+const _grassNormalScale = new THREE.Vector2(1.35, 1.35);
+
+// Next-Gen 1024x1024 PBR Countryside Grass Albedo + Tangent Normal Map + Sunlit Dew Roughness Map
+const createNaturalTerrainMaps = (maxAnisotropy: number, preset: LightingPreset) => {
+  const size = 1024;
   const canvas = document.createElement('canvas');
   canvas.width = size;
   canvas.height = size;
   const ctx = canvas.getContext('2d');
-  if (!ctx) return new THREE.Texture();
 
-  ctx.fillStyle = preset === 'night' ? '#101c13' : preset === 'sunset' ? '#2c4223' : '#314c2a';
+  const normCanvas = document.createElement('canvas');
+  normCanvas.width = size;
+  normCanvas.height = size;
+  const nCtx = normCanvas.getContext('2d');
+
+  const roughCanvas = document.createElement('canvas');
+  roughCanvas.width = size;
+  roughCanvas.height = size;
+  const rCtx = roughCanvas.getContext('2d');
+
+  if (!ctx || !nCtx || !rCtx) {
+    return {
+      map: new THREE.Texture(),
+      normalMap: new THREE.Texture(),
+      roughnessMap: new THREE.Texture()
+    };
+  }
+
+  ctx.fillStyle = preset === 'night' ? '#0e1a11' : preset === 'sunset' ? '#293f21' : '#2e4b27';
   ctx.fillRect(0, 0, size, size);
 
-  for (let i = 0; i < 110; i++) {
+  nCtx.fillStyle = 'rgb(128, 128, 255)';
+  nCtx.fillRect(0, 0, size, size);
+
+  rCtx.fillStyle = preset === 'night' ? '#d4d4d4' : '#e2e2e2';
+  rCtx.fillRect(0, 0, size, size);
+
+  // Macro soil, clover, dry straw & lush emerald turf patches
+  for (let i = 0; i < 190; i++) {
     const x = Math.random() * size;
     const y = Math.random() * size;
-    const r = 24 + Math.random() * 72;
-    const grad = ctx.createRadialGradient(x, y, 2, x, y, r);
+    const r = 34 + Math.random() * 115;
+    const grad = ctx.createRadialGradient(x, y, 4, x, y, r);
     const palette =
-      i % 3 === 0
-        ? ['rgba(76, 102, 50, 0.28)', 'rgba(76, 102, 50, 0)']
-        : i % 3 === 1
-          ? ['rgba(36, 58, 28, 0.34)', 'rgba(36, 58, 28, 0)']
-          : ['rgba(104, 92, 58, 0.16)', 'rgba(104, 92, 58, 0)'];
+      i % 4 === 0
+        ? ['rgba(78, 112, 48, 0.30)', 'rgba(78, 112, 48, 0)']
+        : i % 4 === 1
+          ? ['rgba(28, 48, 22, 0.36)', 'rgba(28, 48, 22, 0)']
+          : i % 4 === 2
+            ? ['rgba(116, 100, 62, 0.22)', 'rgba(116, 100, 62, 0)']
+            : ['rgba(54, 88, 38, 0.26)', 'rgba(54, 88, 38, 0)'];
     grad.addColorStop(0, palette[0]);
     grad.addColorStop(1, palette[1]);
     ctx.fillStyle = grad;
     ctx.fillRect(x - r, y - r, r * 2, r * 2);
+
+    // Dewy grass patches have slightly lower roughness for soft grazing sunlight sheen
+    if (i % 3 === 0) {
+      const rGrad = rCtx.createRadialGradient(x, y, 6, x, y, r);
+      rGrad.addColorStop(0, 'rgba(150, 150, 150, 0.52)');
+      rGrad.addColorStop(1, 'rgba(225, 225, 225, 0)');
+      rCtx.fillStyle = rGrad;
+      rCtx.fillRect(x - r, y - r, r * 2, r * 2);
+    }
   }
 
-  // Subtle mowed stadium turf stripes
-  for (let x = 0; x < size; x += 32) {
-    ctx.fillStyle = (x / 32) % 2 === 0 ? 'rgba(255,255,255,0.03)' : 'rgba(0,0,0,0.04)';
-    ctx.fillRect(x, 0, 32, size);
+  // Subtle stadium mowed turf bands (gives crisp scale & speed perception when racing!)
+  for (let x = 0; x < size; x += 64) {
+    const even = (x / 64) % 2 === 0;
+    ctx.fillStyle = even ? 'rgba(255,255,255,0.032)' : 'rgba(0,0,0,0.042)';
+    ctx.fillRect(x, 0, 64, size);
+    rCtx.fillStyle = even ? 'rgba(195,195,195,0.22)' : 'rgba(245,245,245,0.22)';
+    rCtx.fillRect(x, 0, 64, size);
   }
 
-  for (let i = 0; i < 28000; i++) {
+  // High-frequency organic grass blade micro-strokes + tangent normal ridges
+  for (let i = 0; i < 68000; i++) {
     const x = Math.random() * size;
     const y = Math.random() * size;
-    const w = 1 + Math.random() * 1.4;
-    const h = 1.5 + Math.random() * 2.8;
+    const w = 1.0 + Math.random() * 1.6;
+    const h = 2.2 + Math.random() * 4.4;
     const pick = Math.random();
-    if (pick > 0.65) {
-      ctx.fillStyle = 'rgba(112, 140, 74, 0.18)';
-    } else if (pick > 0.25) {
-      ctx.fillStyle = 'rgba(20, 36, 16, 0.24)';
+    if (pick > 0.66) {
+      ctx.fillStyle = 'rgba(122, 152, 76, 0.22)';
+      nCtx.fillStyle = 'rgb(164, 150, 240)';
+    } else if (pick > 0.28) {
+      ctx.fillStyle = 'rgba(18, 34, 14, 0.28)';
+      nCtx.fillStyle = 'rgb(92, 108, 240)';
     } else {
-      ctx.fillStyle = 'rgba(138, 124, 82, 0.14)';
+      ctx.fillStyle = 'rgba(146, 130, 84, 0.16)';
+      nCtx.fillStyle = 'rgb(142, 106, 244)';
     }
     ctx.fillRect(x, y, w, h);
+    nCtx.fillRect(x, y, w, h);
   }
 
-  const texture = new THREE.CanvasTexture(canvas);
-  texture.colorSpace = THREE.SRGBColorSpace;
-  texture.wrapS = THREE.RepeatWrapping;
-  texture.wrapT = THREE.RepeatWrapping;
-  texture.repeat.set(24, 18);
-  texture.anisotropy = maxAnisotropy;
-  return texture;
+  const map = new THREE.CanvasTexture(canvas);
+  map.colorSpace = THREE.SRGBColorSpace;
+  map.wrapS = THREE.RepeatWrapping;
+  map.wrapT = THREE.RepeatWrapping;
+  map.repeat.set(28, 20);
+  map.anisotropy = maxAnisotropy;
+
+  const normalMap = new THREE.CanvasTexture(normCanvas);
+  normalMap.wrapS = THREE.RepeatWrapping;
+  normalMap.wrapT = THREE.RepeatWrapping;
+  normalMap.repeat.set(28, 20);
+  normalMap.anisotropy = maxAnisotropy;
+
+  const roughnessMap = new THREE.CanvasTexture(roughCanvas);
+  roughnessMap.wrapS = THREE.RepeatWrapping;
+  roughnessMap.wrapT = THREE.RepeatWrapping;
+  roughnessMap.repeat.set(28, 20);
+  roughnessMap.anisotropy = maxAnisotropy;
+
+  return { map, normalMap, roughnessMap };
+};
+
+// Build a single sculpted 3D grass-clump BufferGeometry (3 intersecting tapered blades, 1 draw call via InstancedMesh)
+const createGrassTuftGeometry = () => {
+  const positions: number[] = [];
+  const normals: number[] = [];
+  const bladeAngles = [0, (Math.PI * 2) / 3, (Math.PI * 4) / 3, Math.PI / 3];
+
+  bladeAngles.forEach((ang, idx) => {
+    const cos = Math.cos(ang);
+    const sin = Math.sin(ang);
+    const halfW = idx === 3 ? 0.55 : 0.72;
+    const h = idx === 3 ? 2.4 : 1.75 + (idx % 2) * 0.55;
+    const lean = idx === 3 ? 0.22 : 0.48;
+
+    const p0x = -sin * halfW;
+    const p0y = cos * halfW;
+    const p1x = sin * halfW;
+    const p1y = -cos * halfW;
+    const tipX = cos * lean;
+    const tipY = sin * lean;
+
+    // Front face
+    positions.push(p0x, p0y, 0, p1x, p1y, 0, tipX, tipY, h);
+    normals.push(cos * 0.2, sin * 0.2, 0.96, cos * 0.2, sin * 0.2, 0.96, 0, 0, 1);
+    // Back face for clean double-sided lighting
+    positions.push(p1x, p1y, 0, p0x, p0y, 0, tipX, tipY, h);
+    normals.push(-cos * 0.2, -sin * 0.2, 0.96, -cos * 0.2, -sin * 0.2, 0.96, 0, 0, 1);
+  });
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  return geo;
 };
 
 // Procedural illuminated glass skyscraper facade texture for the Vice Coast skyline
@@ -154,14 +249,15 @@ const createBrakeBoardTexture = (label: string) => {
   return texture;
 };
 
-// Procedural Giant Trackside LED Broadcast Jumbotron Screen texture
-const createJumbotronTexture = () => {
-  const canvas = document.createElement('canvas');
-  canvas.width = 256;
-  canvas.height = 128;
-  const ctx = canvas.getContext('2d');
-  if (!ctx) return new THREE.Texture();
-
+// Procedural Giant Trackside LED Broadcast Jumbotron Screen texture + live updater
+const paintJumbotronScreen = (
+  ctx: CanvasRenderingContext2D,
+  leaderName: string,
+  speedKmh: number,
+  lap: number,
+  drsOrWetLabel: string,
+  accentColor: string
+) => {
   const grad = ctx.createLinearGradient(0, 0, 256, 128);
   grad.addColorStop(0, '#090d16');
   grad.addColorStop(1, '#1e1b4b');
@@ -171,25 +267,35 @@ const createJumbotronTexture = () => {
   ctx.fillStyle = '#dc2626';
   ctx.fillRect(0, 0, 256, 18);
   ctx.fillStyle = '#f8fafc';
-  ctx.font = '900 12px sans-serif';
+  ctx.font = '900 11px sans-serif';
   ctx.textAlign = 'left';
-  ctx.fillText('  FIA FORMULA 1  ·  LIVE TELEMETRY', 8, 13);
+  ctx.fillText(`  FIA F1 LIVE  ·  VUELTA ${lap}`, 8, 13);
 
-  ctx.fillStyle = '#38bdf8';
-  ctx.font = '900 28px monospace';
+  ctx.fillStyle = accentColor;
+  ctx.font = '900 24px monospace';
   ctx.textAlign = 'center';
-  ctx.fillText('DRAW RACE GP', 128, 56);
+  ctx.fillText(leaderName.slice(0, 14).toUpperCase(), 128, 52);
 
   ctx.fillStyle = '#fbbf24';
-  ctx.font = 'bold 18px monospace';
-  ctx.fillText('VMAX: 343 KM/H · DRS', 128, 88);
+  ctx.font = 'bold 17px monospace';
+  ctx.fillText(`${speedKmh} KM/H · ${drsOrWetLabel}`, 128, 86);
 
-  ctx.fillStyle = '#10b981';
-  ctx.fillRect(24, 104, 208, 8);
+  ctx.fillStyle = accentColor;
+  ctx.fillRect(22, 104, 212, 8);
+};
 
+const createJumbotronSurface = () => {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 128;
+  const ctx = canvas.getContext('2d');
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
-  return texture;
+  if (ctx) {
+    paintJumbotronScreen(ctx, 'DRAW RACE GP', 343, 1, 'DRS LIVE', '#38bdf8');
+    texture.needsUpdate = true;
+  }
+  return { canvas, ctx, texture };
 };
 
 // Real-Time Animated GLSL Coastal Marina Ocean Shader (Vice / Monaco GP water with Fresnel sky reflection & sun shimmer)
@@ -264,7 +370,10 @@ const CoastalWaterShader = {
 
 export const Environment3D: React.FC<Environment3DProps> = ({
   track,
-  lightingPreset = 'day'
+  lightingPreset = 'day',
+  weather = 'dry',
+  carsStateRef,
+  players = []
 }) => {
   const { gl } = useThree();
   const maxAnisotropy = Math.min(8, gl.capabilities.getMaxAnisotropy());
@@ -274,6 +383,10 @@ export const Environment3D: React.FC<Environment3DProps> = ({
   const heliRotorRef = useRef<THREE.Mesh>(null);
   const heliTailRotorRef = useRef<THREE.Mesh>(null);
   const ferrisWheelRef = useRef<THREE.Group>(null);
+  const grassTuftsRef = useRef<THREE.InstancedMesh>(null);
+  const crowdFlashesRef = useRef<THREE.InstancedMesh>(null);
+  const lastJumbotronUpdateRef = useRef(0);
+  const flashDummy = useMemo(() => new THREE.Object3D(), []);
 
   const waterMaterial = useMemo(() => {
     return new THREE.ShaderMaterial({
@@ -298,12 +411,15 @@ export const Environment3D: React.FC<Environment3DProps> = ({
   }, [waterMaterial]);
 
   const {
-    grassTexture,
+    grassMaps,
+    grassTuftGeo,
+    grassTuftInstances,
+    crowdFlashAnchors,
     skylineTexture,
     crowdTexture,
     board100Tex,
     board50Tex,
-    jumbotronTex,
+    jumbotronSurface,
     staticTrees,
     staticGrandstands,
     staticDecorations,
@@ -314,12 +430,48 @@ export const Environment3D: React.FC<Environment3DProps> = ({
     skylineTowers,
     marinaYachts
   } = useMemo(() => {
-    const texture = createNaturalTerrainTexture(maxAnisotropy, lightingPreset);
+    const terrainMaps = createNaturalTerrainMaps(maxAnisotropy, lightingPreset);
+    const tuftGeo = createGrassTuftGeometry();
     const skylineTex = createSkylineFacadeTexture(lightingPreset);
     const crowd = createCrowdSeatsTexture();
     const b100 = createBrakeBoardTexture('100');
     const b50 = createBrakeBoardTexture('50');
-    const jumbo = createJumbotronTexture();
+    const jumboSurface = createJumbotronSurface();
+    const jumbo = jumboSurface.texture;
+
+    // Deterministically scatter ~560 3D organic grass & wildflower tufts across infield & outer countryside
+    // Strictly filtered outside asphalt, kerbs & gravel traps via getTrackSurfaceInfo!
+    const tuftList: { x: number; y: number; rot: number; sx: number; sz: number; color: string }[] = [];
+    const tuftPalette =
+      lightingPreset === 'night'
+        ? ['#15291a', '#1b3520', '#122216', '#213d24']
+        : lightingPreset === 'sunset'
+          ? ['#345427', '#426630', '#4f7033', '#616e34', '#2a4620']
+          : ['#3b632d', '#4b7836', '#5a8a3e', '#6f8f42', '#2f5224'];
+    let seed = 1337;
+    const rand = () => {
+      seed = (seed * 16807) % 2147483647;
+      return (seed - 1) / 2147483646;
+    };
+    for (let attempt = 0; attempt < 2200 && tuftList.length < 560; attempt++) {
+      const gx = -120 + rand() * 1040;
+      const gy = -40 + rand() * 580;
+      const surf = getTrackSurfaceInfo({ x: gx, y: gy }, track);
+      // Keep well clear of asphalt, kerbs & gravel runoff
+      if (surf.onAsphalt || surf.onCurbOrGrass || surf.distFromCenter < surf.halfWidth + 24) {
+        continue;
+      }
+      // Stay north of coastal seawall (worldY = 500 - gy > -92 => gy < 592)
+      if (500 - gy < -88) continue;
+      tuftList.push({
+        x: gx,
+        y: 500 - gy,
+        rot: rand() * Math.PI * 2,
+        sx: 0.78 + rand() * 0.72,
+        sz: 0.72 + rand() * 0.85,
+        color: tuftPalette[Math.floor(rand() * tuftPalette.length)]
+      });
+    }
 
     const isNightOrSunset = lightingPreset === 'night' || lightingPreset === 'sunset';
 
@@ -350,27 +502,47 @@ export const Environment3D: React.FC<Environment3DProps> = ({
           </mesh>
 
           {isPalm ? (
-            /* GTA VI Vice Coast Arched Palm Frond Crown */
+            /* GTA VI Vice Coast Arched 3-Segment Palm Frond Crown + Coconuts */
             <group position={[sz * 0.04, 0, sz * 0.8]}>
-              {[0, 1, 2, 3, 4, 5, 6].map((fIdx) => {
-                const fAng = (fIdx / 7) * Math.PI * 2;
+              {[0, 1, 2].map((cIdx) => {
+                const cAng = (cIdx / 3) * Math.PI * 2;
+                return (
+                  <mesh
+                    key={`coco-${cIdx}`}
+                    position={[Math.cos(cAng) * sz * 0.06, Math.sin(cAng) * sz * 0.06, -sz * 0.05]}
+                  >
+                    <sphereGeometry args={[sz * 0.048, 6, 6]} />
+                    <meshStandardMaterial color="#5c3d1e" roughness={0.86} />
+                  </mesh>
+                );
+              })}
+              {[0, 1, 2, 3, 4, 5, 6, 7].map((fIdx) => {
+                const fAng = (fIdx / 8) * Math.PI * 2;
+                const upper = fIdx % 2 === 0;
                 return (
                   <group key={`frond-${fIdx}`} rotation={[0, 0, fAng]}>
                     <mesh
-                      position={[sz * 0.22, 0, -sz * 0.03]}
-                      rotation={[0, 0.34, 0]}
+                      position={[sz * 0.18, 0, upper ? sz * 0.04 : -sz * 0.02]}
+                      rotation={[0, upper ? 0.18 : 0.34, 0]}
                       castShadow
                     >
-                      <boxGeometry args={[sz * 0.46, sz * 0.14, 0.14]} />
-                      <meshStandardMaterial color={fIdx % 2 === 0 ? '#2f6b30' : '#3a7d38'} roughness={0.76} />
+                      <boxGeometry args={[sz * 0.38, sz * 0.13, 0.12]} />
+                      <meshStandardMaterial color={upper ? '#3d833a' : '#2d682d'} roughness={0.74} />
                     </mesh>
                     <mesh
-                      position={[sz * 0.44, 0, -sz * 0.16]}
-                      rotation={[0, 0.78, 0]}
+                      position={[sz * 0.42, 0, upper ? -sz * 0.08 : -sz * 0.16]}
+                      rotation={[0, upper ? 0.62 : 0.78, 0]}
                       castShadow
                     >
-                      <boxGeometry args={[sz * 0.24, sz * 0.09, 0.10]} />
-                      <meshStandardMaterial color="#3c7f3a" roughness={0.78} />
+                      <boxGeometry args={[sz * 0.28, sz * 0.095, 0.09]} />
+                      <meshStandardMaterial color={upper ? '#4a9442' : '#357433'} roughness={0.76} />
+                    </mesh>
+                    <mesh
+                      position={[sz * 0.56, 0, upper ? -sz * 0.24 : -sz * 0.32]}
+                      rotation={[0, 1.08, 0]}
+                    >
+                      <boxGeometry args={[sz * 0.18, sz * 0.055, 0.07]} />
+                      <meshStandardMaterial color="#539e48" roughness={0.78} />
                     </mesh>
                   </group>
                 );
@@ -380,34 +552,50 @@ export const Environment3D: React.FC<Environment3DProps> = ({
             <group position={[0, 0, sz * 0.44]}>
               <mesh position={[0, 0, 0]} rotation={[Math.PI / 2, 0, 0]} castShadow receiveShadow>
                 <coneGeometry args={[sz * 0.44, sz * 0.62, 8]} />
-                <meshStandardMaterial color="#1d3d24" roughness={0.88} />
+                <meshStandardMaterial color="#1b3a22" roughness={0.88} />
               </mesh>
               <mesh position={[0, 0, sz * 0.28]} rotation={[Math.PI / 2, 0, 0.4]} castShadow receiveShadow>
-                <coneGeometry args={[sz * 0.34, sz * 0.52, 8]} />
-                <meshStandardMaterial color="#254c2b" roughness={0.85} />
+                <coneGeometry args={[sz * 0.35, sz * 0.52, 8]} />
+                <meshStandardMaterial color="#244b2a" roughness={0.85} />
               </mesh>
               <mesh position={[0, 0, sz * 0.52]} rotation={[Math.PI / 2, 0, 0.8]} castShadow>
-                <coneGeometry args={[sz * 0.22, sz * 0.4, 8]} />
-                <meshStandardMaterial color="#2f5e34" roughness={0.82} />
+                <coneGeometry args={[sz * 0.24, sz * 0.42, 8]} />
+                <meshStandardMaterial color="#316136" roughness={0.82} />
+              </mesh>
+              <mesh position={[0, 0, sz * 0.70]} rotation={[Math.PI / 2, 0, 1.2]} castShadow>
+                <coneGeometry args={[sz * 0.13, sz * 0.28, 7]} />
+                <meshStandardMaterial color="#3d733f" roughness={0.80} />
               </mesh>
             </group>
           ) : (
-            <group position={[0, 0, sz * 0.48]}>
-              <mesh position={[0, 0, 0]} castShadow receiveShadow>
-                <dodecahedronGeometry args={[sz * 0.34, 1]} />
-                <meshStandardMaterial color="#264723" roughness={0.88} />
+            /* Sculpted Multi-Lobe Mediterranean Oak Canopy with Sunlit Crown & Shaded Understory */
+            <group position={[0, 0, sz * 0.46]}>
+              {/* Deep Shaded Lower Understory Boughs */}
+              <mesh position={[-sz * 0.14, -sz * 0.12, -sz * 0.04]} scale={[1.15, 1.05, 0.78]} castShadow receiveShadow>
+                <dodecahedronGeometry args={[sz * 0.26, 1]} />
+                <meshStandardMaterial color="#1f3b1d" roughness={0.92} flatShading />
               </mesh>
-              <mesh position={[-sz * 0.15, sz * 0.12, sz * 0.12]} castShadow>
-                <dodecahedronGeometry args={[sz * 0.24, 1]} />
-                <meshStandardMaterial color="#345c2c" roughness={0.86} />
-              </mesh>
-              <mesh position={[sz * 0.16, -sz * 0.1, sz * 0.15]} castShadow>
+              <mesh position={[sz * 0.15, sz * 0.11, -sz * 0.02]} scale={[1.1, 1.0, 0.80]} castShadow receiveShadow>
                 <dodecahedronGeometry args={[sz * 0.25, 1]} />
-                <meshStandardMaterial color="#3f6a32" roughness={0.84} />
+                <meshStandardMaterial color="#254422" roughness={0.90} flatShading />
               </mesh>
-              <mesh position={[0.04 * sz, 0.08 * sz, sz * 0.24]} castShadow>
+              {/* Mid-Tier Asymmetric Foliage Lobes */}
+              <mesh position={[-sz * 0.18, sz * 0.14, sz * 0.12]} scale={[1.05, 1.12, 0.88]} castShadow receiveShadow>
+                <dodecahedronGeometry args={[sz * 0.23, 1]} />
+                <meshStandardMaterial color="#31582a" roughness={0.86} flatShading />
+              </mesh>
+              <mesh position={[sz * 0.18, -sz * 0.12, sz * 0.14]} scale={[1.12, 0.96, 0.86]} castShadow receiveShadow>
+                <dodecahedronGeometry args={[sz * 0.24, 1]} />
+                <meshStandardMaterial color="#3b6730" roughness={0.84} flatShading />
+              </mesh>
+              <mesh position={[0, -sz * 0.16, sz * 0.16]} scale={[1.0, 1.08, 0.84]} castShadow>
                 <dodecahedronGeometry args={[sz * 0.21, 1]} />
-                <meshStandardMaterial color="#487537" roughness={0.82} />
+                <meshStandardMaterial color="#457435" roughness={0.83} flatShading />
+              </mesh>
+              {/* Sunlit Warm-Olive Upper Crown */}
+              <mesh position={[sz * 0.05, sz * 0.06, sz * 0.28]} scale={[1.06, 0.98, 0.82]} castShadow>
+                <dodecahedronGeometry args={[sz * 0.20, 1]} />
+                <meshStandardMaterial color="#55843c" roughness={0.80} flatShading />
               </mesh>
             </group>
           )}
@@ -652,49 +840,94 @@ export const Environment3D: React.FC<Environment3DProps> = ({
       }
     }
 
-    // 4. Distant Sculpted Horizon Mountain Range
+    // 4. Multi-Layered Sculpted Alpine Horizon Mountain Range (Granite Ridges + Snow Caps + Forested Foothills)
     const peaks: React.ReactNode[] = [];
-    const mountainRingCount = 26;
+    const mountainRingCount = 30;
     for (let m = 0; m < mountainRingCount; m++) {
       const ang = (m / mountainRingCount) * Math.PI * 2;
       // Leave coastal ocean opening along the south-east arc for the shimmering marina bay!
-      if (ang > 4.2 && ang < 5.6) continue;
-      const dist = 940 + ((m * 137) % 260);
+      if (ang > 4.15 && ang < 5.65) continue;
+      const dist = 920 + ((m * 137) % 280);
       const mx = 400 + Math.cos(ang) * dist;
       const my = 250 + Math.sin(ang) * (dist * 0.85);
-      const radius = 155 + ((m * 73) % 130);
-      const height = 140 + ((m * 89) % 175);
+      const radius = 155 + ((m * 73) % 135);
+      const height = 150 + ((m * 89) % 185);
+      const hasSnowCap = height > 235;
+      const foothillDist = dist - 220;
+      const fx = 400 + Math.cos(ang + 0.05) * foothillDist;
+      const fy = 250 + Math.sin(ang + 0.05) * (foothillDist * 0.85);
+
       peaks.push(
-        <mesh
-          key={`mountain-peak-${m}`}
-          position={[mx, my, height * 0.42 - 12]}
-          rotation={[Math.PI / 2, (m * 0.7) % Math.PI, 0]}
-        >
-          <coneGeometry args={[radius, height, 6]} />
-          <meshStandardMaterial
-            color={
-              lightingPreset === 'sunset'
-                ? '#334155'
-                : lightingPreset === 'night'
-                  ? '#0f172a'
-                  : '#384b39'
-            }
-            roughness={0.95}
-            metalness={0.05}
-            flatShading
-          />
-        </mesh>
+        <group key={`mountain-peak-${m}`}>
+          {/* Main Alpine Massif */}
+          <mesh
+            position={[mx, my, height * 0.42 - 12]}
+            rotation={[Math.PI / 2, (m * 0.7) % Math.PI, 0]}
+          >
+            <coneGeometry args={[radius, height, 7]} />
+            <meshStandardMaterial
+              color={
+                lightingPreset === 'sunset'
+                  ? '#334155'
+                  : lightingPreset === 'night'
+                    ? '#0f172a'
+                    : '#364938'
+              }
+              roughness={0.93}
+              metalness={0.05}
+              flatShading
+            />
+          </mesh>
+          {/* Upper Granite / Snow Summit Cap */}
+          {hasSnowCap && (
+            <mesh
+              position={[mx, my, height * 0.74 - 10]}
+              rotation={[Math.PI / 2, (m * 0.7) % Math.PI, 0]}
+            >
+              <coneGeometry args={[radius * 0.36, height * 0.36, 7]} />
+              <meshStandardMaterial
+                color={
+                  lightingPreset === 'sunset'
+                    ? '#fed7aa'
+                    : lightingPreset === 'night'
+                      ? '#475569'
+                      : '#e2e8f0'
+                }
+                roughness={0.78}
+                flatShading
+              />
+            </mesh>
+          )}
+          {/* Forested Mid-Distance Foothill Ridge */}
+          <mesh
+            position={[fx, fy, height * 0.18 - 10]}
+            rotation={[Math.PI / 2, (m * 1.1) % Math.PI, 0]}
+          >
+            <dodecahedronGeometry args={[radius * 0.56, 1]} />
+            <meshStandardMaterial
+              color={
+                lightingPreset === 'sunset'
+                  ? '#293b2b'
+                  : lightingPreset === 'night'
+                    ? '#0b1710'
+                    : '#2b4728'
+              }
+              roughness={0.95}
+              flatShading
+            />
+          </mesh>
+        </group>
       );
     }
 
-    // 5. Distant Vice / Miami Glass High-Rise Skyline along the North-East Coastal Ridge
+    // 5. Distant Vice / Miami / Monte-Carlo Glass High-Rise Skyline along the North-East Coastal Ridge
     const skyline: React.ReactNode[] = [];
-    for (let s = 0; s < 16; s++) {
-      const bx = 560 + s * 46 + ((s * 29) % 24);
-      const by = 695 + ((s * 53) % 85);
-      const bw = 20 + ((s * 19) % 20);
+    for (let s = 0; s < 18; s++) {
+      const bx = 520 + s * 44 + ((s * 29) % 24);
+      const by = 690 + ((s * 53) % 90);
+      const bw = 20 + ((s * 19) % 22);
       const bd = 18 + ((s * 13) % 16);
-      const bh = 68 + ((s * 47) % 135);
+      const bh = 68 + ((s * 47) % 140);
       skyline.push(
         <group key={`skyline-bldg-${s}`} position={[bx, by, bh * 0.5]}>
           <mesh>
@@ -722,12 +955,14 @@ export const Environment3D: React.FC<Environment3DProps> = ({
       );
     }
 
-    // 6. Luxury Monaco / Miami GP Marina Superyachts moored in the Southern Coastal Bay
+    // 6. Luxury Monaco / Port Hercule Marina Superyachts moored in the Southern Coastal Bay
     const yachts: React.ReactNode[] = [
-      { x: 185, y: -155, rot: 0.22, scale: 1.15 },
-      { x: 330, y: -175, rot: -0.14, scale: 1.35 },
-      { x: 495, y: -162, rot: 0.30, scale: 1.1 },
-      { x: 640, y: -182, rot: -0.25, scale: 1.25 }
+      { x: 110, y: -150, rot: 0.16, scale: 1.1 },
+      { x: 225, y: -162, rot: 0.22, scale: 1.2 },
+      { x: 355, y: -178, rot: -0.14, scale: 1.38 },
+      { x: 495, y: -162, rot: 0.28, scale: 1.15 },
+      { x: 625, y: -182, rot: -0.22, scale: 1.28 },
+      { x: 745, y: -168, rot: 0.12, scale: 1.18 }
     ].map((y, idx) => (
       <group
         key={`yacht-${idx}`}
@@ -740,7 +975,7 @@ export const Environment3D: React.FC<Environment3DProps> = ({
           <boxGeometry args={[28, 7.2, 3.0]} />
           <meshPhysicalMaterial color="#f8fafc" roughness={0.15} metalness={0.2} clearcoat={1.0} />
         </mesh>
-        {/* Teak Foredeck */}
+        {/* Underwater Turquoise Accent & Teak Foredeck */}
         <mesh position={[5, 0, 1.6]}>
           <boxGeometry args={[16, 6.2, 0.3]} />
           <meshStandardMaterial color="#a16207" roughness={0.7} />
@@ -751,16 +986,20 @@ export const Environment3D: React.FC<Environment3DProps> = ({
           <meshPhysicalMaterial
             color="#0f172a"
             emissive={isNightOrSunset ? '#38bdf8' : '#000000'}
-            emissiveIntensity={isNightOrSunset ? 0.9 : 0}
+            emissiveIntensity={isNightOrSunset ? 0.95 : 0}
             roughness={0.08}
             metalness={0.85}
             clearcoat={1.0}
           />
         </mesh>
-        {/* Upper Sun Deck */}
+        {/* Upper Sun Deck & Radar Mast */}
         <mesh position={[-4.5, 0, 5.0]}>
           <boxGeometry args={[9.5, 4.4, 0.5]} />
           <meshStandardMaterial color="#f8fafc" roughness={0.25} />
+        </mesh>
+        <mesh position={[-5.2, 0, 6.6]}>
+          <boxGeometry args={[1.4, 2.8, 2.6]} />
+          <meshStandardMaterial color="#e2e8f0" roughness={0.3} />
         </mesh>
       </group>
     ));
@@ -797,13 +1036,36 @@ export const Environment3D: React.FC<Environment3DProps> = ({
       return null;
     });
 
+    // 8. Spectator Camera Flash Anchors across all Terraced Grandstands
+    const flashAnchors: { x: number; y: number; z: number; phase: number }[] = [];
+    (track.grandstands || []).forEach((gs, gIdx) => {
+      if (gIdx === 0) return; // skip pit building
+      const cosA = Math.cos(-gs.angle);
+      const sinA = Math.sin(-gs.angle);
+      for (let f = 0; f < 14; f++) {
+        const lx = ((f / 13) - 0.5) * (gs.width - 4);
+        const ly = (((f * 7) % 11) / 10 - 0.5) * (gs.height * 0.7);
+        const wx = gs.x + lx * cosA - ly * sinA;
+        const wy = (500 - gs.y) + lx * sinA + ly * cosA;
+        flashAnchors.push({
+          x: wx,
+          y: wy,
+          z: 5.2 + ((f * 3) % 5) * 0.75,
+          phase: gIdx * 17.3 + f * 11.7
+        });
+      }
+    });
+
     return {
-      grassTexture: texture,
+      grassMaps: terrainMaps,
+      grassTuftGeo: tuftGeo,
+      grassTuftInstances: tuftList,
+      crowdFlashAnchors: flashAnchors,
       skylineTexture: skylineTex,
       crowdTexture: crowd,
       board100Tex: b100,
       board50Tex: b50,
-      jumbotronTex: jumbo,
+      jumbotronSurface: jumboSurface,
       staticTrees: trees,
       staticGrandstands: grandstands,
       staticDecorations: decorations,
@@ -816,20 +1078,110 @@ export const Environment3D: React.FC<Environment3DProps> = ({
     };
   }, [track, maxAnisotropy, lightingPreset]);
 
+  // Populate single-draw-call 3D InstancedMesh grass tufts across countryside & infield
+  useEffect(() => {
+    const mesh = grassTuftsRef.current;
+    if (!mesh || grassTuftInstances.length === 0) return;
+
+    const dummy = new THREE.Object3D();
+    const col = new THREE.Color();
+    mesh.count = grassTuftInstances.length;
+
+    grassTuftInstances.forEach((t, idx) => {
+      dummy.position.set(t.x, t.y, -0.2);
+      dummy.rotation.set(0, 0, t.rot);
+      dummy.scale.set(t.sx, t.sx, t.sz);
+      dummy.updateMatrix();
+      mesh.setMatrixAt(idx, dummy.matrix);
+      col.set(t.color);
+      mesh.setColorAt(idx, col);
+    });
+
+    mesh.instanceMatrix.needsUpdate = true;
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    mesh.computeBoundingSphere();
+  }, [grassTuftInstances]);
+
   useEffect(() => {
     return () => {
-      grassTexture.dispose();
+      grassMaps.map.dispose();
+      grassMaps.normalMap.dispose();
+      grassMaps.roughnessMap.dispose();
+      grassTuftGeo.dispose();
       skylineTexture.dispose();
       crowdTexture.dispose();
       board100Tex.dispose();
       board50Tex.dispose();
-      jumbotronTex.dispose();
+      jumbotronSurface.texture.dispose();
     };
-  }, [grassTexture, skylineTexture, crowdTexture, board100Tex, board50Tex, jumbotronTex]);
+  }, [
+    grassMaps,
+    grassTuftGeo,
+    skylineTexture,
+    crowdTexture,
+    board100Tex,
+    board50Tex,
+    jumbotronSurface
+  ]);
 
   useFrame((state) => {
     const elapsed = state.clock.getElapsedTime();
     waterMaterial.uniforms.uTime.value = elapsed;
+
+    // Live Telemetry Jumbotron update (~3Hz) showing P1 race leader, speed in km/h, lap, and DRS / WET status
+    if (elapsed - lastJumbotronUpdateRef.current > 0.35 && jumbotronSurface.ctx) {
+      lastJumbotronUpdateRef.current = elapsed;
+      const cars = carsStateRef?.current;
+      if (cars && cars.length > 0) {
+        let leader = cars[0];
+        for (let i = 1; i < cars.length; i++) {
+          const c = cars[i];
+          if (!c.disqualified && (c.lap > leader.lap || (c.lap === leader.lap && c.targetIndex > leader.targetIndex))) {
+            leader = c;
+          }
+        }
+        const leaderPlayer = players.find((p) => p.id === leader.playerId);
+        const speedKmh = Math.min(372, Math.round(Math.hypot(leader.vx, leader.vy) * 41.5));
+        const statusBadge =
+          weather === 'rain' ? 'WET GP' : leader.drsActive ? 'DRS ON' : 'P1 LIVE';
+        paintJumbotronScreen(
+          jumbotronSurface.ctx,
+          leaderPlayer ? `P1 ${leaderPlayer.name}` : 'P1 LEADER',
+          speedKmh,
+          Math.max(1, leader.lap),
+          statusBadge,
+          leaderPlayer?.color || '#38bdf8'
+        );
+        jumbotronSurface.texture.needsUpdate = true;
+      } else {
+        paintJumbotronScreen(
+          jumbotronSurface.ctx,
+          track.name.split('–')[0].trim(),
+          345,
+          1,
+          weather === 'rain' ? 'WET GP' : 'FIA GP',
+          '#38bdf8'
+        );
+        jumbotronSurface.texture.needsUpdate = true;
+      }
+    }
+
+    // Animate Grandstand Spectator Camera Flash Bursts
+    if (crowdFlashesRef.current && crowdFlashAnchors.length > 0) {
+      const fMesh = crowdFlashesRef.current;
+      fMesh.count = crowdFlashAnchors.length;
+      for (let i = 0; i < crowdFlashAnchors.length; i++) {
+        const a = crowdFlashAnchors[i];
+        const pulse = Math.sin(elapsed * 9.5 + a.phase) * Math.cos(elapsed * 14.2 + a.phase * 1.7);
+        const isFlashing = pulse > 0.88;
+        flashDummy.position.set(a.x, a.y, isFlashing ? a.z : -500);
+        const s = isFlashing ? 0.55 + (pulse - 0.88) * 6.5 : 0.001;
+        flashDummy.scale.setScalar(s);
+        flashDummy.updateMatrix();
+        fMesh.setMatrixAt(i, flashDummy.matrix);
+      }
+      fMesh.instanceMatrix.needsUpdate = true;
+    }
 
     if (treesGroupRef.current) {
       treesGroupRef.current.children.forEach((treeGroup, index) => {
@@ -868,14 +1220,31 @@ export const Environment3D: React.FC<Environment3DProps> = ({
   });
 
   const isNightOrSunset = lightingPreset === 'night' || lightingPreset === 'sunset';
+  const showHeliBeam = isNightOrSunset || weather === 'rain';
 
   return (
     <group>
-      {/* Expansive Natural Circuit Countryside Terrain */}
+      {/* Expansive Next-Gen 1024px PBR Circuit Countryside Terrain (Albedo + Normal Relief + Dew Roughness) */}
       <mesh position={[400, 320, -0.24]} receiveShadow>
         <planeGeometry args={[3800, 2600]} />
-        <meshStandardMaterial map={grassTexture} roughness={0.94} metalness={0.02} />
+        <meshStandardMaterial
+          map={grassMaps.map}
+          normalMap={grassMaps.normalMap}
+          normalScale={_grassNormalScale}
+          roughnessMap={grassMaps.roughnessMap}
+          roughness={0.94}
+          metalness={0.02}
+        />
       </mesh>
+
+      {/* Single-Draw-Call 3D Instanced Trackside Grass & Turf Clumps */}
+      <instancedMesh
+        ref={grassTuftsRef}
+        args={[grassTuftGeo, undefined, Math.max(1, grassTuftInstances.length)]}
+        receiveShadow
+      >
+        <meshStandardMaterial roughness={0.86} metalness={0.02} />
+      </instancedMesh>
 
       {/* Coastal Seawall Promenade separating the Autodrome from the Marina Ocean Bay */}
       <mesh position={[400, -104, 0.9]} receiveShadow castShadow>
@@ -890,6 +1259,251 @@ export const Environment3D: React.FC<Environment3DProps> = ({
 
       {/* Luxury GP Marina Superyachts */}
       {marinaYachts}
+
+      {/* Harbor Breakwater Pier & Red/White Port Hercule Marina Lighthouse */}
+      <group position={[810, -135, 0]}>
+        <mesh position={[-55, 18, 0.9]} receiveShadow castShadow>
+          <boxGeometry args={[130, 8, 2.4]} />
+          <meshStandardMaterial color="#94a3b8" roughness={0.78} />
+        </mesh>
+        <mesh position={[0, 0, 9]} rotation={[Math.PI / 2, 0, 0]} castShadow>
+          <cylinderGeometry args={[2.2, 3.4, 18, 16]} />
+          <meshStandardMaterial color="#f8fafc" roughness={0.35} />
+        </mesh>
+        <mesh position={[0, 0, 14]} rotation={[Math.PI / 2, 0, 0]}>
+          <cylinderGeometry args={[2.35, 2.65, 4.5, 16]} />
+          <meshStandardMaterial color="#dc2626" roughness={0.35} />
+        </mesh>
+        <mesh position={[0, 0, 19.2]}>
+          <sphereGeometry args={[1.9, 12, 12]} />
+          <meshStandardMaterial
+            color="#fef08a"
+            emissive="#facc15"
+            emissiveIntensity={isNightOrSunset ? 7.5 : 1.5}
+          />
+        </mesh>
+      </group>
+
+      {/* F1 Team Paddock Village Motorhomes & Broadcast Satellite Compounds */}
+      <group position={[110, 476, 0]}>
+        <mesh position={[0, 0, 3.6]} castShadow receiveShadow>
+          <boxGeometry args={[36, 12, 7.2]} />
+          <meshPhysicalMaterial color="#0f172a" roughness={0.2} metalness={0.75} clearcoat={0.9} />
+        </mesh>
+        <mesh position={[0, -6.1, 5.2]}>
+          <boxGeometry args={[34, 0.4, 0.7]} />
+          <meshStandardMaterial color="#ef4444" emissive="#ef4444" emissiveIntensity={3.0} />
+        </mesh>
+        <mesh position={[28, 0, 2.8]} castShadow receiveShadow>
+          <boxGeometry args={[16, 8, 5.6]} />
+          <meshStandardMaterial color="#e2e8f0" roughness={0.35} metalness={0.3} />
+        </mesh>
+      </group>
+
+      <group position={[685, 476, 0]}>
+        <mesh position={[0, 0, 3.6]} castShadow receiveShadow>
+          <boxGeometry args={[34, 12, 7.2]} />
+          <meshPhysicalMaterial color="#1e293b" roughness={0.2} metalness={0.75} clearcoat={0.9} />
+        </mesh>
+        <mesh position={[0, -6.1, 5.2]}>
+          <boxGeometry args={[32, 0.4, 0.7]} />
+          <meshStandardMaterial color="#38bdf8" emissive="#38bdf8" emissiveIntensity={3.0} />
+        </mesh>
+      </group>
+
+      {/* CIRCUIT-SPECIFIC REAL-WORLD 3D ARCHITECTURAL LANDMARKS */}
+      {track.id === 'jarama' && (
+        /* Iconic Torre del Jarama – RACE (Madrid): Cylindrical White Tower with Red/Gold Observation Decks + Paddock Control Building */
+        <group position={[315, 265, 0]}>
+          {/* Adjacent RACE Paddock Control Wing */}
+          <mesh position={[-38, 4, 4.2]} castShadow receiveShadow>
+            <boxGeometry args={[42, 18, 8.4]} />
+            <meshStandardMaterial color="#f1f5f9" roughness={0.42} metalness={0.15} />
+          </mesh>
+          <mesh position={[-38, -5.2, 6.2]}>
+            <boxGeometry args={[40, 0.6, 1.4]} />
+            <meshStandardMaterial color="#dc2626" emissive="#dc2626" emissiveIntensity={1.6} />
+          </mesh>
+          {/* Reinforced Concrete Base Podium */}
+          <mesh position={[0, 0, 2.5]} castShadow receiveShadow>
+            <cylinderGeometry args={[14, 16, 5, 20]} />
+            <meshStandardMaterial color="#e2e8f0" roughness={0.55} />
+          </mesh>
+          {/* Main White Cylindrical Control Tower Shaft */}
+          <mesh position={[0, 0, 19]} rotation={[Math.PI / 2, 0, 0]} castShadow receiveShadow>
+            <cylinderGeometry args={[6.2, 7.0, 32, 24]} />
+            <meshStandardMaterial color="#f8fafc" roughness={0.35} metalness={0.1} />
+          </mesh>
+          {/* Lower Observation Glass Deck & RACE Red Ring */}
+          <mesh position={[0, 0, 24]} rotation={[Math.PI / 2, 0, 0]} castShadow>
+            <cylinderGeometry args={[10.5, 9.8, 3.2, 24]} />
+            <meshStandardMaterial color="#dc2626" roughness={0.3} metalness={0.25} />
+          </mesh>
+          <mesh position={[0, 0, 27.2]} rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[10.0, 10.0, 3.4, 24]} />
+            <meshPhysicalMaterial
+              color="#0f172a"
+              emissive={isNightOrSunset ? '#fbbf24' : '#38bdf8'}
+              emissiveIntensity={isNightOrSunset ? 1.8 : 0.35}
+              roughness={0.08}
+              metalness={0.9}
+              clearcoat={1.0}
+            />
+          </mesh>
+          {/* Upper VIP Timing Crown & Helipad Roof */}
+          <mesh position={[0, 0, 31.2]} rotation={[Math.PI / 2, 0, 0]} castShadow>
+            <cylinderGeometry args={[11.4, 10.5, 2.6, 24]} />
+            <meshStandardMaterial color="#f8fafc" roughness={0.3} />
+          </mesh>
+          <mesh position={[0, 0, 33.0]} rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[8.5, 8.5, 1.2, 24]} />
+            <meshStandardMaterial color="#f59e0b" roughness={0.35} metalness={0.4} />
+          </mesh>
+          {/* Rooftop Broadcast Mast */}
+          <mesh position={[0, 0, 38.5]} rotation={[Math.PI / 2, 0, 0]}>
+            <cylinderGeometry args={[0.25, 0.45, 11, 8]} />
+            <meshStandardMaterial color="#cbd5e1" metalness={0.85} roughness={0.2} />
+          </mesh>
+          <mesh position={[0, 0, 44.2]}>
+            <sphereGeometry args={[0.65, 10, 10]} />
+            <meshStandardMaterial color="#ef4444" emissive="#ff1e42" emissiveIntensity={7.0} />
+          </mesh>
+        </group>
+      )}
+
+      {track.id === 'madring' && (
+        /* Madring F1 (2026): Twin IFEMA Madrid Exhibition Pavilions + Skybridge + La Monumental Banked Coliseum Arc */
+        <group>
+          {/* IFEMA West & East Exhibition Pavilions in Infield */}
+          <group position={[285, 250, 0]}>
+            <mesh position={[0, 0, 6.5]} castShadow receiveShadow>
+              <boxGeometry args={[76, 38, 13]} />
+              <meshPhysicalMaterial
+                color="#1e293b"
+                roughness={0.18}
+                metalness={0.78}
+                clearcoat={0.9}
+              />
+            </mesh>
+            <mesh position={[0, 0, 13.6]} castShadow>
+              <boxGeometry args={[82, 42, 1.4]} />
+              <meshStandardMaterial color="#f8fafc" roughness={0.3} metalness={0.4} />
+            </mesh>
+            <mesh position={[0, -20.8, 11.5]}>
+              <boxGeometry args={[78, 0.9, 1.2]} />
+              <meshStandardMaterial
+                color="#ec4899"
+                emissive="#ec4899"
+                emissiveIntensity={isNightOrSunset ? 5.0 : 2.2}
+              />
+            </mesh>
+            <mesh position={[0, 20.8, 11.5]}>
+              <boxGeometry args={[78, 0.9, 1.2]} />
+              <meshStandardMaterial
+                color="#38bdf8"
+                emissive="#38bdf8"
+                emissiveIntensity={isNightOrSunset ? 5.0 : 2.2}
+              />
+            </mesh>
+          </group>
+
+          {/* IFEMA East Valdebebas Pavilion + Elevated Pedestrian Skybridge */}
+          <group position={[515, 252, 0]}>
+            <mesh position={[0, 0, 6.0]} castShadow receiveShadow>
+              <boxGeometry args={[64, 34, 12]} />
+              <meshPhysicalMaterial
+                color="#0f172a"
+                roughness={0.18}
+                metalness={0.82}
+                clearcoat={0.9}
+              />
+            </mesh>
+            <mesh position={[0, 0, 12.6]} castShadow>
+              <boxGeometry args={[68, 38, 1.2]} />
+              <meshStandardMaterial color="#e2e8f0" roughness={0.3} metalness={0.4} />
+            </mesh>
+            <mesh position={[-115, 0, 8.5]} castShadow>
+              <boxGeometry args={[165, 6.5, 4.2]} />
+              <meshPhysicalMaterial color="#38bdf8" roughness={0.12} metalness={0.85} clearcoat={1.0} />
+            </mesh>
+          </group>
+
+          {/* La Monumental Curved Stadium Amphitheater Rim around the Eastern Banked Turn */}
+          <group position={[744, 232, 0]} rotation={[0, 0, -Math.PI / 2]}>
+            <mesh position={[0, 0, 11]} rotation={[Math.PI / 2, 0, 0]}>
+              <torusGeometry args={[76, 3.4, 12, 36, Math.PI * 0.88]} />
+              <meshStandardMaterial
+                color="#f59e0b"
+                emissive="#f59e0b"
+                emissiveIntensity={isNightOrSunset ? 4.2 : 1.4}
+                roughness={0.3}
+                metalness={0.6}
+              />
+            </mesh>
+          </group>
+        </group>
+      )}
+
+      {track.id === 'monaco' && (
+        /* Circuit de Monaco: Belle-Époque Casino de Monte-Carlo Twin Domes & Hôtel de Paris Rotunda */
+        <group>
+          <group position={[315, 252, 0]}>
+            <mesh position={[0, 0, 6.5]} castShadow receiveShadow>
+              <boxGeometry args={[72, 34, 13]} />
+              <meshStandardMaterial color="#fef3c7" roughness={0.45} metalness={0.1} />
+            </mesh>
+            <mesh position={[0, 0, 14.5]} castShadow>
+              <boxGeometry args={[48, 26, 4.0]} />
+              <meshStandardMaterial color="#fde68a" roughness={0.4} />
+            </mesh>
+            {/* Iconic Twin Green Patina Copper Casino Domes */}
+            <mesh position={[-11, 0, 18.5]} castShadow>
+              <sphereGeometry args={[8.5, 20, 16]} />
+              <meshStandardMaterial color="#0d9488" roughness={0.35} metalness={0.45} />
+            </mesh>
+            <mesh position={[11, 0, 18.5]} castShadow>
+              <sphereGeometry args={[8.5, 20, 16]} />
+              <meshStandardMaterial color="#0d9488" roughness={0.35} metalness={0.45} />
+            </mesh>
+            {/* Hôtel de Paris Rotunda Wing */}
+            <mesh position={[52, 4, 8.5]} rotation={[Math.PI / 2, 0, 0]} castShadow receiveShadow>
+              <cylinderGeometry args={[14, 15, 17, 20]} />
+              <meshStandardMaterial color="#fef9c3" roughness={0.42} />
+            </mesh>
+            <mesh position={[52, 4, 18.5]} castShadow>
+              <sphereGeometry args={[11.5, 18, 14]} />
+              <meshStandardMaterial color="#0f766e" roughness={0.35} metalness={0.4} />
+            </mesh>
+            {/* Warm Golden Palace Facade Illumination Strip */}
+            <mesh position={[0, -17.2, 10.5]}>
+              <boxGeometry args={[68, 0.8, 1.0]} />
+              <meshStandardMaterial
+                color="#fbbf24"
+                emissive="#f59e0b"
+                emissiveIntensity={isNightOrSunset ? 5.5 : 1.8}
+              />
+            </mesh>
+          </group>
+        </group>
+      )}
+
+      {track.id === 'grandprix' && (
+        /* Autodromo Nazionale Monza: Historic Royal Park Villa & High-Speed Sopraelevata Banking Arch */
+        <group position={[355, 250, 0]}>
+          <mesh position={[0, 0, 6.0]} castShadow receiveShadow>
+            <boxGeometry args={[74, 30, 12]} />
+            <meshStandardMaterial color="#fed7aa" roughness={0.48} />
+          </mesh>
+          <mesh position={[0, 0, 14.0]} castShadow>
+            <boxGeometry args={[42, 22, 4.5]} />
+            <meshStandardMaterial color="#fdba74" roughness={0.45} />
+          </mesh>
+          <mesh position={[0, -15.3, 9.8]}>
+            <boxGeometry args={[70, 0.8, 1.0]} />
+            <meshStandardMaterial color="#10b981" emissive="#10b981" emissiveIntensity={2.5} />
+          </mesh>
+        </group>
+      )}
 
       {/* Distant Horizon Mountain Range & Illuminated Glass Coastal Skyline */}
       {mountainPeaks}
@@ -936,6 +1550,22 @@ export const Environment3D: React.FC<Environment3DProps> = ({
 
       {/* Pit Complex & Terraced Spectator Grandstands */}
       {staticGrandstands}
+
+      {/* Animated Grandstand Spectator Camera Flashes */}
+      <instancedMesh
+        ref={crowdFlashesRef}
+        args={[undefined, undefined, Math.max(1, crowdFlashAnchors.length)]}
+        frustumCulled={false}
+      >
+        <octahedronGeometry args={[0.75, 0]} />
+        <meshBasicMaterial
+          color="#ffffff"
+          transparent
+          opacity={0.92}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+        />
+      </instancedMesh>
 
       {/* FIA 100m & 50m Braking Marker Boards */}
       {brakeBoards}
@@ -987,6 +1617,20 @@ export const Environment3D: React.FC<Environment3DProps> = ({
           <sphereGeometry args={[0.45, 8, 8]} />
           <meshStandardMaterial color="#ef4444" emissive="#ff1e42" emissiveIntensity={8.5} />
         </mesh>
+        {/* Volumetric TV Broadcast Searchlight Cone under Helicopter in Night / Sunset / Wet GP */}
+        {showHeliBeam && (
+          <mesh position={[12, 0, -34]} rotation={[Math.PI / 2, 0.32, 0]}>
+            <coneGeometry args={[22, 68, 16, 1, true]} />
+            <meshBasicMaterial
+              color="#e0f2fe"
+              transparent
+              opacity={lightingPreset === 'night' ? 0.09 : 0.05}
+              blending={THREE.AdditiveBlending}
+              depthWrite={false}
+              side={THREE.DoubleSide}
+            />
+          </mesh>
+        )}
       </group>
     </group>
   );

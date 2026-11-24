@@ -68,24 +68,31 @@ const MotorsportOpticsShader = {
       vec3 sharpDelta = clamp(centerCol - avgCross, -0.10, 0.10);
       vec3 col = centerCol + sharpDelta * uSharpness;
 
-      // 2. Clean Photorealistic Broadcast Color Grading (balanced white-point, zero haze)
+      // 2. Subtle Horizontal Anamorphic Broadcast Lens Glint on Ultra-Bright Specular Peaks (Sun/Floodlight Glints)
+      vec3 eFar = texture2D(tDiffuse, vUv + vec2(texel.x * 4.0, 0.0)).rgb;
+      vec3 wFar = texture2D(tDiffuse, vUv - vec2(texel.x * 4.0, 0.0)).rgb;
+      float ePeak = max(0.0, dot(eFar, vec3(0.333)) - 0.91);
+      float wPeak = max(0.0, dot(wFar, vec3(0.333)) - 0.91);
+      col += vec3(0.78, 0.90, 1.0) * (ePeak + wPeak) * 0.24;
+
+      // 3. Clean Photorealistic Broadcast Color Grading (balanced white-point, zero haze)
       float luma = dot(col, vec3(0.2126, 0.7152, 0.0722));
       if (uPresetMode < 0.5) {
-        vec3 shadowTint = vec3(0.96, 0.98, 1.03);
-        vec3 highTint = vec3(1.02, 1.01, 0.97);
-        col *= mix(shadowTint, highTint, smoothstep(0.18, 0.86, luma));
-        col = mix(vec3(luma), col, 1.07);
+        vec3 shadowTint = vec3(0.96, 0.98, 1.04);
+        vec3 highTint = vec3(1.03, 1.01, 0.97);
+        col *= mix(shadowTint, highTint, smoothstep(0.16, 0.86, luma));
+        col = mix(vec3(luma), col, 1.09);
       } else if (uPresetMode < 1.5) {
-        vec3 shadowTint = vec3(0.94, 0.98, 1.05);
-        vec3 highTint = vec3(1.00, 1.02, 1.05);
-        col *= mix(shadowTint, highTint, smoothstep(0.18, 0.85, luma));
-        col = mix(vec3(luma), col, 1.08);
+        vec3 shadowTint = vec3(0.94, 0.98, 1.06);
+        vec3 highTint = vec3(1.00, 1.03, 1.06);
+        col *= mix(shadowTint, highTint, smoothstep(0.16, 0.85, luma));
+        col = mix(vec3(luma), col, 1.10);
       } else {
-        col = mix(vec3(luma), col, 1.06);
+        col = mix(vec3(luma), col, 1.08);
       }
 
-      // Subtle micro-contrast without crushing carbon-fiber or kerb details
-      col = mix(col, col * col * (3.0 - 2.0 * col), 0.08);
+      // Crisp S-curve micro-contrast without crushing carbon-fiber or kerb details
+      col = mix(col, col * col * (3.0 - 2.0 * col), 0.11);
 
       // Gentle corner lens framing only at extreme perimeter
       float dist = length(vUv - 0.5);
@@ -117,49 +124,55 @@ export const PostProcessingEffects: React.FC<PostProcessingEffectsProps> = ({
   const opticsPassRef = useRef<ShaderPass | null>(null);
 
   const worldComposer = useMemo(() => {
-    if (isSoftwareGl) return null;
+    // On mobile GPUs (Android Adreno/Mali & iOS WebGL) or software GL, HalfFloatType + MSAA or EffectComposer FBOs
+    // can silently fail completeness checks and render Layer 0 (the road & world) pitch black!
+    // Using UnsignedByteType with safe capability checks guarantees 100% visible, razor-sharp 3D road on all devices.
+    if (isSoftwareGl || isMobile) return null;
 
-    const pixelRatio = gl.getPixelRatio();
-    const physW = Math.max(1, Math.floor(size.width * pixelRatio));
-    const physH = Math.max(1, Math.floor(size.height * pixelRatio));
-    const isWebGL2 = gl.capabilities.isWebGL2;
+    try {
+      const pixelRatio = gl.getPixelRatio();
+      const physW = Math.max(1, Math.floor(size.width * pixelRatio));
+      const physH = Math.max(1, Math.floor(size.height * pixelRatio));
+      const isWebGL2 = gl.capabilities.isWebGL2;
 
-    // Dedicated Full-Physical-DPR MSAA HalfFloat HDR World Render Target (Layer 0)
-    const worldRenderTarget = new THREE.WebGLRenderTarget(physW, physH, {
-      type: THREE.HalfFloatType,
-      format: THREE.RGBAFormat,
-      samples: isWebGL2 ? (isMobile ? 2 : 4) : 0
-    });
+      // Use universally supported UnsignedByteType so FBO color attachment is 100% valid across all GPUs
+      const worldRenderTarget = new THREE.WebGLRenderTarget(physW, physH, {
+        type: THREE.UnsignedByteType,
+        format: THREE.RGBAFormat,
+        samples: isWebGL2 ? 4 : 0
+      });
 
-    const comp = new EffectComposer(gl, worldRenderTarget);
-    comp.setPixelRatio(pixelRatio);
-    comp.setSize(size.width, size.height);
+      const comp = new EffectComposer(gl, worldRenderTarget);
+      comp.setPixelRatio(pixelRatio);
+      comp.setSize(size.width, size.height);
 
-    const renderPass = new RenderPass(scene, camera);
-    comp.addPass(renderPass);
+      const renderPass = new RenderPass(scene, camera);
+      comp.addPass(renderPass);
 
-    // Strictly selective World-Only HDR Bloom (never bleeds onto cars on Layer 1!)
-    const bloomPass = new UnrealBloomPass(
-      new THREE.Vector2(Math.max(1, Math.floor(physW * 0.5)), Math.max(1, Math.floor(physH * 0.5))),
-      preset === 'night' ? 0.34 : preset === 'sunset' ? 0.16 : 0.10,
-      0.22,
-      preset === 'night' ? 0.86 : preset === 'sunset' ? 0.96 : 1.04
-    );
-    comp.addPass(bloomPass);
-    bloomPassRef.current = bloomPass;
+      // Selective World-Only Bloom (never bleeds onto cars on Layer 1)
+      const bloomPass = new UnrealBloomPass(
+        new THREE.Vector2(Math.max(1, Math.floor(physW * 0.5)), Math.max(1, Math.floor(physH * 0.5))),
+        preset === 'night' ? 0.32 : preset === 'sunset' ? 0.14 : 0.08,
+        0.22,
+        preset === 'night' ? 0.85 : preset === 'sunset' ? 0.94 : 0.98
+      );
+      comp.addPass(bloomPass);
+      bloomPassRef.current = bloomPass;
 
-    // OutputPass applies ACESFilmicToneMapping + Linear->sRGB conversion accurately
-    const outputPass = new OutputPass();
-    comp.addPass(outputPass);
+      const outputPass = new OutputPass();
+      comp.addPass(outputPass);
 
-    const opticsPass = new ShaderPass(MotorsportOpticsShader);
-    opticsPass.uniforms.uResolution.value.set(physW, physH);
-    opticsPass.uniforms.uSharpness.value = phase === 'racing' ? 0.44 : 0.32;
-    opticsPass.renderToScreen = true;
-    comp.addPass(opticsPass);
-    opticsPassRef.current = opticsPass;
+      const opticsPass = new ShaderPass(MotorsportOpticsShader);
+      opticsPass.uniforms.uResolution.value.set(physW, physH);
+      opticsPass.uniforms.uSharpness.value = phase === 'racing' ? 0.42 : 0.30;
+      opticsPass.renderToScreen = true;
+      comp.addPass(opticsPass);
+      opticsPassRef.current = opticsPass;
 
-    return comp;
+      return comp;
+    } catch {
+      return null;
+    }
   }, [gl, scene, camera, isSoftwareGl, isMobile]);
 
   useEffect(() => {
@@ -185,14 +198,14 @@ export const PostProcessingEffects: React.FC<PostProcessingEffectsProps> = ({
   useEffect(() => {
     if (bloomPassRef.current) {
       bloomPassRef.current.strength =
-        preset === 'night' ? 0.34 : preset === 'sunset' ? 0.16 : 0.10;
+        preset === 'night' ? 0.32 : preset === 'sunset' ? 0.14 : 0.08;
       bloomPassRef.current.threshold =
-        preset === 'night' ? 0.86 : preset === 'sunset' ? 0.96 : 1.04;
+        preset === 'night' ? 0.85 : preset === 'sunset' ? 0.94 : 0.98;
     }
     if (opticsPassRef.current) {
       opticsPassRef.current.uniforms.uPresetMode.value =
         preset === 'sunset' ? 0.0 : preset === 'night' ? 1.0 : 2.0;
-      opticsPassRef.current.uniforms.uSharpness.value = phase === 'racing' ? 0.44 : 0.32;
+      opticsPassRef.current.uniforms.uSharpness.value = phase === 'racing' ? 0.42 : 0.30;
     }
   }, [preset, phase]);
 
@@ -209,11 +222,13 @@ export const PostProcessingEffects: React.FC<PostProcessingEffectsProps> = ({
     const prevBackground = scene.background;
     const prevFog = scene.fog;
 
-    // 1. PASS 1: Render World Buffer (Layer 0 — Circuit, Terrain, Sky, Grandstands, Splines, Smoke)
+    // 1. PASS 1: Render World Buffer (Layer 0 — Circuit Road, Terrain, Sky, Grandstands, Splines, Smoke)
     camera.layers.set(WORLD_RENDER_LAYER);
-    if (worldComposer && !isSoftwareGl) {
+    if (worldComposer && !isSoftwareGl && !isMobile) {
       worldComposer.render();
     } else {
+      // Direct native hardware MSAA framebuffer pass on Android/iOS & fallback GPUs:
+      // 100% guaranteed road visibility + full native retina sharpness
       gl.setRenderTarget(null);
       gl.autoClear = true;
       gl.clear(true, true, true);

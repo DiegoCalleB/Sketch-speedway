@@ -41,6 +41,8 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
 }) => {
   const shakeRef = useRef<number>(0);
   const prevBounceCooldown = useRef<number>(0);
+  const smoothLongGRef = useRef<number>(0);
+  const smoothLatGRef = useRef<number>(0);
   const currentLookAtRef = useRef<THREE.Vector3>(new THREE.Vector3(400, 250, 0));
   const currentUpRef = useRef<THREE.Vector3>(new THREE.Vector3(0, 1, 0));
   const initializedPhaseRef = useRef<string>('');
@@ -96,18 +98,33 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
     const focusSpeed = focusCar ? Math.hypot(focusCar.vx, focusCar.vy) : 0;
 
     if (focusCar) {
-      if (focusCar.bounceCooldown >= 12 && prevBounceCooldown.current < 12) {
-        shakeRef.current = 3.2;
+      if (focusCar.bounceCooldown >= 8 && prevBounceCooldown.current < 8) {
+        const impactSev = Math.max(0.28, focusCar.lastImpactSeverity ?? 0.55);
+        shakeRef.current = Math.max(shakeRef.current, 1.8 + impactSev * 3.8);
       }
       prevBounceCooldown.current = focusCar.bounceCooldown;
 
       if (focusCar.offTrack && focusSpeed > 1.2) {
         shakeRef.current = Math.max(shakeRef.current, 0.9);
+      } else if (focusCar.onCurb && focusSpeed > 1.4) {
+        shakeRef.current = Math.max(shakeRef.current, Math.min(0.62, 0.24 + focusSpeed * 0.06));
       } else if (focusCar.isDrifting) {
         shakeRef.current = Math.max(shakeRef.current, 0.35);
       } else if (cameraMode === 'onboard' && focusSpeed > 5.2) {
-        shakeRef.current = Math.max(shakeRef.current, 0.1);
+        shakeRef.current = Math.max(shakeRef.current, 0.12);
       }
+      smoothLongGRef.current = THREE.MathUtils.damp(
+        smoothLongGRef.current,
+        focusCar.longitudinalG ?? 0,
+        8.0,
+        dt
+      );
+      smoothLatGRef.current = THREE.MathUtils.damp(
+        smoothLatGRef.current,
+        focusCar.lateralG ?? 0,
+        7.5,
+        dt
+      );
     }
 
     shakeRef.current = THREE.MathUtils.damp(shakeRef.current, 0, 10, dt);
@@ -161,40 +178,52 @@ export const CameraDirector: React.FC<CameraDirectorProps> = ({
       const yaw = -focusCar.angle;
       const fwdX = Math.cos(yaw);
       const fwdY = Math.sin(yaw);
+      const sideX = -fwdY;
+      const sideY = fwdX;
       const carWorldX = focusCar.x;
       const carWorldY = 500 - focusCar.y;
       const carWorldZ = carSurf.elevationZ + 0.15;
 
+      // Subtle G-force helmet inertia & apex look-ahead in T-Cam Onboard
+      const longOffset = THREE.MathUtils.clamp(-smoothLongGRef.current * 0.16, -0.35, 0.45);
+      const apexLook = THREE.MathUtils.clamp(-smoothLatGRef.current * 1.4, -4.5, 4.5);
+      const pitchDip = THREE.MathUtils.clamp(smoothLongGRef.current * 0.08, -0.32, 0.18);
+
       _desiredPos.set(
-        carWorldX - fwdX * 1.6,
-        carWorldY - fwdY * 1.6,
-        carWorldZ + 4.35
+        carWorldX - fwdX * (1.6 - longOffset),
+        carWorldY - fwdY * (1.6 - longOffset),
+        carWorldZ + 4.35 + pitchDip * 0.4
       );
       _desiredLookAt.set(
-        carWorldX + fwdX * 52,
-        carWorldY + fwdY * 52,
-        carWorldZ + 1.85
+        carWorldX + fwdX * 52 + sideX * apexLook,
+        carWorldY + fwdY * 52 + sideY * apexLook,
+        carWorldZ + 1.85 + pitchDip
       );
-      _desiredUp.set(0, 0, 1);
+      _desiredUp.set(sideX * THREE.MathUtils.clamp(smoothLatGRef.current * 0.012, -0.045, 0.045), sideY * THREE.MathUtils.clamp(smoothLatGRef.current * 0.012, -0.045, 0.045), 1).normalize();
     } else if (cameraMode === 'chase' && focusCar) {
       const carSurf = getTrackSurfaceInfo({ x: focusCar.x, y: focusCar.y }, track);
       const yaw = -focusCar.angle - (focusCar.slipAngle ?? 0) * 0.45;
       const fwdX = Math.cos(yaw);
       const fwdY = Math.sin(yaw);
+      const sideX = -fwdY;
+      const sideY = fwdX;
       const carWorldX = focusCar.x;
       const carWorldY = 500 - focusCar.y;
       const carWorldZ = carSurf.elevationZ + 0.15;
 
-      const trailDist = 22.0 + focusSpeed * 1.3;
+      // Dynamic G-force spring-back: pulls back slightly under hard acceleration/DRS, leans closer under 5G braking
+      const gTrailLag = THREE.MathUtils.clamp(smoothLongGRef.current * 1.15, -2.4, 2.8);
+      const latSwing = THREE.MathUtils.clamp(-smoothLatGRef.current * 0.72, -3.2, 3.2);
+      const trailDist = 21.8 + focusSpeed * 1.32 + gTrailLag;
       _desiredPos.set(
-        carWorldX - fwdX * trailDist,
-        carWorldY - fwdY * trailDist,
-        carWorldZ + 8.8 + focusSpeed * 0.3
+        carWorldX - fwdX * trailDist + sideX * latSwing,
+        carWorldY - fwdY * trailDist + sideY * latSwing,
+        carWorldZ + 8.7 + focusSpeed * 0.28
       );
       _desiredLookAt.set(
-        carWorldX + fwdX * 34,
-        carWorldY + fwdY * 34,
-        carWorldZ + 2.4
+        carWorldX + fwdX * 34 - sideX * latSwing * 0.65,
+        carWorldY + fwdY * 34 - sideY * latSwing * 0.65,
+        carWorldZ + 2.35
       );
       _desiredUp.set(0, 0, 1);
     } else if (cameraMode === 'circuit') {

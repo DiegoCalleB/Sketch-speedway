@@ -45,8 +45,8 @@ export default function App() {
   };
 
   return (
-    <div className="min-h-dvh bg-slate-950 text-slate-100 pt-safe pb-safe px-safe sm:py-5 sm:px-6 md:py-6 md:px-8 flex flex-col items-center justify-start gap-3 sm:gap-6 font-sans">
-      <div className="w-full max-w-5xl flex flex-col gap-3 sm:gap-6">
+    <div className="min-h-dvh bg-slate-950 text-slate-100 pt-safe pb-safe px-2 sm:py-3 sm:px-5 md:py-4 md:px-6 flex flex-col items-center justify-start gap-2 sm:gap-3 font-sans">
+      <div className="w-full max-w-5xl flex flex-col gap-2 sm:gap-3">
         <GameUI
           phase={phase}
           tracks={TRACKS}
@@ -81,9 +81,11 @@ export default function App() {
           />
         )}
 
-        <div className="text-center text-[11px] text-slate-500 font-mono mt-1 pb-2" id="footer-credits">
-          Draw Race · Campeonato F1 3D · Android & iPhone Ready
-        </div>
+        {phase === 'menu' && (
+          <div className="text-center text-[10px] text-slate-500 font-mono pb-1" id="footer-credits">
+            Draw Race · Campeonato F1 3D · Android & iPhone Ready
+          </div>
+        )}
       </div>
 
       <OfflineIndicator />

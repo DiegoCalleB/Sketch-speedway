@@ -16,5 +16,6 @@ export const haptics = {
   countdownTick: () => vibrate(22),
   countdownGo: () => vibrate([35, 30, 55]),
   finishLap: () => vibrate([25, 35, 25]),
-  errorBuzz: () => vibrate([40, 25, 40])
+  errorBuzz: () => vibrate([40, 25, 40]),
+  collisionImpact: () => vibrate([45, 20, 65])
 };

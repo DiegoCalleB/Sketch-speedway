@@ -2,13 +2,14 @@ import React, { useEffect, useMemo, useRef } from 'react';
 import { useThree, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 
-import { RaceCarState } from '../../types';
+import { RaceCarState, WeatherCondition } from '../../types';
 import { CARS_RENDER_LAYER } from './renderLayers';
 
 export type LightingPreset = 'day' | 'sunset' | 'night';
 
 interface SceneAtmosphereProps {
   preset?: LightingPreset;
+  weather?: WeatherCondition;
   shadowFocus?: [number, number];
   carsStateRef?: React.MutableRefObject<RaceCarState[]>;
   focusedPlayerId?: string | null;
@@ -18,8 +19,9 @@ interface SceneAtmosphereProps {
 
 // High-contrast HDR-style Studio/Autodrome IBL Environment Scene for PMREMGenerator
 // Produces rich, crisp reflections across metallic-flake car paint, carbon fiber, chrome visors, and wet tarmac
-const createAutodromeEnvironmentScene = (preset: LightingPreset) => {
+const createAutodromeEnvironmentScene = (preset: LightingPreset, weather: WeatherCondition = 'dry') => {
   const envScene = new THREE.Scene();
+  const isRain = weather === 'rain';
 
   const skyGeo = new THREE.SphereGeometry(90, 32, 16);
   const skyCanvas = document.createElement('canvas');
@@ -29,17 +31,17 @@ const createAutodromeEnvironmentScene = (preset: LightingPreset) => {
   if (ctx) {
     const grad = ctx.createLinearGradient(0, 0, 0, 256);
     if (preset === 'day') {
-      grad.addColorStop(0.0, '#103468');
-      grad.addColorStop(0.28, '#2b6cb0');
-      grad.addColorStop(0.50, '#8cc4f8');
-      grad.addColorStop(0.62, '#eef6ff');
-      grad.addColorStop(0.69, '#394a36');
-      grad.addColorStop(1.0, '#182018');
+      grad.addColorStop(0.0, isRain ? '#0f2342' : '#103468');
+      grad.addColorStop(0.28, isRain ? '#264973' : '#2b6cb0');
+      grad.addColorStop(0.50, isRain ? '#648cb8' : '#8cc4f8');
+      grad.addColorStop(0.62, isRain ? '#cbd5e1' : '#eef6ff');
+      grad.addColorStop(0.69, '#2b3a2c');
+      grad.addColorStop(1.0, '#121914');
     } else if (preset === 'sunset') {
       grad.addColorStop(0.0, '#0f2140');
       grad.addColorStop(0.26, '#284a78');
-      grad.addColorStop(0.48, '#7398c4');
-      grad.addColorStop(0.60, '#fbe0a8');
+      grad.addColorStop(0.48, isRain ? '#527196' : '#7398c4');
+      grad.addColorStop(0.60, isRain ? '#d6c3a5' : '#fbe0a8');
       grad.addColorStop(0.68, '#2b3330');
       grad.addColorStop(1.0, '#141918');
     } else {
@@ -62,27 +64,41 @@ const createAutodromeEnvironmentScene = (preset: LightingPreset) => {
   skyMesh.rotation.x = Math.PI / 2;
   envScene.add(skyMesh);
 
-  // High-luminance Solar Disc for razor-sharp clearcoat highlights on F1 bodywork
+  // High-luminance Solar Disc + Soft Atmospheric Corona for razor-sharp clearcoat highlights on F1 bodywork
   const sunColor =
-    preset === 'day' ? '#ffffff' : preset === 'sunset' ? '#fff4d4' : '#cceeff';
-  const sunGeo = new THREE.SphereGeometry(8.5, 16, 16);
+    preset === 'day' ? '#fffef5' : preset === 'sunset' ? '#ffe8b6' : '#cceeff';
+  const sunGeo = new THREE.SphereGeometry(7.5, 16, 16);
   const sunMat = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(sunColor).multiplyScalar(preset === 'night' ? 2.6 : 3.4)
+    color: new THREE.Color(sunColor).multiplyScalar(
+      preset === 'night' ? 3.1 : isRain ? 3.5 : 4.2
+    )
   });
   const sunCard = new THREE.Mesh(sunGeo, sunMat);
   sunCard.position.set(50, 36, preset === 'sunset' ? 22 : 44);
   envScene.add(sunCard);
 
+  const coronaGeo = new THREE.SphereGeometry(16, 16, 16);
+  const coronaMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(
+      preset === 'day' ? '#e0f2fe' : preset === 'sunset' ? '#fcd34d' : '#38bdf8'
+    ).multiplyScalar(preset === 'night' ? 0.9 : 1.35),
+    transparent: true,
+    opacity: 0.45
+  });
+  const coronaCard = new THREE.Mesh(coronaGeo, coronaMat);
+  coronaCard.position.copy(sunCard.position);
+  envScene.add(coronaCard);
+
   // Overhead Softbox Reflection Strips (emulates sunlit cloud decks / stadium floodlight banks)
-  const stripGeo = new THREE.BoxGeometry(42, 4.2, 0.5);
+  const stripGeo = new THREE.BoxGeometry(44, 4.8, 0.5);
   const stripMat1 = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(preset === 'night' ? '#a5f3fc' : '#ffffff').multiplyScalar(
-      preset === 'night' ? 2.4 : 1.9
+    color: new THREE.Color(preset === 'night' || isRain ? '#a5f3fc' : '#ffffff').multiplyScalar(
+      preset === 'night' || isRain ? 2.85 : 2.15
     )
   });
   const stripMat2 = new THREE.MeshBasicMaterial({
-    color: new THREE.Color(preset === 'night' ? '#38bdf8' : '#e0f2fe').multiplyScalar(
-      preset === 'night' ? 2.0 : 1.45
+    color: new THREE.Color(preset === 'night' || isRain ? '#38bdf8' : '#e0f2fe').multiplyScalar(
+      preset === 'night' || isRain ? 2.4 : 1.55
     )
   });
 
@@ -93,12 +109,36 @@ const createAutodromeEnvironmentScene = (preset: LightingPreset) => {
     envScene.add(strip);
   }
 
-  // Horizon Light Ring for crisp sidepod reflections
+  // Warm/Cool Coastal Horizon Bounce Panels for sculpted metallic sidepod reflections
+  const bounceGeo = new THREE.PlaneGeometry(58, 14);
+  const warmBounceMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(
+      preset === 'day' ? '#fef3c7' : preset === 'sunset' ? '#fdba74' : '#0ea5e9'
+    ).multiplyScalar(preset === 'night' ? 1.4 : 1.15),
+    side: THREE.DoubleSide
+  });
+  const coolBounceMat = new THREE.MeshBasicMaterial({
+    color: new THREE.Color(
+      preset === 'day' ? '#7dd3fc' : preset === 'sunset' ? '#93c5fd' : '#6366f1'
+    ).multiplyScalar(preset === 'night' ? 1.35 : 0.95),
+    side: THREE.DoubleSide
+  });
+  const warmPanel = new THREE.Mesh(bounceGeo, warmBounceMat);
+  warmPanel.position.set(55, -28, 12);
+  warmPanel.lookAt(0, 0, 0);
+  envScene.add(warmPanel);
+
+  const coolPanel = new THREE.Mesh(bounceGeo, coolBounceMat);
+  coolPanel.position.set(-55, 28, 14);
+  coolPanel.lookAt(0, 0, 0);
+  envScene.add(coolPanel);
+
+  // Horizon Light Ring for crisp sidepod specular sweep
   const horizonGeo = new THREE.TorusGeometry(62, 1.8, 8, 32);
   const horizonMat = new THREE.MeshBasicMaterial({
     color: new THREE.Color(
       preset === 'day' ? '#dbeafe' : preset === 'sunset' ? '#fde68a' : '#38bdf8'
-    ).multiplyScalar(preset === 'night' ? 1.5 : 1.1)
+    ).multiplyScalar(preset === 'night' || isRain ? 1.85 : 1.2)
   });
   const horizonRing = new THREE.Mesh(horizonGeo, horizonMat);
   horizonRing.position.set(0, 0, 4);
@@ -110,9 +150,14 @@ const createAutodromeEnvironmentScene = (preset: LightingPreset) => {
       skyGeo.dispose();
       sunGeo.dispose();
       sunMat.dispose();
+      coronaGeo.dispose();
+      coronaMat.dispose();
       stripGeo.dispose();
       stripMat1.dispose();
       stripMat2.dispose();
+      bounceGeo.dispose();
+      warmBounceMat.dispose();
+      coolBounceMat.dispose();
       horizonGeo.dispose();
       horizonMat.dispose();
       envTex.dispose();
@@ -132,6 +177,7 @@ const AtmosphericSkyShader = {
   fragmentShader: `
     uniform float uTime;
     uniform float uPreset; // 0 = day, 1 = sunset, 2 = night
+    uniform float uWeather; // 0 = dry, 1 = rain
     uniform vec3 uSunDir;
     varying vec3 vWorldDir;
 
@@ -178,22 +224,22 @@ const AtmosphericSkyShader = {
 
       if (uPreset < 0.5) {
         // Crisp Natural European / Coastal GP Daylight
-        zenithCol = vec3(0.06, 0.21, 0.48);
-        midCol = vec3(0.22, 0.49, 0.80);
-        horizonCol = vec3(0.76, 0.87, 0.96);
+        zenithCol = mix(vec3(0.06, 0.21, 0.48), vec3(0.11, 0.19, 0.30), uWeather * 0.65);
+        midCol = mix(vec3(0.22, 0.49, 0.80), vec3(0.26, 0.37, 0.50), uWeather * 0.65);
+        horizonCol = mix(vec3(0.76, 0.87, 0.96), vec3(0.56, 0.66, 0.76), uWeather * 0.6);
         groundCol = vec3(0.18, 0.24, 0.16);
         sunCol = vec3(1.0, 0.98, 0.92);
-        cloudBright = vec3(1.0, 0.99, 0.97);
-        cloudShadow = vec3(0.56, 0.66, 0.78);
+        cloudBright = mix(vec3(1.0, 0.99, 0.97), vec3(0.78, 0.84, 0.90), uWeather * 0.55);
+        cloudShadow = mix(vec3(0.56, 0.66, 0.78), vec3(0.26, 0.34, 0.44), uWeather * 0.7);
       } else if (uPreset < 1.5) {
         // GTA VI Golden-Hour Vice Coast (Rich Indigo Zenith to Champagne Gold Horizon, ZERO red tint)
         zenithCol = vec3(0.07, 0.15, 0.30);
-        midCol = vec3(0.26, 0.42, 0.62);
-        horizonCol = vec3(0.95, 0.82, 0.60);
+        midCol = mix(vec3(0.26, 0.42, 0.62), vec3(0.22, 0.32, 0.46), uWeather * 0.6);
+        horizonCol = mix(vec3(0.95, 0.82, 0.60), vec3(0.68, 0.64, 0.58), uWeather * 0.55);
         groundCol = vec3(0.15, 0.19, 0.17);
         sunCol = vec3(1.0, 0.92, 0.72);
-        cloudBright = vec3(1.0, 0.91, 0.74);
-        cloudShadow = vec3(0.38, 0.46, 0.60);
+        cloudBright = mix(vec3(1.0, 0.91, 0.74), vec3(0.80, 0.76, 0.68), uWeather * 0.5);
+        cloudShadow = mix(vec3(0.38, 0.46, 0.60), vec3(0.22, 0.28, 0.38), uWeather * 0.65);
       } else {
         // Floodlit Night Grand Prix
         zenithCol = vec3(0.01, 0.02, 0.06);
@@ -201,7 +247,7 @@ const AtmosphericSkyShader = {
         horizonCol = vec3(0.10, 0.18, 0.30);
         groundCol = vec3(0.03, 0.05, 0.09);
         sunCol = vec3(0.76, 0.90, 1.0);
-        cloudBright = vec3(0.14, 0.24, 0.38);
+        cloudBright = vec3(0.16, 0.26, 0.40);
         cloudShadow = vec3(0.03, 0.05, 0.10);
       }
 
@@ -215,31 +261,49 @@ const AtmosphericSkyShader = {
       // Mie Solar Scattering Halo & Crisp Sun Disk
       vec3 sunDir = normalize(uSunDir);
       float sunDot = max(dot(dir, sunDir), 0.0);
-      float mieGlow = pow(sunDot, 10.0) * (uPreset < 1.5 ? 0.38 : 0.14);
-      float sunCorona = pow(sunDot, 120.0) * (uPreset < 1.5 ? 0.95 : 0.45);
-      float sunDisk = smoothstep(0.9985, 0.9994, sunDot) * (uPreset < 1.5 ? 2.2 : 1.2);
+      float sunVis = 1.0 - uWeather * 0.52;
+      float mieGlow = pow(sunDot, 10.0) * (uPreset < 1.5 ? 0.38 : 0.14) * sunVis;
+      float sunCorona = pow(sunDot, 120.0) * (uPreset < 1.5 ? 0.95 : 0.45) * sunVis;
+      float sunDisk = smoothstep(0.9985, 0.9994, sunDot) * (uPreset < 1.5 ? 2.2 : 1.2) * sunVis;
       sky += sunCol * (mieGlow + sunCorona + sunDisk) * smoothstep(-0.04, 0.06, elev);
 
-      // Animated Volumetric Cumulus Cloud Deck projected onto upper sky plane
+      // Animated Volumetric Cumulus / Storm Cloud Deck + Crepuscular Solar God-Rays (Light Shafts)
       if (elev > 0.02) {
-        vec2 cloudUv = dir.xy / (elev + 0.18) * 1.45 + vec2(uTime * 0.008, uTime * 0.003);
+        vec2 cloudUv = dir.xy / (elev + 0.18) * 1.45 + vec2(uTime * 0.011, uTime * 0.004);
         float c1 = fbm(cloudUv);
-        float c2 = fbm(cloudUv * 2.1 - vec2(uTime * 0.012, 0.0));
-        float cloudDensity = smoothstep(0.47, 0.78, c1 * 0.75 + c2 * 0.28);
+        float c2 = fbm(cloudUv * 2.1 - vec2(uTime * 0.016, 0.0));
+        float lowThresh = mix(0.47, 0.30, uWeather);
+        float highThresh = mix(0.78, 0.68, uWeather);
+        float cloudDensity = smoothstep(lowThresh, highThresh, c1 * 0.75 + c2 * 0.28);
+
+        // High-altitude wispy cirrus ice clouds above the cumulus deck
+        float cirrus = smoothstep(0.62, 0.88, fbm(cloudUv * 0.65 + vec2(12.4, -uTime * 0.005)));
+        sky = mix(sky, mix(cloudBright, sunCol, 0.35), cirrus * 0.24 * smoothstep(0.15, 0.65, elev));
 
         // Directional self-shadowing on clouds toward sun
         float litSample = fbm(cloudUv + sunDir.xy * 0.08);
         float cloudLight = clamp(0.45 + (c1 - litSample) * 2.4 + sunDot * 0.45, 0.0, 1.0);
         vec3 cloudCol = mix(cloudShadow, cloudBright, cloudLight);
         // Silver lining near sun
-        cloudCol += sunCol * pow(sunDot, 8.0) * 0.35 * (1.0 - cloudDensity * 0.4);
+        cloudCol += sunCol * pow(sunDot, 7.0) * 0.48 * (1.0 - cloudDensity * 0.35);
 
         float horizonFade = smoothstep(0.02, 0.22, elev) * (1.0 - smoothstep(0.75, 0.98, elev) * 0.35);
-        sky = mix(sky, cloudCol, cloudDensity * horizonFade * (uPreset > 1.5 ? 0.42 : 0.78));
+        float maxCloudAlpha = mix(uPreset > 1.5 ? 0.42 : 0.78, 0.92, uWeather);
+        sky = mix(sky, cloudCol, cloudDensity * horizonFade * maxCloudAlpha);
+
+        // Crepuscular Volumetric Solar God-Rays (Light Shafts) streaming through cloud gaps
+        if (uPreset < 1.5 && sunDot > 0.35) {
+          vec2 rayUv1 = cloudUv - sunDir.xy * 0.14;
+          vec2 rayUv2 = cloudUv - sunDir.xy * 0.28;
+          float gap1 = 1.0 - smoothstep(lowThresh, highThresh, fbm(rayUv1));
+          float gap2 = 1.0 - smoothstep(lowThresh, highThresh, fbm(rayUv2));
+          float godRay = (gap1 * 0.55 + gap2 * 0.45) * (1.0 - cloudDensity * 0.65) * pow(sunDot, 5.5);
+          sky += sunCol * godRay * (uPreset > 0.5 ? 0.46 : 0.32) * sunVis;
+        }
       }
 
-      // Crisp Twinkling Starfield in Night Grand Prix mode
-      if (uPreset > 1.5 && elev > 0.08) {
+      // Crisp Twinkling Starfield in Night Grand Prix mode (partially veiled by storm clouds in rain)
+      if (uPreset > 1.5 && elev > 0.08 && uWeather < 0.5) {
         vec2 starGrid = floor(dir.xy / (elev + 0.25) * 240.0);
         float starVal = hash(starGrid);
         if (starVal > 0.994) {
@@ -255,6 +319,7 @@ const AtmosphericSkyShader = {
 
 export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
   preset = 'day',
+  weather = 'dry',
   shadowFocus = [400, 250],
   carsStateRef,
   focusedPlayerId = null,
@@ -275,13 +340,14 @@ export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
       sunRef.current.layers.enable(CARS_RENDER_LAYER);
       sunRef.current.shadow.camera.layers.enable(CARS_RENDER_LAYER);
     }
-  }, [preset, shadowMapSize]);
+  }, [preset, weather, shadowMapSize]);
 
   const skyMaterial = useMemo(() => {
     return new THREE.ShaderMaterial({
       uniforms: {
         uTime: { value: 0 },
         uPreset: { value: preset === 'day' ? 0.0 : preset === 'sunset' ? 1.0 : 2.0 },
+        uWeather: { value: weather === 'rain' ? 1.0 : 0.0 },
         uSunDir: { value: new THREE.Vector3(0.65, 0.45, 0.6).normalize() }
       },
       vertexShader: AtmosphericSkyShader.vertexShader,
@@ -295,7 +361,8 @@ export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
   useEffect(() => {
     skyMaterial.uniforms.uPreset.value =
       preset === 'day' ? 0.0 : preset === 'sunset' ? 1.0 : 2.0;
-  }, [preset, skyMaterial]);
+    skyMaterial.uniforms.uWeather.value = weather === 'rain' ? 1.0 : 0.0;
+  }, [preset, weather, skyMaterial]);
 
   useEffect(() => {
     return () => {
@@ -310,18 +377,25 @@ export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
 
     const pmremGenerator = new THREE.PMREMGenerator(gl);
     pmremGenerator.compileEquirectangularShader();
-    const { envScene, dispose: disposeEnvScene } = createAutodromeEnvironmentScene(preset);
+    const { envScene, dispose: disposeEnvScene } = createAutodromeEnvironmentScene(preset, weather);
     const envRT = pmremGenerator.fromScene(envScene, 0.025);
 
     scene.environment = envRT.texture;
 
+    const isRain = weather === 'rain';
     const fogColor =
-      preset === 'day' ? '#c5dcef' : preset === 'sunset' ? '#cad2dc' : '#091224';
+      preset === 'day'
+        ? isRain
+          ? '#94adc4'
+          : '#c5dcef'
+        : preset === 'sunset'
+          ? isRain
+            ? '#9aa8b8'
+            : '#cad2dc'
+          : '#091224';
     scene.background = new THREE.Color(fogColor);
-    scene.fog = new THREE.FogExp2(
-      fogColor,
-      preset === 'day' ? 0.00032 : preset === 'sunset' ? 0.00038 : 0.00046
-    );
+    const baseFog = preset === 'day' ? 0.00032 : preset === 'sunset' ? 0.00038 : 0.00046;
+    scene.fog = new THREE.FogExp2(fogColor, isRain ? baseFog * 1.25 : baseFog);
 
     pmremGenerator.dispose();
     disposeEnvScene();
@@ -329,7 +403,7 @@ export const SceneAtmosphere: React.FC<SceneAtmosphereProps> = ({
     return () => {
       envRT.dispose();
     };
-  }, [gl, scene, preset]);
+  }, [gl, scene, preset, weather]);
 
   useFrame((state, delta) => {
     const elapsed = state.clock.getElapsedTime();

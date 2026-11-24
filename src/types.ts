@@ -135,6 +135,19 @@ export interface RaceCarState {
   lateralG?: number;        // cornering lateral G-force (-4.5 to +4.5)
   throttle?: number;        // 0..1 driver throttle application
   brake?: number;           // 0..1 driver brake pressure
+  tireTemp?: number;        // °C Pirelli thermal grip window (78..126°C, peak 95..108°C)
+  gear?: number;            // 1..8 sequential F1 gearbox ratio
+  onCurb?: boolean;         // true when wheels ride over serrated FIA rumble kerbs
+  shiftKick?: number;       // 0..1 transient torque pulse on sequential gear upshifts
+  // Soft-Body Crash & Structural Deformation State (0.0 = pristine -> 1.0 = heavily crumpled/dented)
+  damageFront?: number;     // Nosecone & front wing crumple / droop
+  damageRear?: number;      // Rear wing & diffuser crush / tilt
+  damageLeft?: number;      // Left sidepod & suspension caved-in dent
+  damageRight?: number;     // Right sidepod & suspension caved-in dent
+  chassisHealth?: number;   // 100% down to 25% overall structural integrity
+  lastImpactSeverity?: number; // 0..1 transient shock impulse from latest barrier/car crash
+  lastImpactZone?: 'front' | 'rear' | 'left' | 'right' | null;
+  lastImpactPos?: { x: number; y: number } | null;
 }
 
 export interface Particle {
@@ -147,7 +160,22 @@ export interface Particle {
   alpha: number;
   life: number;
   maxLife: number;
+  // Optional 3D solid carbon-fiber debris chunk or water spray plume kinematics
+  kind?: 'smoke' | 'spark' | 'debris' | 'spray';
+  z?: number;
+  vz?: number;
+  rotX?: number;
+  rotY?: number;
+  rotZ?: number;
+  vRotX?: number;
+  vRotY?: number;
+  vRotZ?: number;
 }
 
+export type LightingPreset = 'day' | 'sunset' | 'night';
+
+export type WeatherCondition = 'dry' | 'rain';
+
 export type GamePhase = 'menu' | 'car_selection' | 'drawing' | 'racing' | 'results';
+
 

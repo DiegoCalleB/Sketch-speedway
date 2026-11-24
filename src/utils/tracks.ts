@@ -137,24 +137,14 @@ function generateTrack2Points(): { outer: TrackPoint[]; inner: TrackPoint[] } {
 
 const track2Points = generateTrack2Points();
 
-// Track 3: Grand Prix Technical Circuit (Hard) — fits cleanly within [65..735] x [55..445]
-function generateTrack3Points(): { outer: TrackPoint[]; inner: TrackPoint[] } {
-  const centerlineKeypoints: TrackPoint[] = [
-    { x: 155, y: 155 },
-    { x: 380, y: 135 },
-    { x: 485, y: 195 },
-    { x: 655, y: 145 },
-    { x: 675, y: 345 },
-    { x: 535, y: 315 },
-    { x: 440, y: 385 },
-    { x: 330, y: 290 },
-    { x: 225, y: 375 },
-    { x: 125, y: 335 }
-  ];
-
-  const smoothCenterline: TrackPoint[] = [];
+function buildSplineTrack(
+  centerlineKeypoints: TrackPoint[],
+  halfWidth: number = 36,
+  targetCount: number = 112
+): { outer: TrackPoint[]; inner: TrackPoint[] } {
+  const denseCenterline: TrackPoint[] = [];
   const len = centerlineKeypoints.length;
-  const subSteps = 10;
+  const subSteps = 20;
 
   for (let i = 0; i < len; i++) {
     const p0 = centerlineKeypoints[(i - 1 + len) % len];
@@ -180,25 +170,79 @@ function generateTrack3Points(): { outer: TrackPoint[]; inner: TrackPoint[] } {
           (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
           (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3);
 
-      smoothCenterline.push({ x, y });
+      denseCenterline.push({ x, y });
     }
+  }
+
+  // Apply gentle Laplacian smoothing pass on dense centerline to prevent high-frequency curvature spikes
+  let smoothedDense = denseCenterline;
+  for (let pass = 0; pass < 3; pass++) {
+    const nDense = smoothedDense.length;
+    smoothedDense = smoothedDense.map((pt, idx) => {
+      const prev = smoothedDense[(idx - 1 + nDense) % nDense];
+      const next = smoothedDense[(idx + 1) % nDense];
+      return {
+        x: pt.x * 0.5 + (prev.x + next.x) * 0.25,
+        y: pt.y * 0.5 + (prev.y + next.y) * 0.25
+      };
+    });
+  }
+
+  // Resample closed loop to uniform arc-length steps (targetCount vertices)
+  const denseLen = smoothedDense.length;
+  const cumArc: number[] = [0];
+  let totalArc = 0;
+  for (let i = 0; i < denseLen; i++) {
+    const curr = smoothedDense[i];
+    const next = smoothedDense[(i + 1) % denseLen];
+    totalArc += Math.hypot(next.x - curr.x, next.y - curr.y);
+    cumArc.push(totalArc);
+  }
+
+  const uniformCenterline: TrackPoint[] = [];
+  let segIdx = 0;
+  for (let k = 0; k < targetCount; k++) {
+    const targetDist = (k / targetCount) * totalArc;
+    while (segIdx < denseLen - 1 && cumArc[segIdx + 1] < targetDist) {
+      segIdx++;
+    }
+    const d0 = cumArc[segIdx];
+    const d1 = cumArc[segIdx + 1];
+    const ratio = d1 > d0 ? (targetDist - d0) / (d1 - d0) : 0;
+    const pA = smoothedDense[segIdx];
+    const pB = smoothedDense[(segIdx + 1) % denseLen];
+    uniformCenterline.push({
+      x: pA.x + (pB.x - pA.x) * ratio,
+      y: pA.y + (pB.y - pA.y) * ratio
+    });
+  }
+
+  // Compute smoothed normals across a window so tight hairpins never self-intersect on inner/outer boundaries
+  const rawNormals: TrackPoint[] = [];
+  for (let i = 0; i < targetCount; i++) {
+    const prev = uniformCenterline[(i - 2 + targetCount) % targetCount];
+    const next = uniformCenterline[(i + 2) % targetCount];
+    const tx = next.x - prev.x;
+    const ty = next.y - prev.y;
+    const tLen = Math.hypot(tx, ty) || 1;
+    rawNormals.push({ x: ty / tLen, y: -tx / tLen });
   }
 
   const outer: TrackPoint[] = [];
   const inner: TrackPoint[] = [];
-  const total = smoothCenterline.length;
-  const halfWidth = 44;
 
-  for (let i = 0; i < total; i++) {
-    const prev = smoothCenterline[(i - 1 + total) % total];
-    const curr = smoothCenterline[i];
-    const next = smoothCenterline[(i + 1) % total];
-
-    const tx = next.x - prev.x;
-    const ty = next.y - prev.y;
-    const tLen = Math.hypot(tx, ty) || 1;
-    const nx = ty / tLen;
-    const ny = -tx / tLen;
+  for (let i = 0; i < targetCount; i++) {
+    let sx = 0;
+    let sy = 0;
+    for (let w = -2; w <= 2; w++) {
+      const n = rawNormals[(i + w + targetCount) % targetCount];
+      sx += n.x;
+      sy += n.y;
+    }
+    const sLen = Math.hypot(sx, sy) || 1;
+    const nx = sx / sLen;
+    const ny = sy / sLen;
+    const curr = uniformCenterline[i];
 
     outer.push({
       x: curr.x + nx * halfWidth,
@@ -213,9 +257,244 @@ function generateTrack3Points(): { outer: TrackPoint[]; inner: TrackPoint[] } {
   return { outer, inner };
 }
 
-const track3Points = generateTrack3Points();
+// Automatically build a 4-slot staggered F1 starting grid aligned with the track tangent behind startLineIdx
+function createAlignedStartGrid(
+  outer: TrackPoint[],
+  inner: TrackPoint[],
+  startLineIdx: number
+): { x: number; y: number; angle: number }[] {
+  const len = Math.min(outer.length, inner.length);
+  const centerAt = (idx: number): TrackPoint => {
+    const i = ((idx % len) + len) % len;
+    return {
+      x: (outer[i].x + inner[i].x) * 0.5,
+      y: (outer[i].y + inner[i].y) * 0.5
+    };
+  };
+
+  // Place the 4 grid slots at indices behind startLineIdx along the main straight
+  const slotConfigs = [
+    { offsetIdx: -2, lateralBias: -0.22 },
+    { offsetIdx: -3, lateralBias: 0.22 },
+    { offsetIdx: -4, lateralBias: -0.22 },
+    { offsetIdx: -5, lateralBias: 0.22 }
+  ];
+
+  const cStart = centerAt(startLineIdx - 4);
+  const cEnd = centerAt(startLineIdx + 1);
+  const straightAngle = Math.atan2(cEnd.y - cStart.y, cEnd.x - cStart.x);
+
+  return slotConfigs.map(({ offsetIdx, lateralBias }) => {
+    const idx = ((startLineIdx + offsetIdx) % len + len) % len;
+    const o = outer[idx];
+    const i = inner[idx];
+    const cx = (o.x + i.x) * 0.5;
+    const cy = (o.y + i.y) * 0.5;
+    const rx = (o.x - i.x) * 0.5;
+    const ry = (o.y - i.y) * 0.5;
+    return {
+      x: Number((cx + rx * lateralBias).toFixed(1)),
+      y: Number((cy + ry * lateralBias).toFixed(1)),
+      angle: Number(straightAngle.toFixed(3))
+    };
+  });
+}
+
+// Track 3: Templo de la Velocidad (Autodromo Nazionale Monza GP)
+// Authentic Italian GP pistol/boot silhouette: Long southern Rettifilo straight, Curva Grande on the west,
+// Roggia & Lesmo 1/2 at the north, diagonal Serraglio straight into Ascari, and iconic 180° Parabolica on the east
+const track3Points = buildSplineTrack(
+  [
+    { x: 535, y: 394 }, // Rettifilo Tribune start
+    { x: 345, y: 394 }, // Rettifilo Main Straight mid
+    { x: 168, y: 376 }, // Braking into Variante del Rettifilo
+    { x: 116, y: 272 }, // Curva Grande (Biassono)
+    { x: 158, y: 144 }, // Approach to Variante della Roggia
+    { x: 288, y: 114 }, // Curve di Lesmo 1
+    { x: 410, y: 136 }, // Curve di Lesmo 2
+    { x: 525, y: 184 }, // Discesa del Serraglio
+    { x: 642, y: 188 }, // Variante Ascari
+    { x: 692, y: 284 }, // Rettilineo Centrale into Parabolica entry
+    { x: 652, y: 380 }  // Curva Parabolica (Alboreto) 180° apex
+  ],
+  40,
+  112
+);
+
+// Track 4: Circuito del Jarama – RACE (Madrid)
+// Authentic Spanish GP layout: Long northern main straight past Torre del Jarama, Nuvolari & Fangio loop,
+// inward Varzi / Farina / Le Mans hairpin fold, Pegaso ramp, Ascari/Bugatti Esses, and María de Villota (Túnel) 180° turn
+const jaramaPoints = buildSplineTrack(
+  [
+    { x: 182, y: 122 }, // Salida Curva María de Villota -> Recta Principal
+    { x: 350, y: 118 }, // Recta Principal frente a Torre del Jarama
+    { x: 520, y: 122 }, // Final Recta Principal / Frenada Nuvolari
+    { x: 654, y: 142 }, // Curva Fangio (Noreste)
+    { x: 674, y: 218 }, // Bajada hacia Varzi
+    { x: 576, y: 244 }, // Horquilla Farina / Le Mans (pliegue interior característico del Jarama)
+    { x: 568, y: 312 }, // Salida Le Mans hacia Curva Hípica
+    { x: 654, y: 338 }, // Subida Rampa Pegaso (Sureste)
+    { x: 634, y: 396 }, // Coronación Pegaso hacia S de Ascari
+    { x: 492, y: 394 }, // Curva Portago
+    { x: 375, y: 340 }, // Ese de Bugatti (cresta)
+    { x: 238, y: 392 }, // Bajada Bugatti / Curva Monza
+    { x: 128, y: 336 }, // Curva María de Villota (Túnel)
+    { x: 118, y: 210 }  // Salida Túnel hacia Recta Principal
+  ],
+  40,
+  112
+);
+
+// Track 5: Madring F1 – Circuito de Madrid IFEMA (2026 Spanish GP)
+// Authentic IFEMA-Valdebebas dual-zone silhouette: Western IFEMA exhibition halls straight & 90° street corners,
+// fast northern Valdebebas highway stretch, wide semicircular banked "La Monumental" on the east, and technical return
+const madringPoints = buildSplineTrack(
+  [
+    { x: 128, y: 274 }, // Recta Principal IFEMA (Oeste)
+    { x: 134, y: 156 }, // Frenada Pabellón 1 IFEMA
+    { x: 238, y: 116 }, // Curva Avenida Partenón
+    { x: 338, y: 166 }, // Chicane técnica entre Pabellones IFEMA
+    { x: 448, y: 122 }, // Salida hacia enlace M-11 Valdebebas
+    { x: 588, y: 118 }, // Recta rápida de Valdebebas
+    { x: 682, y: 180 }, // Entrada a La Monumental (curva peraltada semicircular)
+    { x: 694, y: 280 }, // Ápice central de La Monumental (Este)
+    { x: 642, y: 382 }, // Salida de La Monumental
+    { x: 502, y: 390 }, // Sector rápido Valdebebas Sur
+    { x: 385, y: 334 }, // Enlazadas rápidas de retorno
+    { x: 254, y: 390 }, // Entrada a recinto ferial Sur
+    { x: 146, y: 364 }  // Última curva hacia Recta Principal IFEMA
+  ],
+  40,
+  112
+);
+
+// Track 6: Circuit de Monaco – Monte-Carlo
+// Authentic Principality street layout: Boulevard Albert Ier start straight, Sainte-Dévote (T1), uphill Beau Rivage
+// to Massenet & Casino Square, tight Mirabeau / Fairmont Hairpin / Portier fold, coastal Louis II Tunnel on the east,
+// Nouvelle Chicane, Tabac & Piscine complex along the southern yacht harbor, and La Rascasse hairpin
+const monacoPoints = buildSplineTrack(
+  [
+    { x: 146, y: 278 }, // Boulevard Albert Ier (Recta de Salida)
+    { x: 198, y: 168 }, // Sainte-Dévote (Curva 1) & subida Beau Rivage
+    { x: 314, y: 118 }, // Massenet
+    { x: 435, y: 116 }, // Place du Casino
+    { x: 508, y: 182 }, // Mirabeau & Horquilla Fairmont (pliegue interior)
+    { x: 615, y: 142 }, // Portier hacia la costa
+    { x: 686, y: 226 }, // Entrada Túnel Louis II (costa Este)
+    { x: 662, y: 340 }, // Salida del Túnel hacia el Puerto
+    { x: 550, y: 380 }, // Nouvelle Chicane
+    { x: 455, y: 332 }, // Curva Tabac (frente al puerto deportivo)
+    { x: 345, y: 390 }, // Complejo de la Piscina (Louis Chiron)
+    { x: 206, y: 388 }, // La Rascasse & Antony Noghès
+    { x: 140, y: 346 }  // Retorno a Boulevard Albert Ier
+  ],
+  40,
+  112
+);
 
 export const TRACKS: Track[] = [
+  {
+    id: 'jarama',
+    name: 'Circuito del Jarama – RACE',
+    difficulty: 'Medio',
+    description:
+      'Trazado histórico de Madrid con la recta principal frente a la Torre RACE, horquillas Farina/Le Mans, rampa Pegaso y bajada Bugatti.',
+    width: 800,
+    height: 500,
+    outerBoundary: jaramaPoints.outer,
+    innerBoundary: jaramaPoints.inner,
+    startGrid: createAlignedStartGrid(jaramaPoints.outer, jaramaPoints.inner, 8),
+    startLine: createGateAt(jaramaPoints.outer, jaramaPoints.inner, 8, 14),
+    checkpoints: [
+      createGateAt(jaramaPoints.outer, jaramaPoints.inner, 36, 14),
+      createGateAt(jaramaPoints.outer, jaramaPoints.inner, 64, 14),
+      createGateAt(jaramaPoints.outer, jaramaPoints.inner, 92, 14)
+    ],
+    trees: [
+      { x: 75, y: 65, size: 19, type: 'pine' },
+      { x: 730, y: 65, size: 19, type: 'pine' },
+      { x: 735, y: 435, size: 18, type: 'pine' },
+      { x: 70, y: 435, size: 18, type: 'pine' },
+      { x: 245, y: 235, size: 17, type: 'pine' },
+      { x: 385, y: 245, size: 16, type: 'pine' }
+    ],
+    grandstands: [
+      { x: 335, y: 30, width: 210, height: 15, angle: 0, title: 'TRIBUNA PRINCIPAL JARAMA · RACE' },
+      { x: 560, y: 474, width: 150, height: 14, angle: 0, title: 'GRADERÍO FARINA & PEGASO' }
+    ],
+    decorations: [
+      { x: 280, y: 225, type: 'flag', color: '#dc2626' },
+      { x: 140, y: 468, type: 'tent', color: '#f59e0b' },
+      { x: 685, y: 468, type: 'tent', color: '#ef4444' }
+    ]
+  },
+  {
+    id: 'madring',
+    name: 'Madring F1 – Madrid IFEMA',
+    difficulty: 'Difícil',
+    description:
+      'Circuito semiurbano del GP de España en IFEMA-Valdebebas con rápidas avenidas, chicanes entre pabellones y la curva peraltada La Monumental.',
+    width: 800,
+    height: 500,
+    outerBoundary: madringPoints.outer,
+    innerBoundary: madringPoints.inner,
+    startGrid: createAlignedStartGrid(madringPoints.outer, madringPoints.inner, 6),
+    startLine: createGateAt(madringPoints.outer, madringPoints.inner, 6, 14),
+    checkpoints: [
+      createGateAt(madringPoints.outer, madringPoints.inner, 34, 14),
+      createGateAt(madringPoints.outer, madringPoints.inner, 62, 14),
+      createGateAt(madringPoints.outer, madringPoints.inner, 90, 14)
+    ],
+    trees: [
+      { x: 65, y: 60, size: 18, type: 'leaf' },
+      { x: 735, y: 60, size: 18, type: 'leaf' },
+      { x: 735, y: 440, size: 18, type: 'pine' },
+      { x: 65, y: 440, size: 18, type: 'leaf' },
+      { x: 235, y: 265, size: 16, type: 'leaf' }
+    ],
+    grandstands: [
+      { x: 280, y: 30, width: 200, height: 15, angle: 0, title: 'PADDOCK CLUB IFEMA MADRID' },
+      { x: 580, y: 474, width: 175, height: 15, angle: 0, title: 'ARENA LA MONUMENTAL' }
+    ],
+    decorations: [
+      { x: 475, y: 245, type: 'flag', color: '#ec4899' },
+      { x: 200, y: 468, type: 'tent', color: '#38bdf8' },
+      { x: 535, y: 245, type: 'tent', color: '#f43f5e' }
+    ]
+  },
+  {
+    id: 'monaco',
+    name: 'Circuit de Monaco – Monte-Carlo',
+    difficulty: 'Difícil',
+    description:
+      'El legendario trazado urbano del Principado: Sainte-Dévote, Casino, horquilla Fairmont, el Túnel Louis II junto al puerto y la Piscina.',
+    width: 800,
+    height: 500,
+    outerBoundary: monacoPoints.outer,
+    innerBoundary: monacoPoints.inner,
+    startGrid: createAlignedStartGrid(monacoPoints.outer, monacoPoints.inner, 6),
+    startLine: createGateAt(monacoPoints.outer, monacoPoints.inner, 6, 14),
+    checkpoints: [
+      createGateAt(monacoPoints.outer, monacoPoints.inner, 34, 14),
+      createGateAt(monacoPoints.outer, monacoPoints.inner, 62, 14),
+      createGateAt(monacoPoints.outer, monacoPoints.inner, 90, 14)
+    ],
+    trees: [
+      { x: 65, y: 65, size: 19, type: 'leaf' },
+      { x: 735, y: 65, size: 19, type: 'leaf' },
+      { x: 265, y: 255, size: 17, type: 'leaf' },
+      { x: 545, y: 255, size: 16, type: 'pine' }
+    ],
+    grandstands: [
+      { x: 350, y: 28, width: 195, height: 15, angle: 0, title: 'PLACE DU CASINO · MONTE-CARLO' },
+      { x: 380, y: 475, width: 210, height: 15, angle: 0, title: 'YACHT CLUB & PISCINE HARBOR' }
+    ],
+    decorations: [
+      { x: 425, y: 255, type: 'flag', color: '#ef4444' },
+      { x: 135, y: 468, type: 'tent', color: '#f8fafc' },
+      { x: 665, y: 468, type: 'tent', color: '#dc2626' }
+    ]
+  },
   {
     id: 'oval',
     name: 'Circuito Óvalo de Iniciación',
@@ -302,37 +581,32 @@ export const TRACKS: Track[] = [
     name: 'Templo de la Velocidad',
     difficulty: 'Difícil',
     description:
-      'Horquillas de gran frenada, rectas de alta velocidad y chicanes técnicas donde entrar pasado penaliza gravemente.',
+      'Trazado clásico de Monza GP: larguísima recta Rettifilo, Curva Grande, Lesmo 1 y 2, bajada del Serraglio hacia Ascari y la mítica Parabólica.',
     width: 800,
     height: 500,
     outerBoundary: track3Points.outer,
     innerBoundary: track3Points.inner,
-    startGrid: [
-      { x: 255, y: 138, angle: 0 },
-      { x: 225, y: 156, angle: 0 },
-      { x: 195, y: 144, angle: 0 },
-      { x: 168, y: 164, angle: 0 }
-    ],
-    startLine: createGateAt(track3Points.outer, track3Points.inner, 7, 14),
+    startGrid: createAlignedStartGrid(track3Points.outer, track3Points.inner, 8),
+    startLine: createGateAt(track3Points.outer, track3Points.inner, 8, 14),
     checkpoints: [
-      createGateAt(track3Points.outer, track3Points.inner, 32, 14),
-      createGateAt(track3Points.outer, track3Points.inner, 55, 14),
-      createGateAt(track3Points.outer, track3Points.inner, 80, 14)
+      createGateAt(track3Points.outer, track3Points.inner, 36, 14),
+      createGateAt(track3Points.outer, track3Points.inner, 64, 14),
+      createGateAt(track3Points.outer, track3Points.inner, 92, 14)
     ],
     trees: [
       { x: 55, y: 55, size: 20, type: 'pine' },
       { x: 745, y: 60, size: 20, type: 'pine' },
       { x: 745, y: 440, size: 18, type: 'leaf' },
       { x: 55, y: 440, size: 18, type: 'pine' },
-      { x: 260, y: 235, size: 16, type: 'leaf' },
-      { x: 565, y: 235, size: 16, type: 'pine' }
+      { x: 260, y: 255, size: 16, type: 'leaf' },
+      { x: 485, y: 285, size: 16, type: 'pine' }
     ],
     grandstands: [
-      { x: 450, y: 32, width: 190, height: 15, angle: 0, title: 'TRIBUNA PRINCIPAL MONZA' },
-      { x: 380, y: 476, width: 120, height: 14, angle: 0, title: 'ZONA DE SOCIOS' }
+      { x: 410, y: 476, width: 210, height: 15, angle: 0, title: 'TRIBUNA CENTRALE RETTIFILO · MONZA' },
+      { x: 320, y: 30, width: 150, height: 14, angle: 0, title: 'CURVA DI LESMO & SERRAGLIO' }
     ],
     decorations: [
-      { x: 270, y: 78, type: 'flag', color: '#ef4444' },
+      { x: 350, y: 265, type: 'flag', color: '#ef4444' },
       { x: 100, y: 465, type: 'tent', color: '#f43f5e' }
     ]
   }
@@ -1022,23 +1296,27 @@ export function getPerfectLapGuide(
 
     const surf = getTrackSurfaceInfo(curr, track);
     const maxSafe = getMaxSafeCornerSpeed(localCurv, surf.trackCurvature, carGrip, true);
+    const isLowGripClass = carGrip < 0.07;
+    const gripCaution = isLowGripClass ? 0.90 : 0.975;
+    const minApexSpeed = isLowGripClass ? 2.40 : 2.60;
 
-    // Push 99% of the physical tire limit in corners and full 7.45 (343 km/h) on straights!
-    const targetV = localCurv < 0.0032 && surf.trackCurvature < 0.0042
+    // Push physical tire limit in corners and full 7.45 (343 km/h) on straights!
+    const targetV = localCurv < 0.0034 && surf.trackCurvature < 0.0044
       ? 7.45
-      : Math.max(3.35, Math.min(7.45, maxSafe * 0.99));
+      : Math.max(minApexSpeed, Math.min(7.45, maxSafe * gripCaution));
     rawMaxSpeeds.push(targetV);
   }
 
   // Backward pass (Late F1 Carbon-Ceramic Braking before corners) & Forward pass (Full-Throttle Exit)
   const finalSpeeds = [...rawMaxSpeeds];
+  const brakeRate = carGrip < 0.07 ? 0.072 : 0.086;
   for (let i = finalSpeeds.length - 2; i >= 0; i--) {
     const stepDist = Math.hypot(
       straightened[i + 1].x - straightened[i].x,
       straightened[i + 1].y - straightened[i].y
     );
     // Late F1 braking deceleration envelope
-    finalSpeeds[i] = Math.min(finalSpeeds[i], finalSpeeds[i + 1] + stepDist * 0.095);
+    finalSpeeds[i] = Math.min(finalSpeeds[i], finalSpeeds[i + 1] + stepDist * brakeRate);
   }
   for (let i = 1; i < finalSpeeds.length; i++) {
     const stepDist = Math.hypot(

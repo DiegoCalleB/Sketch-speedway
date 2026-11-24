@@ -115,16 +115,29 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const [inspectLapIndex, setInspectLapIndex] = useState(0);
   const [redrawLapTarget, setRedrawLapTarget] = useState<number | null>(null);
   const [cameraMode, setCameraMode] = useState<RaceCameraMode>('helicopter');
-  const [lightingPreset, setLightingPreset] = useState<LightingPreset>('day');
   const [focusedPlayerId, setFocusedPlayerId] = useState<string | null>(null);
 
-  // Multi-Lap & Real-Time F1 Pit-Wall Strategy states
+  // Global 3D Atmosphere (Time-of-Day + Dynamic Wet/Dry Weather) & Multi-Lap states
+  const lightingPreset = useGameStore((s) => s.lightingPreset);
+  const setLightingPreset = useGameStore((s) => s.setLightingPreset);
+  const weather = useGameStore((s) => s.weather);
+  const setWeather = useGameStore((s) => s.setWeather);
   const totalLaps = useGameStore((s) => s.totalLaps);
   const setTotalLaps = useGameStore((s) => s.setTotalLaps);
   const [paceMode, setPaceMode] = useState<PaceStrategyMode>('balanced');
   const paceModeRef = useRef<PaceStrategyMode>('balanced');
   const [lapBannerText, setLapBannerText] = useState<string | null>(null);
   const lapBannerTimerRef = useRef<any>(null);
+
+  // Adaptive 60 FPS Quality Governor refs & state (Mobile & Desktop)
+  const qualityScaleRef = useRef<number>(1.0);
+  const smoothFrameMsRef = useRef<number>(16.67);
+  const [adaptiveShadowSize, setAdaptiveShadowSize] = useState<number>(() =>
+    typeof window !== 'undefined' &&
+    (window.matchMedia('(pointer: coarse)').matches || window.innerWidth < 768)
+      ? 1024
+      : 2048
+  );
 
   // 3D TV Broadcast Replay states
   const isReplaying = useGameStore((s) => s.isReplaying);
@@ -484,7 +497,13 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         longitudinalG: 0,
         lateralG: 0,
         throttle: 0,
-        brake: 0
+        brake: 0,
+        damageFront: 0,
+        damageRear: 0,
+        damageLeft: 0,
+        damageRight: 0,
+        chassisHealth: 100,
+        lastImpactSeverity: 0
       };
     });
 
@@ -544,6 +563,23 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     const now = performance.now();
     const dtMs = now - lastFrameTimeRef.current;
     lastFrameTimeRef.current = now;
+
+    // Adaptive 60 FPS Quality Governor: track rolling frame-time EMA and auto-scale particle/rain density & shadow resolution
+    if (dtMs > 4 && dtMs < 120) {
+      smoothFrameMsRef.current = smoothFrameMsRef.current * 0.92 + dtMs * 0.08;
+      if (smoothFrameMsRef.current > 21.0) {
+        qualityScaleRef.current = Math.max(0.5, qualityScaleRef.current - 0.02);
+        if (
+          simulationTickRef.current % 45 === 0 &&
+          !isMobileDevice &&
+          adaptiveShadowSize > 1024
+        ) {
+          setAdaptiveShadowSize(1024);
+        }
+      } else if (smoothFrameMsRef.current < 17.5) {
+        qualityScaleRef.current = Math.min(1.0, qualityScaleRef.current + 0.01);
+      }
+    }
 
     // Allow freezing 3D replay at any frame while still rotating/switching cameras!
     if (useGameStore.getState().isReplaying && isReplayPausedRef.current) {
@@ -694,6 +730,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
       const oldX = car.x;
       const oldY = car.y;
+      const prevCooldown = car.bounceCooldown;
 
       // 1. Sub-stepped Rigid-Body Newtonian Vehicle Physics (Ackermann, Pacejka Friction Circle, Downforce & Drag)
       const phys = stepVehiclePhysics(
@@ -712,6 +749,79 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       const isOverspeedWide = phys.isOverspeedWide;
       const slipstreamActive = phys.slipstreamActive;
       const centrifugalForce = phys.centrifugalForce;
+
+      // 1B. Realistic Tecpro Barrier Impact Audio, Haptics & 3D Carbon-Fiber + Painted Livery Debris Explosion
+      if (phys.hitBarrier && phys.impactSeverity > 0.06) {
+        const impX = car.lastImpactPos?.x ?? car.x;
+        const impY = car.lastImpactPos?.y ?? car.y;
+        const carLiveryColor = player.color || stats.color;
+        const sev = phys.impactSeverity;
+
+        if (prevCooldown < 4) {
+          audio.playCrash(sev);
+          if (car.playerId === (focusedPlayerId || players[0]?.id)) {
+            haptics.collisionImpact();
+          }
+        }
+
+        // Spawn 3D tumbling carbon-fiber & painted bodywork debris shards
+        const shardCount = prevCooldown < 4 ? Math.min(14, Math.max(3, Math.round(sev * 16))) : 1;
+        for (let d = 0; d < shardCount; d++) {
+          const ejectAngle = Math.random() * Math.PI * 2;
+          const ejectSpd = (0.8 + Math.random() * 2.8) * (0.45 + sev * 0.85);
+          active_particles.push({
+            x: impX + (Math.random() - 0.5) * 3.5,
+            y: impY + (Math.random() - 0.5) * 3.5,
+            z: 0.75 + Math.random() * 0.9,
+            vx: Math.cos(ejectAngle) * ejectSpd + car.vx * 0.25,
+            vy: Math.sin(ejectAngle) * ejectSpd + car.vy * 0.25,
+            vz: 0.85 + Math.random() * 2.1 * (0.4 + sev),
+            color: Math.random() > 0.42 ? '#111827' : carLiveryColor,
+            size: 1.6 + Math.random() * 2.2 * (0.6 + sev * 0.6),
+            alpha: 1.0,
+            life: 0,
+            maxLife: 24 + Math.random() * 20,
+            kind: 'debris',
+            rotX: Math.random() * Math.PI,
+            rotY: Math.random() * Math.PI,
+            rotZ: Math.random() * Math.PI,
+            vRotX: (Math.random() - 0.5) * 0.45,
+            vRotY: (Math.random() - 0.5) * 0.45,
+            vRotZ: (Math.random() - 0.5) * 0.45
+          });
+        }
+
+        // Shower of incandescent barrier-scrape titanium sparks
+        const sparkCount = Math.min(12, Math.max(3, Math.round(sev * 14)));
+        for (let s = 0; s < sparkCount; s++) {
+          active_particles.push({
+            x: impX + (Math.random() - 0.5) * 2.8,
+            y: impY + (Math.random() - 0.5) * 2.8,
+            vx: -car.vx * 0.35 + (Math.random() - 0.5) * 3.4,
+            vy: -car.vy * 0.35 + (Math.random() - 0.5) * 3.4,
+            color: Math.random() > 0.35 ? '#fbbf24' : '#f97316',
+            size: 2.3 + Math.random() * 1.4,
+            alpha: 1.0,
+            life: 0,
+            maxLife: 8 + Math.random() * 9,
+            kind: 'spark'
+          });
+        }
+
+        // Impact dust / carbon smoke puff
+        active_particles.push({
+          x: impX,
+          y: impY,
+          vx: (Math.random() - 0.5) * 1.2,
+          vy: (Math.random() - 0.5) * 1.2,
+          color: 'rgba(203, 213, 225, 0.72)',
+          size: 5.0 + sev * 5.5,
+          alpha: 0.85,
+          life: 0,
+          maxLife: 18 + Math.random() * 12,
+          kind: 'smoke'
+        });
+      }
 
       // 2. Aerodynamic Slipstream wake particles
       if (slipstreamActive && Math.random() < 0.25) {
@@ -783,7 +893,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       }
 
       // 5. Kick up warm FIA limestone gravel dust clouds whenever off-track!
-      if (car.offTrack && newSpeed > 0.5 && Math.random() < 0.78) {
+      if (car.offTrack && newSpeed > 0.5 && Math.random() < 0.78 * qualityScaleRef.current) {
         active_particles.push({
           x: car.x - Math.cos(car.angle) * 5.5 + (Math.random() - 0.5) * 3.0,
           y: car.y - Math.sin(car.angle) * 5.5 + (Math.random() - 0.5) * 3.0,
@@ -794,6 +904,30 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           alpha: 0.85,
           life: 0,
           maxLife: 18 + Math.random() * 8
+        });
+      }
+
+      // 6. Wet-Weather F1 Rooster-Tail Diffuser & Tire Water Spray Plumes in Rain GP
+      if (
+        useGameStore.getState().weather === 'rain' &&
+        !car.offTrack &&
+        newSpeed > 1.25 &&
+        Math.random() < Math.min(0.92, (newSpeed / 7.5) * 0.88) * qualityScaleRef.current
+      ) {
+        const cosA = Math.cos(car.angle);
+        const sinA = Math.sin(car.angle);
+        const latOffset = (Math.random() - 0.5) * 3.4;
+        active_particles.push({
+          x: car.x - cosA * 6.8 - sinA * latOffset,
+          y: car.y - sinA * 6.8 + cosA * latOffset,
+          vx: -car.vx * 0.16 + (Math.random() - 0.5) * 0.9,
+          vy: -car.vy * 0.16 + (Math.random() - 0.5) * 0.9,
+          color: '#e0f2fe',
+          size: 4.5 + Math.min(4.2, newSpeed * 0.52),
+          alpha: 0.68,
+          life: 0,
+          maxLife: 14 + Math.random() * 10,
+          kind: 'spray'
         });
       }
 
@@ -901,19 +1035,54 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       }
     });
 
-    // Symmetric Momentum-Conserving Car-to-Car Rigid-Body Collisions
-    resolveCarCollisions(cars, (sx, sy) => {
-      for (let sp = 0; sp < 3; sp++) {
+    // Symmetric Momentum-Conserving Car-to-Car Rigid-Body Collisions with 3D Carbon Debris & Audio
+    resolveCarCollisions(cars, (sx, sy, sev = 0.55) => {
+      audio.playCrash(sev);
+      haptics.collisionImpact();
+
+      const shardCount = Math.min(12, Math.max(4, Math.round(sev * 14)));
+      for (let d = 0; d < shardCount; d++) {
+        const ang = Math.random() * Math.PI * 2;
+        const spd = (1.1 + Math.random() * 2.6) * (0.5 + sev * 0.7);
+        const randomPlayer = players[d % players.length];
+        const shardColor =
+          Math.random() > 0.45
+            ? '#111827'
+            : randomPlayer?.color || '#ef4444';
+        active_particles.push({
+          x: sx + (Math.random() - 0.5) * 3.0,
+          y: sy + (Math.random() - 0.5) * 3.0,
+          z: 0.85 + Math.random() * 0.9,
+          vx: Math.cos(ang) * spd,
+          vy: Math.sin(ang) * spd,
+          vz: 1.0 + Math.random() * 2.2,
+          color: shardColor,
+          size: 1.7 + Math.random() * 2.0,
+          alpha: 1.0,
+          life: 0,
+          maxLife: 24 + Math.random() * 18,
+          kind: 'debris',
+          rotX: Math.random() * Math.PI,
+          rotY: Math.random() * Math.PI,
+          rotZ: Math.random() * Math.PI,
+          vRotX: (Math.random() - 0.5) * 0.5,
+          vRotY: (Math.random() - 0.5) * 0.5,
+          vRotZ: (Math.random() - 0.5) * 0.5
+        });
+      }
+
+      for (let sp = 0; sp < 8; sp++) {
         active_particles.push({
           x: sx,
           y: sy,
-          vx: (Math.random() - 0.5) * 2.8,
-          vy: (Math.random() - 0.5) * 2.8,
-          color: '#fbbf24',
-          size: 2.4,
+          vx: (Math.random() - 0.5) * 3.6,
+          vy: (Math.random() - 0.5) * 3.6,
+          color: sp % 2 === 0 ? '#fbbf24' : '#f97316',
+          size: 2.5,
           alpha: 1,
           life: 0,
-          maxLife: 9
+          maxLife: 11,
+          kind: 'spark'
         });
       }
     });
@@ -922,6 +1091,22 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       const p = active_particles[i];
       p.x += p.vx * dtFactor;
       p.y += p.vy * dtFactor;
+      if (p.kind === 'debris') {
+        p.z = (p.z ?? 0.9) + (p.vz ?? 0) * dtFactor * 0.25;
+        p.vz = (p.vz ?? 0) - 0.19 * dtFactor;
+        if (p.z < 0.26) {
+          p.z = 0.26;
+          p.vz = -Math.abs(p.vz ?? 0) * 0.44;
+          p.vx *= 0.80;
+          p.vy *= 0.80;
+          p.vRotX = (p.vRotX ?? 0) * 0.78;
+          p.vRotY = (p.vRotY ?? 0) * 0.78;
+          p.vRotZ = (p.vRotZ ?? 0) * 0.78;
+        }
+        p.rotX = (p.rotX ?? 0) + (p.vRotX ?? 0) * dtFactor;
+        p.rotY = (p.rotY ?? 0) + (p.vRotY ?? 0) * dtFactor;
+        p.rotZ = (p.rotZ ?? 0) + (p.vRotZ ?? 0) * dtFactor;
+      }
       p.life += dtFactor;
       p.alpha = Math.max(0, 1 - p.life / p.maxLife);
       if (p.life >= p.maxLife) {
@@ -1715,28 +1900,57 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               </button>
             )}
 
-            {/* Time-of-Day & Weather Graphics Switcher */}
+            {/* Time-of-Day Graphics Switcher */}
             <button
               onClick={() => {
                 haptics.lightTap();
-                setLightingPreset((prev) =>
-                  prev === 'day' ? 'sunset' : prev === 'sunset' ? 'night' : 'day'
+                setLightingPreset(
+                  lightingPreset === 'day'
+                    ? 'sunset'
+                    : lightingPreset === 'sunset'
+                      ? 'night'
+                      : 'day'
                 );
               }}
               className="bg-slate-950/90 hover:bg-slate-900 active:scale-95 border border-slate-800 hover:border-amber-500/50 text-white px-2 py-1.5 sm:px-2.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold"
-              title="Cambiar iluminación y clima del circuito (Día Real GP / Tarde Dorada / Noche Asfalto Mojado)"
+              title="Cambiar hora del día (Día Real GP / Tarde Dorada / Noche Focos GP)"
             >
               {lightingPreset === 'day' ? (
                 <span className="text-emerald-300">
-                  ☀️ <span className="hidden sm:inline">DÍA REAL GP</span>
+                  ☀️ <span className="hidden sm:inline">DÍA GP</span>
                 </span>
               ) : lightingPreset === 'sunset' ? (
                 <span className="text-amber-300">
-                  🌅 <span className="hidden sm:inline">TARDE DORADA</span>
+                  🌅 <span className="hidden sm:inline">OCASO</span>
                 </span>
               ) : (
                 <span className="text-cyan-300">
-                  🌃 <span className="hidden sm:inline">NOCHE WET GP</span>
+                  🌃 <span className="hidden sm:inline">NOCHE</span>
+                </span>
+              )}
+            </button>
+
+            {/* Dynamic Wet / Dry Weather Graphics Switcher */}
+            <button
+              onClick={() => {
+                haptics.lightTap();
+                setWeather(weather === 'dry' ? 'rain' : 'dry');
+                audio.playBeep(weather === 'dry' ? 320 : 480, 0.06, 'sine');
+              }}
+              className={`bg-slate-950/90 hover:bg-slate-900 active:scale-95 border px-2 py-1.5 sm:px-2.5 min-h-[34px] rounded-lg shadow-lg flex items-center gap-1 transition-all cursor-pointer text-[10px] sm:text-xs font-mono font-bold ${
+                weather === 'rain'
+                  ? 'border-cyan-400/70 text-cyan-300'
+                  : 'border-slate-800 hover:border-emerald-500/50 text-slate-200'
+              }`}
+              title="Alternar meteorología 3D en tiempo real (Asfalto Seco PBR / Lluvia GP con charcos y spray)"
+            >
+              {weather === 'rain' ? (
+                <span>
+                  🌧️ <span className="hidden sm:inline">LLUVIA GP</span>
+                </span>
+              ) : (
+                <span>
+                  🛞 <span className="hidden sm:inline">SECO</span>
                 </span>
               )}
             </button>
@@ -1900,21 +2114,29 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
           <SceneAtmosphere
             preset={lightingPreset}
+            weather={weather}
             shadowFocus={
               activeCarObj ? [activeCarObj.x, 500 - activeCarObj.y] : [400, 250]
             }
             carsStateRef={carsStateRef}
             focusedPlayerId={focusedPlayerId}
             tightShadows={phase === 'racing' && cameraMode !== 'circuit'}
-            shadowMapSize={isMobileDevice ? 1024 : 2048}
+            shadowMapSize={isMobileDevice ? 1024 : adaptiveShadowSize}
           />
 
           <TrackMesh
             track={track}
             countdownValue={countdownValue}
             lightingPreset={lightingPreset}
+            weather={weather}
           />
-          <Environment3D track={track} lightingPreset={lightingPreset} />
+          <Environment3D
+            track={track}
+            lightingPreset={lightingPreset}
+            weather={weather}
+            carsStateRef={carsStateRef}
+            players={players}
+          />
           <Skidmarks3D skidmarksRef={skidmarksRef} />
 
           {players.map((p, idx) => {
@@ -1933,6 +2155,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
                 carsStateRef={carsStateRef}
                 track={track}
                 isRacing={phase === 'racing'}
+                weather={weather}
                 color={p.color || stats.color}
                 position={[grid.x, 500 - grid.y, gridSurf.elevationZ + 0.15]}
                 angle={grid.angle}
@@ -1969,7 +2192,11 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               return null;
             })}
 
-          <SmokeParticles particlesRef={particlesRef} />
+          <SmokeParticles
+            particlesRef={particlesRef}
+            weather={weather}
+            qualityScaleRef={qualityScaleRef}
+          />
 
           <CameraDirector
             phase={phase}
@@ -2890,6 +3117,18 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
               >
                 🔋 {Math.round(activeCarObj?.ersBattery ?? 100)}%
               </span>
+              {(activeCarObj?.chassisHealth ?? 100) < 99 && (
+                <span
+                  className={`bg-slate-950 border font-bold px-1.5 py-0.5 rounded text-[10px] ${
+                    (activeCarObj?.chassisHealth ?? 100) < 70
+                      ? 'border-rose-500/50 text-rose-400'
+                      : 'border-amber-500/40 text-amber-300'
+                  }`}
+                  title="Integridad aerodinámica y estructural del chasis (abolladuras por impacto)"
+                >
+                  🛠️ {Math.round(activeCarObj?.chassisHealth ?? 100)}%
+                </span>
+              )}
               <span className="text-slate-700 hidden md:inline">·</span>
               <span
                 className={`hidden md:inline font-bold text-[11px] ${

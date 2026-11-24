@@ -1,7 +1,7 @@
 import React, { useMemo, useEffect, useRef } from 'react';
-import { useThree } from '@react-three/fiber';
+import { useThree, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
-import { Track } from '../../types';
+import { Track, WeatherCondition } from '../../types';
 import { getTrackBankingProfile } from '../../utils/tracks';
 import { LightingPreset } from './SceneAtmosphere';
 
@@ -9,13 +9,18 @@ interface TrackMeshProps {
   track: Track;
   countdownValue?: string | null;
   lightingPreset?: LightingPreset;
+  weather?: WeatherCondition;
 }
 
 const _asphaltNormalScale = new THREE.Vector2(1.45, 1.45);
 const _kerbNormalScale = new THREE.Vector2(1.2, 1.2);
 
 // Next-Gen 1024x1024 Photogrammetry-Style PBR Asphalt Albedo + Specular Roughness Map + True RGB Tangent Normal Map
-const createNextGenAsphaltMaps = (maxAnisotropy: number, preset: LightingPreset) => {
+const createNextGenAsphaltMaps = (
+  maxAnisotropy: number,
+  preset: LightingPreset,
+  weather: WeatherCondition = 'dry'
+) => {
   const size = 1024;
 
   const albedoCanvas = document.createElement('canvas');
@@ -41,14 +46,15 @@ const createNextGenAsphaltMaps = (maxAnisotropy: number, preset: LightingPreset)
     };
   }
 
-  const isNightWet = preset === 'night';
+  const isRain = weather === 'rain';
+  const isNightWet = preset === 'night' || isRain;
   const isSunset = preset === 'sunset';
 
-  // Rich motorsport obsidian bitumen base
-  ctx.fillStyle = isNightWet ? '#131720' : '#1d222b';
+  // Rich motorsport obsidian bitumen base (slightly deeper wet sheen in rain while keeping high contrast against green turf)
+  ctx.fillStyle = isRain ? '#12161f' : preset === 'night' ? '#131720' : '#1d222b';
   ctx.fillRect(0, 0, size, size);
 
-  rCtx.fillStyle = isNightWet ? '#262626' : isSunset ? '#747474' : '#909090';
+  rCtx.fillStyle = isRain ? '#161616' : preset === 'night' ? '#262626' : isSunset ? '#747474' : '#909090';
   rCtx.fillRect(0, 0, size, size);
 
   nCtx.fillStyle = 'rgb(128, 128, 255)';
@@ -80,25 +86,25 @@ const createNextGenAsphaltMaps = (maxAnisotropy: number, preset: LightingPreset)
 
   // Specular roughness drop in the rubbered racing line (creates realistic grazing sun-glint & floodlight reflections)
   const rubberRoughGrad = rCtx.createLinearGradient(0, 0, 0, size);
-  rubberRoughGrad.addColorStop(0.0, isNightWet ? '#202020' : '#a8a8a8');
-  rubberRoughGrad.addColorStop(0.22, isNightWet ? '#181818' : '#6c6c6c');
-  rubberRoughGrad.addColorStop(0.44, isNightWet ? '#0a0a0a' : '#242424');
-  rubberRoughGrad.addColorStop(0.50, isNightWet ? '#060606' : '#181818');
-  rubberRoughGrad.addColorStop(0.56, isNightWet ? '#0a0a0a' : '#242424');
-  rubberRoughGrad.addColorStop(0.78, isNightWet ? '#181818' : '#6c6c6c');
-  rubberRoughGrad.addColorStop(1.0, isNightWet ? '#202020' : '#a8a8a8');
+  rubberRoughGrad.addColorStop(0.0, isNightWet ? '#1c1c1c' : '#a8a8a8');
+  rubberRoughGrad.addColorStop(0.22, isNightWet ? '#121212' : '#6c6c6c');
+  rubberRoughGrad.addColorStop(0.44, isNightWet ? '#070707' : '#242424');
+  rubberRoughGrad.addColorStop(0.50, isNightWet ? '#040404' : '#181818');
+  rubberRoughGrad.addColorStop(0.56, isNightWet ? '#070707' : '#242424');
+  rubberRoughGrad.addColorStop(0.78, isNightWet ? '#121212' : '#6c6c6c');
+  rubberRoughGrad.addColorStop(1.0, isNightWet ? '#1c1c1c' : '#a8a8a8');
   rCtx.fillStyle = rubberRoughGrad;
   rCtx.fillRect(0, 0, size, size);
 
   // Wet-weather / Sunset mirror puddle patches
-  const puddleCount = isNightWet ? 85 : 34;
+  const puddleCount = isRain ? 135 : isNightWet ? 85 : 34;
   for (let i = 0; i < puddleCount; i++) {
     const px = Math.random() * size;
-    const py = 90 + Math.random() * (size - 180);
-    const rx = 50 + Math.random() * 165;
-    const ry = 18 + Math.random() * 58;
+    const py = 75 + Math.random() * (size - 150);
+    const rx = 55 + Math.random() * (isRain ? 210 : 165);
+    const ry = 20 + Math.random() * (isRain ? 72 : 58);
     const pGrad = rCtx.createRadialGradient(px, py, 4, px, py, rx);
-    pGrad.addColorStop(0, isNightWet ? 'rgba(4, 4, 4, 0.96)' : 'rgba(20, 20, 20, 0.62)');
+    pGrad.addColorStop(0, isRain ? 'rgba(2, 2, 2, 0.98)' : isNightWet ? 'rgba(4, 4, 4, 0.96)' : 'rgba(20, 20, 20, 0.62)');
     pGrad.addColorStop(1, 'rgba(128, 128, 128, 0)');
     rCtx.fillStyle = pGrad;
     rCtx.fillRect(px - rx, py - ry, rx * 2, ry * 2);
@@ -136,16 +142,34 @@ const createNextGenAsphaltMaps = (maxAnisotropy: number, preset: LightingPreset)
 
   // Smooth water puddle centers in normal map so rain puddles act as glass mirrors
   if (isNightWet || isSunset) {
-    for (let i = 0; i < 36; i++) {
+    const smoothPuddleCount = isRain ? 68 : 36;
+    for (let i = 0; i < smoothPuddleCount; i++) {
       const px = Math.random() * size;
-      const py = 120 + Math.random() * (size - 240);
-      const r = 34 + Math.random() * 78;
+      const py = 100 + Math.random() * (size - 200);
+      const r = 38 + Math.random() * (isRain ? 95 : 78);
       const nGrad = nCtx.createRadialGradient(px, py, 4, px, py, r);
-      nGrad.addColorStop(0, 'rgba(128, 128, 255, 0.90)');
+      nGrad.addColorStop(0, 'rgba(128, 128, 255, 0.94)');
       nGrad.addColorStop(1, 'rgba(128, 128, 255, 0)');
       nCtx.fillStyle = nGrad;
       nCtx.fillRect(px - r, py - r, r * 2, r * 2);
     }
+  }
+
+  // Off-line F1 tire rubber marbles along outer and inner edges of the racing groove
+  for (let i = 0; i < 420; i++) {
+    const mx = Math.random() * size;
+    const isTopSide = i % 2 === 0;
+    const my = isTopSide
+      ? 55 + Math.random() * 165
+      : size - 220 + Math.random() * 165;
+    const mw = 2.0 + Math.random() * 4.5;
+    const mh = 1.5 + Math.random() * 3.0;
+    ctx.fillStyle = 'rgba(4, 6, 9, 0.55)';
+    ctx.fillRect(mx, my, mw, mh);
+    rCtx.fillStyle = '#c8c8c8';
+    rCtx.fillRect(mx, my, mw, mh);
+    nCtx.fillStyle = 'rgb(168, 118, 236)';
+    nCtx.fillRect(mx, my, mw, mh);
   }
 
   // Crisp FIA White Track-Limit Edge Stripes
@@ -400,11 +424,96 @@ const createGantryBannerTexture = (maxAnisotropy: number, text: string, accentCo
 export const TrackMesh: React.FC<TrackMeshProps> = ({
   track,
   countdownValue = null,
-  lightingPreset = 'day'
+  lightingPreset = 'day',
+  weather = 'dry'
 }) => {
   const { gl } = useThree();
   const maxAnisotropy = Math.min(8, gl.capabilities.getMaxAnisotropy());
   const tireWallInstancedRef = useRef<THREE.InstancedMesh>(null);
+  const apexCatEyesRef = useRef<THREE.InstancedMesh>(null);
+  const asphaltShaderUniformsRef = useRef<{
+    uTime: { value: number };
+    uWetness: { value: number };
+  }>({
+    uTime: { value: 0 },
+    uWetness: { value: weather === 'rain' ? 1.0 : 0.0 }
+  });
+
+  useEffect(() => {
+    asphaltShaderUniformsRef.current.uWetness.value = weather === 'rain' ? 1.0 : 0.0;
+  }, [weather]);
+
+  const handleAsphaltBeforeCompile = useMemo(() => {
+    return (shader: THREE.WebGLProgramParametersWithUniforms) => {
+      shader.uniforms.uTime = asphaltShaderUniformsRef.current.uTime;
+      shader.uniforms.uWetness = asphaltShaderUniformsRef.current.uWetness;
+
+      shader.vertexShader = shader.vertexShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+           varying vec3 vAsphaltWorldPos;`
+        )
+        .replace(
+          '#include <begin_vertex>',
+          `#include <begin_vertex>
+           vAsphaltWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`
+        );
+
+      shader.fragmentShader = shader.fragmentShader
+        .replace(
+          '#include <common>',
+          `#include <common>
+           uniform float uTime;
+           uniform float uWetness;
+           varying vec3 vAsphaltWorldPos;
+           float asphaltHash(vec2 p) {
+             return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+           }`
+        )
+        .replace(
+          '#include <roughnessmap_fragment>',
+          `#include <roughnessmap_fragment>
+           // Procedural sub-millimeter quartz aggregate micro-facet & wet raindrop concentric ripples
+           vec2 microGrid = floor(vAsphaltWorldPos.xy * 16.0);
+           float microSparkle = asphaltHash(microGrid);
+           if (microSparkle > 0.965) {
+             roughnessFactor = max(0.04, roughnessFactor * 0.45);
+           }
+           if (uWetness > 0.5) {
+             vec2 cell = floor(vAsphaltWorldPos.xy * 0.42);
+             vec2 local = fract(vAsphaltWorldPos.xy * 0.42) - 0.5;
+             float phase = fract(uTime * 1.45 + asphaltHash(cell));
+             float ring = smoothstep(0.06, 0.0, abs(length(local) - phase * 0.45)) * (1.0 - phase);
+             roughnessFactor = clamp(roughnessFactor - ring * 0.28, 0.03, 1.0);
+           }`
+        );
+    };
+  }, []);
+
+  const marshalLedMat = useMemo(
+    () =>
+      new THREE.MeshStandardMaterial({
+        color: '#10b981',
+        emissive: '#10b981',
+        emissiveIntensity: lightingPreset === 'night' ? 6.5 : 3.2,
+        roughness: 0.25
+      }),
+    [lightingPreset]
+  );
+
+  useEffect(() => {
+    return () => {
+      marshalLedMat.dispose();
+    };
+  }, [marshalLedMat]);
+
+  useFrame((state) => {
+    const elapsed = state.clock.getElapsedTime();
+    asphaltShaderUniformsRef.current.uTime.value = elapsed;
+    const base = lightingPreset === 'night' ? 6.2 : 3.0;
+    marshalLedMat.emissiveIntensity = base + Math.sin(elapsed * 4.2) * 0.85;
+  });
 
   const {
     bankedTrackGeometry,
@@ -415,6 +524,7 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
     barrierGeometry,
     catchFenceGeometry,
     tireStackTransforms,
+    apexCatEyeTransforms,
     marshalPanels,
     asphaltMaps,
     runoffApronTexture,
@@ -425,7 +535,9 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
     gantryTexture,
     sectorGantries,
     startLineTransform,
-    gridSlots
+    gridSlots,
+    drsActivationZones,
+    monacoTunnelArches
   } = useMemo(() => {
     const outer = track.outerBoundary;
     const inner = track.innerBoundary;
@@ -479,6 +591,7 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
     geometry.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
     geometry.setIndex(indices);
     geometry.computeVertexNormals();
+    geometry.computeTangents();
 
     // 2. Continuous Flush 3D FIA Kerb Ribbons
     const buildKerbRibbon = (isOuter: boolean) => {
@@ -537,6 +650,7 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       g.setAttribute('uv', new THREE.Float32BufferAttribute(kUvs, 2));
       g.setIndex(kIdx);
       g.computeVertexNormals();
+      g.computeTangents();
       return g;
     };
 
@@ -555,6 +669,7 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
     let gVertCount = 0;
 
     const tireTransforms: { x: number; y: number; z: number; color: string }[] = [];
+    const catEyes: { x: number; y: number; z: number; color: string }[] = [];
     const marshals: { x: number; y: number; z: number; angle: number }[] = [];
 
     for (let i = 0; i < len; i++) {
@@ -634,6 +749,22 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       tireTransforms.push(
         { x: tx, y: ty, z: 0.7, color: '#181c24' },
         { x: tx, y: ty, z: 1.9, color: isBlue ? '#0284c7' : '#e2e8f0' }
+      );
+
+      // Embedded Solar LED Apex Cat-Eye Studs along inner & outer kerbs
+      catEyes.push(
+        {
+          x: i1.x - nx1 * 1.1,
+          y: 500 - (i1.y - ny1 * 1.1),
+          z: b1.innerZ + 0.28,
+          color: i % 2 === 0 ? '#10b981' : '#fbbf24'
+        },
+        {
+          x: o1.x + nx1 * 1.1,
+          y: 500 - (o1.y + ny1 * 1.1),
+          z: b1.outerZ + 0.28,
+          color: i % 2 === 0 ? '#ef4444' : '#38bdf8'
+        }
       );
 
       // Place glowing FIA Digital LED Marshal Flag Panels at key corner apexes
@@ -758,6 +889,67 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       angle: -slot.angle
     }));
 
+    // 8. FIA DRS Activation Zone White Line + Glowing Green Trackside DRS Marker Boards
+    const drsIndices = [Math.floor(len * 0.09), Math.floor(len * 0.56)];
+    const drsZones = drsIndices.map((dIdx, idx) => {
+      const rIdx = dIdx % len;
+      const oRaw = outer[rIdx];
+      const iRaw = inner[rIdx];
+      const b = banking[rIdx];
+      const oP = new THREE.Vector3(oRaw.x, 500 - oRaw.y, b.outerZ);
+      const iP = new THREE.Vector3(iRaw.x, 500 - iRaw.y, b.innerZ);
+      const dMid = oP.clone().add(iP).multiplyScalar(0.5);
+      dMid.z += 0.34;
+      const dSpan = Math.max(40, oP.distanceTo(iP) - 10);
+      const dDir = iP.clone().sub(oP).normalize();
+      const dQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dDir);
+      return {
+        key: `drs-zone-${idx}`,
+        position: dMid,
+        quaternion: dQuat,
+        span: dSpan
+      };
+    });
+
+    // 9. Circuit de Monaco 3D Louis II Tunnel Ribbed Architectural Canopy & Warm Interior Ceiling Lights
+    const tunnelArches: {
+      key: string;
+      position: THREE.Vector3;
+      quaternion: THREE.Quaternion;
+      span: number;
+    }[] = [];
+
+    if (track.id === 'monaco') {
+      const tunnelIndices = [48, 51, 54, 57, 60, 63];
+      tunnelIndices.forEach((tIdx) => {
+        const rIdx = tIdx % len;
+        const oRaw = outer[rIdx];
+        const iRaw = inner[rIdx];
+        const b = banking[rIdx];
+        const oP = new THREE.Vector3(oRaw.x, 500 - oRaw.y, b.outerZ);
+        const iP = new THREE.Vector3(iRaw.x, 500 - iRaw.y, b.innerZ);
+        const tMid = oP.clone().add(iP).multiplyScalar(0.5);
+        const tSpan = Math.max(54, oP.distanceTo(iP) + 12);
+        const tDir = iP.clone().sub(oP).normalize();
+        const tQuat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), tDir);
+        tunnelArches.push({
+          key: `monaco-tunnel-rib-${tIdx}`,
+          position: tMid,
+          quaternion: tQuat,
+          span: tSpan
+        });
+      });
+    }
+
+    const mainGantryTitle =
+      track.id === 'jarama'
+        ? 'CIRCUITO DEL JARAMA  ·  RACE MADRID'
+        : track.id === 'madring'
+          ? 'MADRING F1  ·  IFEMA MADRID GP'
+          : track.id === 'monaco'
+            ? 'FORMULA 1  ·  GRAND PRIX DE MONACO'
+            : 'GRAND PRIX  ·  DRAW RACE  ·  FIA';
+
     return {
       bankedTrackGeometry: geometry,
       runoffApronGeometry: apronGeo,
@@ -767,46 +959,65 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       barrierGeometry: barGeo,
       catchFenceGeometry: fenceGeo,
       tireStackTransforms: tireTransforms,
+      apexCatEyeTransforms: catEyes,
       marshalPanels: marshals,
-      asphaltMaps: createNextGenAsphaltMaps(maxAnisotropy, lightingPreset),
+      asphaltMaps: createNextGenAsphaltMaps(maxAnisotropy, lightingPreset, weather),
       runoffApronTexture: createRunoffApronTexture(maxAnisotropy),
       gravelTexture: createGravelTexture(maxAnisotropy),
       kerbMaps: createKerbMaps(maxAnisotropy),
       barrierTexture: createBarrierSponsorTexture(maxAnisotropy),
       checkerTexture: createCheckerTexture(maxAnisotropy),
-      gantryTexture: createGantryBannerTexture(
-        maxAnisotropy,
-        'GRAND PRIX  ·  DRAW RACE  ·  FIA',
-        '#10b981'
-      ),
+      gantryTexture: createGantryBannerTexture(maxAnisotropy, mainGantryTitle, '#10b981'),
       sectorGantries: secGantries,
       startLineTransform: { position: mid, quaternion: startQuat, length: fullDist },
-      gridSlots: slots
+      gridSlots: slots,
+      drsActivationZones: drsZones,
+      monacoTunnelArches: tunnelArches
     };
-  }, [track, maxAnisotropy, lightingPreset]);
+  }, [track, maxAnisotropy, lightingPreset, weather]);
 
-  // Populate 3D FIA Tire Wall InstancedMesh
+  // Populate 3D FIA Tire Wall InstancedMesh & Solar LED Apex Cat-Eye Studs
   useEffect(() => {
     const mesh = tireWallInstancedRef.current;
-    if (!mesh || tireStackTransforms.length === 0) return;
+    if (mesh && tireStackTransforms.length > 0) {
+      const dummy = new THREE.Object3D();
+      const color = new THREE.Color();
+      mesh.count = tireStackTransforms.length;
 
-    const dummy = new THREE.Object3D();
-    const color = new THREE.Color();
-    mesh.count = tireStackTransforms.length;
+      tireStackTransforms.forEach((t, idx) => {
+        dummy.position.set(t.x, t.y, t.z);
+        dummy.rotation.set(Math.PI / 2, 0, 0);
+        dummy.updateMatrix();
+        mesh.setMatrixAt(idx, dummy.matrix);
+        color.set(t.color);
+        mesh.setColorAt(idx, color);
+      });
 
-    tireStackTransforms.forEach((t, idx) => {
-      dummy.position.set(t.x, t.y, t.z);
-      dummy.rotation.set(Math.PI / 2, 0, 0);
-      dummy.updateMatrix();
-      mesh.setMatrixAt(idx, dummy.matrix);
-      color.set(t.color);
-      mesh.setColorAt(idx, color);
-    });
+      mesh.instanceMatrix.needsUpdate = true;
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+      mesh.computeBoundingSphere();
+    }
 
-    mesh.instanceMatrix.needsUpdate = true;
-    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-    mesh.computeBoundingSphere();
-  }, [tireStackTransforms]);
+    const catMesh = apexCatEyesRef.current;
+    if (catMesh && apexCatEyeTransforms.length > 0) {
+      const dummy = new THREE.Object3D();
+      const color = new THREE.Color();
+      catMesh.count = apexCatEyeTransforms.length;
+
+      apexCatEyeTransforms.forEach((c, idx) => {
+        dummy.position.set(c.x, c.y, c.z);
+        dummy.rotation.set(0, 0, 0);
+        dummy.updateMatrix();
+        catMesh.setMatrixAt(idx, dummy.matrix);
+        color.set(c.color);
+        catMesh.setColorAt(idx, color);
+      });
+
+      catMesh.instanceMatrix.needsUpdate = true;
+      if (catMesh.instanceColor) catMesh.instanceColor.needsUpdate = true;
+      catMesh.computeBoundingSphere();
+    }
+  }, [tireStackTransforms, apexCatEyeTransforms]);
 
   useEffect(() => {
     return () => {
@@ -858,18 +1069,27 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
         />
       </mesh>
 
-      {/* Next-Gen 1024px 3D Banked Tarmac Surface with RGB Normal Map + Specular Rubber Groove & Wet Puddles */}
+      {/* Next-Gen 1024px 3D Banked Tarmac Surface with RGB Normal Map + Specular Rubber Groove + Wet Puddle Ripples */}
       <mesh geometry={bankedTrackGeometry} receiveShadow castShadow>
         <meshPhysicalMaterial
           map={asphaltMaps.map}
           roughnessMap={asphaltMaps.roughnessMap}
           normalMap={asphaltMaps.normalMap}
           normalScale={_asphaltNormalScale}
-          roughness={0.82}
-          metalness={0.14}
-          clearcoat={lightingPreset === 'night' ? 0.78 : lightingPreset === 'sunset' ? 0.24 : 0.16}
-          clearcoatRoughness={lightingPreset === 'night' ? 0.08 : 0.28}
-          envMapIntensity={lightingPreset === 'night' ? 1.8 : 1.05}
+          roughness={weather === 'rain' ? 0.38 : 0.78}
+          metalness={weather === 'rain' ? 0.24 : 0.16}
+          clearcoat={
+            weather === 'rain'
+              ? 0.96
+              : lightingPreset === 'night'
+                ? 0.82
+                : lightingPreset === 'sunset'
+                  ? 0.32
+                  : 0.22
+          }
+          clearcoatRoughness={weather === 'rain' ? 0.04 : lightingPreset === 'night' ? 0.07 : 0.24}
+          envMapIntensity={weather === 'rain' ? 2.55 : lightingPreset === 'night' ? 1.95 : 1.25}
+          onBeforeCompile={handleAsphaltBeforeCompile}
           side={THREE.DoubleSide}
         />
       </mesh>
@@ -880,8 +1100,8 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
           map={kerbMaps.map}
           normalMap={kerbMaps.normalMap}
           normalScale={_kerbNormalScale}
-          roughness={0.42}
-          metalness={0.12}
+          roughness={weather === 'rain' ? 0.18 : 0.42}
+          metalness={weather === 'rain' ? 0.22 : 0.12}
           side={THREE.DoubleSide}
         />
       </mesh>
@@ -890,11 +1110,27 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
           map={kerbMaps.map}
           normalMap={kerbMaps.normalMap}
           normalScale={_kerbNormalScale}
-          roughness={0.42}
-          metalness={0.12}
+          roughness={weather === 'rain' ? 0.18 : 0.42}
+          metalness={weather === 'rain' ? 0.22 : 0.12}
           side={THREE.DoubleSide}
         />
       </mesh>
+
+      {/* 3D Embedded Solar LED Apex Cat-Eye Reflector Studs along Corner Kerbs */}
+      <instancedMesh
+        ref={apexCatEyesRef}
+        args={[undefined, undefined, Math.max(1, apexCatEyeTransforms.length)]}
+        frustumCulled={false}
+      >
+        <boxGeometry args={[0.65, 0.65, 0.18]} />
+        <meshStandardMaterial
+          color="#ffffff"
+          emissive="#38bdf8"
+          emissiveIntensity={lightingPreset === 'night' || weather === 'rain' ? 4.8 : 1.8}
+          roughness={0.2}
+          metalness={0.8}
+        />
+      </instancedMesh>
 
       {/* 3D Instanced FIA Tire Barrier Stacks on Corner Runoffs */}
       <instancedMesh
@@ -918,13 +1154,8 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
             <boxGeometry args={[0.5, 3.2, 2.2]} />
             <meshStandardMaterial color="#090d16" roughness={0.4} metalness={0.6} />
           </mesh>
-          <mesh position={[0.28, 0, 0]}>
+          <mesh position={[0.28, 0, 0]} material={marshalLedMat}>
             <boxGeometry args={[0.08, 2.7, 1.7]} />
-            <meshStandardMaterial
-              color="#10b981"
-              emissive="#10b981"
-              emissiveIntensity={lightingPreset === 'night' ? 6.5 : 3.2}
-            />
           </mesh>
         </group>
       ))}
@@ -952,12 +1183,21 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
         />
       </mesh>
 
-      {/* Painted FIA Staggered Starting Grid Boxes */}
+      {/* Painted FIA Staggered Starting Grid Boxes + Yellow Front-Axle Alignment Lines + Rubbered-In Launch Burnout Patches */}
       {gridSlots.map((slot) => (
         <group key={slot.key} position={slot.position} rotation={[0, 0, slot.angle]}>
           <mesh position={[8.5, 0, 0]}>
             <planeGeometry args={[1.1, 10.5]} />
             <meshStandardMaterial color="#f8fafc" roughness={0.6} polygonOffset polygonOffsetFactor={-2} />
+          </mesh>
+          {/* Official FIA Yellow Front-Wheel Stop Alignment Line */}
+          <mesh position={[7.2, -5.8, 0]}>
+            <planeGeometry args={[0.7, 2.6]} />
+            <meshStandardMaterial color="#facc15" roughness={0.5} polygonOffset polygonOffsetFactor={-3} />
+          </mesh>
+          <mesh position={[7.2, 5.8, 0]}>
+            <planeGeometry args={[0.7, 2.6]} />
+            <meshStandardMaterial color="#facc15" roughness={0.5} polygonOffset polygonOffsetFactor={-3} />
           </mesh>
           <mesh position={[5.0, -5.0, 0]}>
             <planeGeometry args={[7.2, 0.9]} />
@@ -966,6 +1206,29 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
           <mesh position={[5.0, 5.0, 0]}>
             <planeGeometry args={[7.2, 0.9]} />
             <meshStandardMaterial color="#f8fafc" roughness={0.6} polygonOffset polygonOffsetFactor={-2} />
+          </mesh>
+          {/* Twin Rear-Tire Launch Burnout Rubber Strips */}
+          <mesh position={[1.2, -2.85, 0]}>
+            <planeGeometry args={[12.5, 1.45]} />
+            <meshStandardMaterial
+              color="#05070b"
+              transparent
+              opacity={0.46}
+              roughness={0.32}
+              polygonOffset
+              polygonOffsetFactor={-1}
+            />
+          </mesh>
+          <mesh position={[1.2, 2.85, 0]}>
+            <planeGeometry args={[12.5, 1.45]} />
+            <meshStandardMaterial
+              color="#05070b"
+              transparent
+              opacity={0.46}
+              roughness={0.32}
+              polygonOffset
+              polygonOffsetFactor={-1}
+            />
           </mesh>
         </group>
       ))}
@@ -984,6 +1247,74 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
           polygonOffsetFactor={-3}
         />
       </mesh>
+
+      {/* FIA DRS Detection & Activation Zone Lines + Glowing Emerald Trackside DRS Boards */}
+      {drsActivationZones.map((dz) => (
+        <group
+          key={dz.key}
+          position={[dz.position.x, dz.position.y, dz.position.z]}
+          quaternion={dz.quaternion}
+        >
+          <mesh>
+            <planeGeometry args={[1.6, dz.span]} />
+            <meshStandardMaterial
+              color="#34d399"
+              emissive="#10b981"
+              emissiveIntensity={0.85}
+              roughness={0.4}
+              polygonOffset
+              polygonOffsetFactor={-2}
+            />
+          </mesh>
+          <mesh position={[0, -dz.span * 0.56, 3.6]} castShadow>
+            <boxGeometry args={[1.2, 3.8, 3.2]} />
+            <meshStandardMaterial
+              color="#065f46"
+              emissive="#10b981"
+              emissiveIntensity={lightingPreset === 'night' ? 3.2 : 1.6}
+            />
+          </mesh>
+        </group>
+      ))}
+
+      {/* Circuit de Monaco 3D Louis II Tunnel Ribbed Concrete/Glass Canopy with Warm Ceiling Strips */}
+      {monacoTunnelArches.map((ta) => (
+        <group
+          key={ta.key}
+          position={[ta.position.x, ta.position.y, ta.position.z]}
+          quaternion={ta.quaternion}
+        >
+          {/* Left & Right Tunnel Concrete Colonade Pillars */}
+          <mesh position={[0, -ta.span * 0.54, 7.5]} castShadow>
+            <boxGeometry args={[3.4, 2.6, 15]} />
+            <meshStandardMaterial color="#cbd5e1" roughness={0.55} metalness={0.2} />
+          </mesh>
+          <mesh position={[0, ta.span * 0.54, 7.5]} castShadow>
+            <boxGeometry args={[3.4, 2.6, 15]} />
+            <meshStandardMaterial color="#cbd5e1" roughness={0.55} metalness={0.2} />
+          </mesh>
+          {/* Semi-Transparent Ribbed Tunnel Ceiling Slab */}
+          <mesh position={[0, 0, 15.2]}>
+            <boxGeometry args={[5.2, ta.span * 1.12, 1.4]} />
+            <meshStandardMaterial
+              color="#475569"
+              transparent
+              opacity={0.45}
+              roughness={0.35}
+              metalness={0.55}
+            />
+          </mesh>
+          {/* Warm Amber Monte-Carlo Tunnel Sodium/LED Ceiling Light Strip */}
+          <mesh position={[0, 0, 14.3]}>
+            <boxGeometry args={[1.6, ta.span * 0.96, 0.35]} />
+            <meshStandardMaterial
+              color="#fbbf24"
+              emissive="#f59e0b"
+              emissiveIntensity={lightingPreset === 'night' ? 6.5 : 4.2}
+            />
+          </mesh>
+        </group>
+      ))}
 
       {/* 3D Overhead FIA Sector Timing Arches (S1, S2, S3) with Glowing LED Accent Strips */}
       {sectorGantries.map((sg) => (
@@ -1037,6 +1368,19 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
         <mesh position={[0, 0, 18.2]} castShadow receiveShadow>
           <boxGeometry args={[3.6, startLineTransform.length * 1.18, 4.2]} />
           <meshStandardMaterial map={gantryTexture} roughness={0.30} metalness={0.35} />
+        </mesh>
+        {/* Architectural Carbon-Steel Upper Truss Cap & Side Diagonal Bracing */}
+        <mesh position={[0, 0, 20.65]} castShadow>
+          <boxGeometry args={[1.8, startLineTransform.length * 1.16, 0.7]} />
+          <meshStandardMaterial color="#475569" roughness={0.28} metalness={0.86} />
+        </mesh>
+        <mesh position={[0, -startLineTransform.length * 0.44, 14.4]} rotation={[0.62, 0, 0]} castShadow>
+          <boxGeometry args={[0.9, 9.2, 0.9]} />
+          <meshStandardMaterial color="#475569" roughness={0.30} metalness={0.85} />
+        </mesh>
+        <mesh position={[0, startLineTransform.length * 0.44, 14.4]} rotation={[-0.62, 0, 0]} castShadow>
+          <boxGeometry args={[0.9, 9.2, 0.9]} />
+          <meshStandardMaterial color="#475569" roughness={0.30} metalness={0.85} />
         </mesh>
 
         {/* 5 Hanging FIA Red Starting Light Pods */}

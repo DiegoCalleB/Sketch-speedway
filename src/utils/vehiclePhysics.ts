@@ -12,6 +12,8 @@ export interface VehiclePhysicsStepResult {
   centrifugalForce: number;
   distFromCenter: number;
   hitBarrier: boolean;
+  impactSeverity: number;
+  impactZone: 'front' | 'rear' | 'left' | 'right' | null;
 }
 
 const WHEELBASE = 8.4; // Physical distance between front and rear F1 axles (world units)
@@ -32,11 +34,84 @@ function normalizeAngle(rad: number): number {
 }
 
 /**
+ * Compute which anatomical zone of the F1 car ('front', 'rear', 'left', 'right') absorbs an external impact
+ * where (normalIntoCarX, normalIntoCarY) points FROM the barrier/opponent INTO the car's center of mass.
+ * Equivalently, the contact point on the car hull is in direction (-normalIntoCarX, -normalIntoCarY).
+ */
+export function applyLocalizedChassisDent(
+  car: RaceCarState,
+  normalIntoCarX: number,
+  normalIntoCarY: number,
+  rawSeverity: number
+): 'front' | 'rear' | 'left' | 'right' {
+  const severity = clamp(rawSeverity, 0.04, 1.0);
+  const cosY = Math.cos(car.angle);
+  const sinY = Math.sin(car.angle);
+
+  // Contact vector from car center toward the impact point in car's local frame (+X = Nose, +Y = Right sidepod in 2D)
+  const contactWorldX = -normalIntoCarX;
+  const contactWorldY = -normalIntoCarY;
+  const localContactX = contactWorldX * cosY + contactWorldY * sinY;
+  const localContactY = -contactWorldX * sinY + contactWorldY * cosY;
+
+  let primaryZone: 'front' | 'rear' | 'left' | 'right';
+  if (Math.abs(localContactX) >= Math.abs(localContactY) * 0.92) {
+    primaryZone = localContactX >= 0 ? 'front' : 'rear';
+  } else {
+    // In 2D screen coords (+Y down), localContactY > 0 is right side of car, < 0 is left side
+    primaryZone = localContactY >= 0 ? 'right' : 'left';
+  }
+
+  // Accumulate permanent plastic deformation (crumpling/denting) across the impacted zone + adjacent corner bleed
+  const dentGain = severity * 0.44;
+  if (primaryZone === 'front') {
+    car.damageFront = clamp((car.damageFront ?? 0) + dentGain, 0, 1);
+    if (localContactY > 0.25) {
+      car.damageRight = clamp((car.damageRight ?? 0) + dentGain * 0.42, 0, 1);
+    } else if (localContactY < -0.25) {
+      car.damageLeft = clamp((car.damageLeft ?? 0) + dentGain * 0.42, 0, 1);
+    }
+  } else if (primaryZone === 'rear') {
+    car.damageRear = clamp((car.damageRear ?? 0) + dentGain, 0, 1);
+    if (localContactY > 0.25) {
+      car.damageRight = clamp((car.damageRight ?? 0) + dentGain * 0.35, 0, 1);
+    } else if (localContactY < -0.25) {
+      car.damageLeft = clamp((car.damageLeft ?? 0) + dentGain * 0.35, 0, 1);
+    }
+  } else if (primaryZone === 'left') {
+    car.damageLeft = clamp((car.damageLeft ?? 0) + dentGain, 0, 1);
+    if (localContactX > 0.3) {
+      car.damageFront = clamp((car.damageFront ?? 0) + dentGain * 0.35, 0, 1);
+    }
+  } else {
+    car.damageRight = clamp((car.damageRight ?? 0) + dentGain, 0, 1);
+    if (localContactX > 0.3) {
+      car.damageFront = clamp((car.damageFront ?? 0) + dentGain * 0.35, 0, 1);
+    }
+  }
+
+  const totalDamage =
+    (car.damageFront ?? 0) * 0.34 +
+    (car.damageRear ?? 0) * 0.22 +
+    (car.damageLeft ?? 0) * 0.22 +
+    (car.damageRight ?? 0) * 0.22;
+  car.chassisHealth = Math.round(clamp(100 - totalDamage * 75, 25, 100));
+  car.lastImpactSeverity = Math.max(car.lastImpactSeverity ?? 0, severity);
+  car.lastImpactZone = primaryZone;
+  car.lastImpactPos = {
+    x: car.x + contactWorldX * 5.2,
+    y: car.y + contactWorldY * 5.2
+  };
+
+  return primaryZone;
+}
+
+/**
  * Pure-Pursuit + Pacejka Friction-Circle Rigid-Body F1 Vehicle Physics Engine.
  * Enforces real Newtonian inertia, finite Ackermann steering geometry, rate-limited steering rack,
  * kinematic braking envelopes, aerodynamic ground-effect downforce (v^2), longitudinal weight transfer,
  * quadratic drag, realistic understeer/oversteer slip angles, anti-orbiting waypoint projection,
- * and physical barrier containment.
+ * and physical Tecpro barrier crash & crumple-zone containment.
  */
 export function stepVehiclePhysics(
   car: RaceCarState,
@@ -48,6 +123,11 @@ export function stepVehiclePhysics(
   activeStrategy: PaceStrategyMode,
   dtFactor: number
 ): VehiclePhysicsStepResult {
+  // Decay transient impact shock pulse smoothly while preserving permanent structural dents
+  if ((car.lastImpactSeverity ?? 0) > 0) {
+    car.lastImpactSeverity = Math.max(0, (car.lastImpactSeverity ?? 0) - 0.08 * dtFactor);
+  }
+
   // 1. Forward-projecting waypoint progress tracker (never warps car position, never traps car behind a missed node!)
   let idx = clamp(car.targetIndex, 0, path.length - 1);
   const searchWindow = Math.min(path.length - 1, idx + 48);
@@ -112,13 +192,29 @@ export function stepVehiclePhysics(
   }
   car.slipstreamActive = slipstreamActive;
 
-  // 3. Surface, Tire Degradation & Hybrid Strategy State
+  // 3. Surface, Tire Degradation, Structural Aero Damage & Hybrid Strategy State
   const surface = getTrackSurfaceInfo({ x: car.x, y: car.y }, track);
   car.offTrack = !surface.onAsphalt;
 
+  const dmgFront = car.damageFront ?? 0;
+  const dmgRear = car.damageRear ?? 0;
+  const dmgLeft = car.damageLeft ?? 0;
+  const dmgRight = car.damageRight ?? 0;
+  // Front wing / sidepod crumpling slightly reduces front aerodynamic downforce & increases parasitic drag
+  const aeroDownforceHealth = clamp(1.0 - dmgFront * 0.09 - dmgRear * 0.07, 0.84, 1.0);
+  const aeroDragPenalty = 1.0 + (dmgFront + dmgLeft + dmgRight) * 0.06;
+
   const currentErs = car.ersBattery ?? 100;
   const currentTireHealth = car.tireHealth ?? 100;
-  const tireGripFactor = 0.84 + 0.16 * (currentTireHealth / 100);
+  const currentTireTemp = car.tireTemp ?? 88;
+  // Pirelli Thermal Grip Window: warms from cold (~78°C) into optimal 95-108°C window, drops slightly when overheated (>118°C)
+  const thermalGripMult =
+    currentTireTemp < 95
+      ? 0.96 + 0.04 * clamp((currentTireTemp - 74) / 21, 0, 1)
+      : currentTireTemp <= 112
+        ? 1.015
+        : Math.max(0.92, 1.015 - (currentTireTemp - 112) * 0.006);
+  const tireGripFactor = (0.84 + 0.16 * (currentTireHealth / 100)) * thermalGripMult;
   const strategyGripMult =
     activeStrategy === 'conserve' ? 1.07 : activeStrategy === 'attack' ? 0.985 : 1.0;
 
@@ -228,6 +324,8 @@ export function stepVehiclePhysics(
   let lastBrake = 0;
   let maxSlipRatio = 0;
   let hitBarrier = false;
+  let stepImpactSeverity = 0;
+  let stepImpactZone: 'front' | 'rear' | 'left' | 'right' | null = null;
 
   // Calibrated Newtonian Pacejka tire friction peak matching real F1 centripetal cornering limits:
   // Perfect Lap holds peak Pacejka grip (~3.8-4.5G) with zero off-track; reckless overspeed saturates tires & understeers wide!
@@ -347,13 +445,16 @@ export function stepVehiclePhysics(
     const maxBrakeForce = (0.24 + stats.grip * 0.95) * (surface.onAsphalt ? 1.0 : 0.48);
     const fBrake = brake * maxBrakeForce * (vFwd > 0.05 ? 1 : 0);
 
-    // Aerodynamic Drag (quadratic with velocity) + Surface Rolling Resistance
+    // Aerodynamic Drag (quadratic with velocity) + Surface Rolling Resistance + Structural Damage Drag
     const aeroDragCoeff =
-      (drsOpen ? 0.0012 : slipstreamActive ? 0.00105 : 0.00155) * (surface.onAsphalt ? 1.0 : 1.5);
+      (drsOpen ? 0.0012 : slipstreamActive ? 0.00105 : 0.00155) *
+      (surface.onAsphalt ? 1.0 : 1.5) *
+      aeroDragPenalty;
     const fDrag = aeroDragCoeff * vFwd * Math.abs(vFwd) + 0.0065 * surfaceDragMult * vFwd;
 
-    // Aerodynamic Ground-Effect Downforce: Normal load increases smoothly with speed^2!
-    const downforce = 0.90 + 0.0068 * vFwd * vFwd * (surface.onAsphalt ? 1.0 : 0.35);
+    // Aerodynamic Ground-Effect Downforce: Normal load increases smoothly with speed^2 (scaled by wing integrity)!
+    const downforce =
+      0.90 + 0.0068 * vFwd * vFwd * (surface.onAsphalt ? 1.0 : 0.35) * aeroDownforceHealth;
     const totalNormalLoad = MASS * downforce;
 
     // Dynamic Longitudinal Weight Transfer (braking loads front tires; acceleration loads rear tires)
@@ -394,10 +495,17 @@ export function stepVehiclePhysics(
     const scrubDrag =
       slipSat > 0.95 ? 0.018 * Math.min(2.5, slipSat - 0.95) * vFwd : 0;
 
+    // Track Banking Gravity Assist: real banked corners incline the normal vector inward, supporting higher cornering G
+    const bankGravityMag = surface.onAsphalt ? Math.sin(surface.bankAngleRad) * 0.068 : 0;
+    const bankInwardLat =
+      bankGravityMag !== 0
+        ? (-surface.inwardNormal.x * sinY + surface.inwardNormal.y * cosY) * Math.abs(bankGravityMag)
+        : 0;
+
     // Equations of Motion in Car Local Frame (Newton-Euler Rigid Body!)
     // Includes exact rotating-frame Coriolis/centripetal coupling (+ vLat * omega and - vFwd * omega)
     const fLongTotal = fEngine - fBrake - fDrag - scrubDrag - fLatFront * Math.sin(steer);
-    const fLatTotal = fLatRear + fLatFront * Math.cos(steer);
+    const fLatTotal = fLatRear + fLatFront * Math.cos(steer) + bankInwardLat * MASS;
 
     const aFwd = fLongTotal / MASS + vLat * omega;
     const aLat = fLatTotal / MASS - vFwd * omega;
@@ -430,18 +538,32 @@ export function stepVehiclePhysics(
     x += vx * subDt;
     y += vy * subDt;
 
-    // World canvas perimeter guard (safety walls)
+    // World canvas perimeter guard (outer stadium retaining walls)
     if (x < 14 || x > track.width - 14) {
+      const normalIntoCarX = x < 14 ? 1 : -1;
+      const impactV = Math.abs(vx);
       x = clamp(x, 14, track.width - 14);
       vx *= -0.28;
       vy *= 0.80;
       hitBarrier = true;
+      stepImpactSeverity = Math.max(stepImpactSeverity, clamp(impactV / 3.2, 0.15, 1.0));
+      car.x = x;
+      car.y = y;
+      car.angle = yaw;
+      stepImpactZone = applyLocalizedChassisDent(car, normalIntoCarX, 0, stepImpactSeverity);
     }
     if (y < 14 || y > track.height - 14) {
+      const normalIntoCarY = y < 14 ? 1 : -1;
+      const impactV = Math.abs(vy);
       y = clamp(y, 14, track.height - 14);
       vy *= -0.28;
       vx *= 0.80;
       hitBarrier = true;
+      stepImpactSeverity = Math.max(stepImpactSeverity, clamp(impactV / 3.2, 0.15, 1.0));
+      car.x = x;
+      car.y = y;
+      car.angle = yaw;
+      stepImpactZone = applyLocalizedChassisDent(car, 0, normalIntoCarY, stepImpactSeverity);
     }
 
     lastLongAccel = fLongTotal / MASS;
@@ -450,7 +572,7 @@ export function stepVehiclePhysics(
     lastBrake = brake;
   }
 
-  // 6. Runoff Tecpro safety barrier containment (uses inwardNormal so BOTH outer runoff AND inner infield push back TOWARD the track!)
+  // 6. Runoff Tecpro & Tire-Barrier Crash Physics (Realistic Energy Absorption, Wall Scraping, Yaw Lever-Arm & Localized Chassis Denting!)
   const postSurf = getTrackSurfaceInfo({ x, y }, track);
   const maxRunoffLimit = postSurf.halfWidth + 26;
   if (postSurf.distFromCenter > maxRunoffLimit) {
@@ -460,15 +582,29 @@ export function stepVehiclePhysics(
     const awayX = -toTrackX;
     const awayY = -toTrackY;
 
-    // Push cleanly back inside the runoff boundary TOWARD the track centerline
+    // Push cleanly back inside the Tecpro barrier face TOWARD the track centerline
     x += toTrackX * pushBack;
     y += toTrackY * pushBack;
 
+    // Decompose velocity into Normal (into barrier) and Tangential (along barrier face)
     const vAway = vx * awayX + vy * awayY;
+    const wallTanX = -awayY;
+    const wallTanY = awayX;
+    const vTan = vx * wallTanX + vy * wallTanY;
+
     if (vAway > 0) {
-      vx -= awayX * vAway * 1.15;
-      vy -= awayY * vAway * 1.15;
-      // Only scrub heavy kinetic energy on genuine barrier impacts (>0.45); gentle grazing lets a car steer cleanly back onto asphalt!
+      // Tecpro polyethylene foam & tire stacks have low coefficient of restitution (~0.18):
+      // they absorb normal impact energy by crumpling rather than bouncing like a pinball!
+      const tecproRestitution = vAway > 0.8 ? 0.18 : 0.14;
+      vx -= awayX * vAway * (1.0 + tecproRestitution);
+      vy -= awayY * vAway * (1.0 + tecproRestitution);
+
+      // Tangential wall-scraping Coulomb friction: grinding along the guardrail scrubs speed and throws sparks
+      const wallFriction = vAway > 0.45 ? 0.34 : 0.08;
+      const tanScrub = clamp(vAway * wallFriction, 0, Math.abs(vTan) * 0.42);
+      vx -= wallTanX * Math.sign(vTan) * tanScrub;
+      vy -= wallTanY * Math.sign(vTan) * tanScrub;
+
       if (vAway > 0.45) {
         vx *= 0.58;
         vy *= 0.58;
@@ -477,14 +613,29 @@ export function stepVehiclePhysics(
         vx *= 0.90;
         vy *= 0.90;
       }
-      // Glancing wall deflection: nose deflects slightly away from barrier normal so car never wedges nose-first
+
+      // Realistic rigid-body lever-arm yaw torque when nose or sidepod strikes the barrier at an angle:
+      // aligns the chassis parallel to the barrier while transferring rotational jolt!
       const noseIntoWall = Math.cos(yaw) * awayX + Math.sin(yaw) * awayY;
-      if (noseIntoWall > 0.22) {
-        const crossWall = Math.cos(yaw) * awayY - Math.sin(yaw) * awayX;
+      const crossWall = Math.cos(yaw) * awayY - Math.sin(yaw) * awayX;
+      if (noseIntoWall > 0.18) {
         const deflectDir = crossWall >= 0 ? -1 : 1;
-        yaw = normalizeAngle(yaw + deflectDir * 0.11 * noseIntoWall);
+        yaw = normalizeAngle(yaw + deflectDir * 0.13 * noseIntoWall);
+        omega = clamp(omega + deflectDir * vAway * 0.028 * noseIntoWall, -0.14, 0.14);
+      } else {
+        omega *= 0.42;
       }
-      omega *= 0.42;
+
+      // Compute physical crash severity from both normal impact velocity & high-speed wall-grinding energy
+      const impactEnergy = vAway + Math.abs(vTan) * (vAway > 0.32 ? 0.25 : 0);
+      if (vAway > 0.30 || impactEnergy > 0.65) {
+        const rawSev = clamp((impactEnergy - 0.24) / 2.6, 0.08, 1.0);
+        stepImpactSeverity = Math.max(stepImpactSeverity, rawSev);
+        car.x = x;
+        car.y = y;
+        car.angle = yaw;
+        stepImpactZone = applyLocalizedChassisDent(car, toTrackX, toTrackY, rawSev);
+      }
     }
   }
 
@@ -505,7 +656,9 @@ export function stepVehiclePhysics(
   car.driftAngle = clamp(-trueSlipAngle * 1.15, -0.52, 0.52);
 
   // Convert real local accelerations into realistic Formula 1 G-forces for HUD, Telemetry & Suspension Pitch/Roll
-  car.longitudinalG = clamp(lastLongAccel * 18.0, -5.2, 2.6);
+  // Spike longitudinal/lateral G transiently on barrier impact for violent suspension compression!
+  const impactGSpike = stepImpactSeverity > 0.1 ? -stepImpactSeverity * 3.8 : 0;
+  car.longitudinalG = clamp(lastLongAccel * 18.0 + impactGSpike, -5.2, 2.6);
   car.lateralG = clamp(lastLatAccel * 38.0, -4.8, 4.8);
   car.throttle = lastThrottle;
   car.brake = lastBrake;
@@ -531,7 +684,7 @@ export function stepVehiclePhysics(
     car.bounceCooldown = Math.max(0, car.bounceCooldown - dtFactor);
   }
 
-  // Update Pirelli Tire Health & Hybrid ERS MGU-K Battery
+  // Update Pirelli Tire Health, Thermal Core Temperature, Sequential 8-Speed Gearbox & Hybrid ERS Battery
   const wearRateMult =
     activeStrategy === 'conserve' ? 0.45 : activeStrategy === 'attack' ? 1.35 : 1.0;
   const frameTireWear =
@@ -539,6 +692,28 @@ export function stepVehiclePhysics(
     wearRateMult *
     dtFactor;
   car.tireHealth = Math.max(45, currentTireHealth - frameTireWear);
+
+  // Thermal tire equilibrium: lateral G + sliding heats compound; clean straights cool toward ambient airflow (~84°C)
+  const thermalLoad =
+    Math.abs(car.lateralG) * 0.16 +
+    (isDrifting ? 0.55 : 0) +
+    (isOverspeedWide ? 0.45 : 0) +
+    (lastBrake > 0.3 ? 0.18 : 0);
+  const ambientCool = (currentTireTemp - 82) * 0.014;
+  car.tireTemp = clamp(currentTireTemp + (thermalLoad - ambientCool) * dtFactor, 74, 128);
+
+  // 8-Speed Sequential F1 Gearbox + Upshift Torque Kick Pulse (drives chassis micro-pitch & exhaust overrun pop)
+  const prevGear = car.gear ?? 1;
+  const speedRatio = clamp(newSpeed / Math.max(4.8, stats.maxSpeed * 1.04), 0, 1);
+  const nextGear = clamp(Math.floor(speedRatio * 7.65) + 1, 1, 8);
+  car.gear = nextGear;
+  const prevKick = car.shiftKick ?? 0;
+  if (nextGear > prevGear && lastThrottle > 0.55 && newSpeed > 1.8) {
+    car.shiftKick = 1.0;
+  } else {
+    car.shiftKick = Math.max(0, prevKick - 0.14 * dtFactor);
+  }
+  car.onCurb = postSurf.onCurbOrGrass;
 
   const isBraking = lastBrake > 0.18 && newSpeed > 1.4;
   if (ersBoostActive) {
@@ -558,17 +733,19 @@ export function stepVehiclePhysics(
     surfaceElevationZ: postSurf.elevationZ,
     centrifugalForce: Math.abs(car.lateralG) / 2.2,
     distFromCenter: postSurf.distFromCenter,
-    hitBarrier
+    hitBarrier,
+    impactSeverity: stepImpactSeverity,
+    impactZone: stepImpactZone
   };
 }
 
 /**
- * Momentum-conserving 2D Elastic Rigid-Body Car-to-Car Collision Resolution.
- * Replaces artificial position teleports with realistic impulse exchange and yaw deflection.
+ * Momentum-conserving 2D Elastic Rigid-Body Car-to-Car Collision Resolution with Localized 3D Chassis Denting.
+ * Replaces artificial position teleports with realistic impulse exchange, yaw deflection, and carbon panel deformation.
  */
 export function resolveCarCollisions(
   cars: RaceCarState[],
-  onSpark?: (x: number, y: number) => void
+  onSpark?: (x: number, y: number, severity?: number) => void
 ): void {
   const minDist = 13.0;
   const restitution = 0.28; // F1 carbon chassis/tires absorb most energy without ping-ponging
@@ -601,21 +778,42 @@ export function resolveCarCollisions(
         const velAlongNormal = rvx * nx + rvy * ny;
 
         if (velAlongNormal < 0) {
-          // Equal mass impulse: J = -(1 + e) * vn / 2
+          // Equal mass normal impulse: J = -(1 + e) * vn / 2
           const jImpulse = (-(1 + restitution) * velAlongNormal) * 0.5;
           a.vx += jImpulse * nx;
           a.vy += jImpulse * ny;
           b.vx -= jImpulse * nx;
           b.vy -= jImpulse * ny;
 
-          // Subtle physical yaw bump from side-pod contact
+          // Coulomb tangential rubbing friction impulse (wheel-to-wheel scrub slows relative slide realistically)
+          const tx = -ny;
+          const ty = nx;
+          const velAlongTangent = rvx * tx + rvy * ty;
+          const frictionCoeff = 0.24;
+          const jtRaw = -velAlongTangent * 0.5;
+          const maxJt = jImpulse * frictionCoeff;
+          const jt = clamp(jtRaw, -maxJt, maxJt);
+          a.vx += jt * tx;
+          a.vy += jt * ty;
+          b.vx -= jt * tx;
+          b.vy -= jt * ty;
+
+          // Physical yaw torque exchange from normal impact + sidepod rubbing friction
           const crossA = Math.cos(a.angle) * ny - Math.sin(a.angle) * nx;
           const crossB = Math.cos(b.angle) * -ny - Math.sin(b.angle) * -nx;
-          a.angularVelocity = clamp((a.angularVelocity ?? 0) + crossA * jImpulse * 0.04, -0.14, 0.14);
-          b.angularVelocity = clamp((b.angularVelocity ?? 0) + crossB * jImpulse * 0.04, -0.14, 0.14);
+          const rubYaw = clamp(jt * 0.045, -0.04, 0.04);
+          a.angularVelocity = clamp((a.angularVelocity ?? 0) + crossA * jImpulse * 0.045 + rubYaw, -0.14, 0.14);
+          b.angularVelocity = clamp((b.angularVelocity ?? 0) + crossB * jImpulse * 0.045 - rubYaw, -0.14, 0.14);
 
-          if (onSpark && Math.abs(velAlongNormal) > 0.4) {
-            onSpark((a.x + b.x) * 0.5, (a.y + b.y) * 0.5);
+          // 3. Apply localized 3D bodywork denting to BOTH colliding cars based on impact vector & impulse!
+          const impactSev = clamp((Math.abs(velAlongNormal) + Math.abs(velAlongTangent) * 0.35) / 2.8, 0.08, 1.0);
+          // For car A, normal pointing FROM car B INTO car A is (nx, ny)
+          applyLocalizedChassisDent(a, nx, ny, impactSev);
+          // For car B, normal pointing FROM car A INTO car B is (-nx, -ny)
+          applyLocalizedChassisDent(b, -nx, -ny, impactSev);
+
+          if (onSpark && (Math.abs(velAlongNormal) > 0.28 || Math.abs(velAlongTangent) > 0.75)) {
+            onSpark((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, impactSev);
           }
         }
       }

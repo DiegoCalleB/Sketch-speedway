@@ -290,29 +290,61 @@ class AudioEngine {
     } catch {}
   }
 
-  playCrash() {
+  playCrash(severity: number = 0.65) {
     this.init();
     if (this.isMuted || !this.ctx || !this.noiseBuffer) return;
 
     try {
       const now = this.ctx.currentTime;
-      const noiseNode = this.ctx.createBufferSource();
-      noiseNode.buffer = this.noiseBuffer;
+      const sev = Math.max(0.15, Math.min(1.0, severity));
 
-      const filter = this.ctx.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(320, now);
+      // 1. Sub-bass structural chassis & Tecpro barrier thud (140Hz -> 36Hz punch)
+      const thudOsc = this.ctx.createOscillator();
+      const thudGain = this.ctx.createGain();
+      thudOsc.type = 'triangle';
+      thudOsc.frequency.setValueAtTime(125 + sev * 45, now);
+      thudOsc.frequency.exponentialRampToValueAtTime(34, now + 0.19 + sev * 0.08);
+      thudGain.gain.setValueAtTime(0.18 * sev, now);
+      thudGain.gain.exponentialRampToValueAtTime(0.001, now + 0.22 + sev * 0.08);
+      thudOsc.connect(thudGain);
+      thudGain.connect(this.ctx.destination);
+      thudOsc.start(now);
+      thudOsc.stop(now + 0.32);
 
-      const gain = this.ctx.createGain();
-      gain.gain.setValueAtTime(0.16, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.28);
+      // 2. Carbon-fiber & suspension crunch (Bandpass noise burst)
+      const crunchNode = this.ctx.createBufferSource();
+      crunchNode.buffer = this.noiseBuffer;
+      const crunchFilter = this.ctx.createBiquadFilter();
+      crunchFilter.type = 'bandpass';
+      crunchFilter.frequency.setValueAtTime(420 + sev * 380, now);
+      crunchFilter.Q.setValueAtTime(1.1, now);
+      const crunchGain = this.ctx.createGain();
+      crunchGain.gain.setValueAtTime(0.16 * sev, now);
+      crunchGain.gain.exponentialRampToValueAtTime(0.001, now + 0.24 + sev * 0.12);
+      crunchNode.connect(crunchFilter);
+      crunchFilter.connect(crunchGain);
+      crunchGain.connect(this.ctx.destination);
+      crunchNode.start(now, Math.random() * 0.5, 0.36);
 
-      noiseNode.connect(filter);
-      filter.connect(gain);
-      gain.connect(this.ctx.destination);
-
-      noiseNode.start(now);
-      noiseNode.stop(now + 0.3);
+      // 3. Metallic barrier / titanium skid-plate scrape ring
+      if (sev > 0.28) {
+        const scrapeOsc = this.ctx.createOscillator();
+        const scrapeFilter = this.ctx.createBiquadFilter();
+        const scrapeGain = this.ctx.createGain();
+        scrapeOsc.type = 'sawtooth';
+        scrapeOsc.frequency.setValueAtTime(640 + Math.random() * 220, now);
+        scrapeOsc.frequency.exponentialRampToValueAtTime(240, now + 0.16);
+        scrapeFilter.type = 'bandpass';
+        scrapeFilter.frequency.setValueAtTime(1100, now);
+        scrapeFilter.Q.setValueAtTime(3.2, now);
+        scrapeGain.gain.setValueAtTime(0.045 * sev, now);
+        scrapeGain.gain.exponentialRampToValueAtTime(0.0005, now + 0.18);
+        scrapeOsc.connect(scrapeFilter);
+        scrapeFilter.connect(scrapeGain);
+        scrapeGain.connect(this.ctx.destination);
+        scrapeOsc.start(now);
+        scrapeOsc.stop(now + 0.19);
+      }
     } catch {}
   }
 

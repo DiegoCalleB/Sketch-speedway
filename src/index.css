@@ -9,15 +9,16 @@
 @layer base {
   html,
   body {
-    overscroll-behavior: none;
+    overscroll-behavior-y: contain;
     background-color: #020617;
     -webkit-tap-highlight-color: transparent;
     -webkit-touch-callout: none;
     -webkit-text-size-adjust: 100%;
     user-select: none;
     -webkit-user-select: none;
-    touch-action: manipulation;
+    touch-action: pan-y manipulation;
     overflow-x: hidden;
+    overflow-y: auto;
   }
 
   #root {

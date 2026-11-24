@@ -252,6 +252,13 @@ for (const track of TRACKS) {
     'Collision cleanly separates overlapping F1 chassis without interpenetration'
   );
   assert(sparked, 'High-impulse contact triggers carbon-titanium collision spark callback');
+  assert(
+    (carA.damageFront ?? 0) > 0.05 &&
+      (carB.damageRear ?? 0) > 0.05 &&
+      (carA.chassisHealth ?? 100) < 100 &&
+      (carB.chassisHealth ?? 100) < 100,
+    `Rear-end collision dents Car A nosecone (front=${(carA.damageFront ?? 0).toFixed(2)}) and Car B rear diffuser/wing (rear=${(carB.damageRear ?? 0).toFixed(2)})`
+  );
 }
 
 // Regression Test 1: Car stranded deep on the inner grass facing backwards/sideways at 16 km/h (screenshot bug!)

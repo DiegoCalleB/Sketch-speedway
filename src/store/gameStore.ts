@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { GamePhase, Track, Player, CarType, CarStats, Point, AIArchetype, RaceResultItem, PlayerTelemetry } from '../types';
+import { GamePhase, Track, Player, CarType, CarStats, Point, AIArchetype, RaceResultItem, PlayerTelemetry, LightingPreset, WeatherCondition } from '../types';
 import { TRACKS } from '../utils/tracks';
 
 export interface CarLiveryOption {
@@ -65,6 +65,8 @@ interface GameState {
   selectedTrack: Track;
   gameMode: 'solo' | 'ai' | 'multiplayer';
   totalLaps: number;
+  lightingPreset: LightingPreset;
+  weather: WeatherCondition;
   players: Player[];
   activePlayerIndex: number;
   raceResults: RaceResultItem[] | null;
@@ -76,6 +78,8 @@ interface GameState {
   setSelectedTrack: (track: Track) => void;
   setGameMode: (mode: 'solo' | 'ai' | 'multiplayer') => void;
   setTotalLaps: (laps: number) => void;
+  setLightingPreset: (preset: LightingPreset) => void;
+  setWeather: (weather: WeatherCondition) => void;
   setupPlayers: (
     playersSetup: {
       name: string;
@@ -105,6 +109,8 @@ export const useGameStore = create<GameState>((set, get) => ({
   selectedTrack: TRACKS[0],
   gameMode: 'ai',
   totalLaps: 3,
+  lightingPreset: 'day',
+  weather: 'dry',
   players: [],
   activePlayerIndex: 0,
   raceResults: null,
@@ -114,6 +120,8 @@ export const useGameStore = create<GameState>((set, get) => ({
   setPhase: (phase) => set({ phase }),
   setSelectedTrack: (selectedTrack) => set({ selectedTrack }),
   setGameMode: (gameMode) => set({ gameMode }),
+  setLightingPreset: (lightingPreset) => set({ lightingPreset }),
+  setWeather: (weather) => set({ weather }),
   setTotalLaps: (totalLaps) =>
     set((state) => {
       const clampedLaps = Math.max(1, totalLaps);
