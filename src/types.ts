@@ -148,6 +148,7 @@ export interface RaceCarState {
   lastImpactSeverity?: number; // 0..1 transient shock impulse from latest barrier/car crash
   lastImpactZone?: 'front' | 'rear' | 'left' | 'right' | null;
   lastImpactPos?: { x: number; y: number } | null;
+  trackSegmentIdx?: number; // Progressive centerline segment index preventing cross-infield barrier tunneling
 }
 
 export interface Particle {

@@ -1,5 +1,13 @@
 import { CarStats, PaceStrategyMode, Point, RaceCarState, Track } from '../types';
-import { getMaxSafeCornerSpeed, getTrackSurfaceInfo } from './tracks';
+import {
+  checkSegmentCrossing,
+  distToSegment,
+  getMaxSafeCornerSpeed,
+  getTrackObstacleColliders,
+  getTrackSurfaceInfo,
+  registerPerfectLapPhysicsEvaluator,
+  resampleAndSmoothPath
+} from './tracks';
 
 export interface VehiclePhysicsStepResult {
   newSpeed: number;
@@ -21,6 +29,8 @@ const L_FRONT = WHEELBASE * 0.46; // Center of gravity slightly rear-biased like
 const L_REAR = WHEELBASE * 0.54;
 const MASS = 1.0; // Normalized F1 car mass
 const INERTIA_Z = 3.45; // Physical yaw moment of inertia (m * k^2) preventing impossible instant turns
+const CAR_HALF_LENGTH = 5.4; // Physical F1 nosecone / rear diffuser half-length for flush barrier contact
+const CAR_HALF_WIDTH = 3.0;  // Physical F1 sidepod / wheel-track half-width for flush barrier contact
 
 function clamp(val: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, val));
@@ -63,39 +73,39 @@ export function applyLocalizedChassisDent(
   }
 
   // Accumulate permanent plastic deformation (crumpling/denting) across the impacted zone + adjacent corner bleed
-  const dentGain = severity * 0.44;
+  const dentGain = severity * 0.68;
   if (primaryZone === 'front') {
     car.damageFront = clamp((car.damageFront ?? 0) + dentGain, 0, 1);
     if (localContactY > 0.25) {
-      car.damageRight = clamp((car.damageRight ?? 0) + dentGain * 0.42, 0, 1);
+      car.damageRight = clamp((car.damageRight ?? 0) + dentGain * 0.45, 0, 1);
     } else if (localContactY < -0.25) {
-      car.damageLeft = clamp((car.damageLeft ?? 0) + dentGain * 0.42, 0, 1);
+      car.damageLeft = clamp((car.damageLeft ?? 0) + dentGain * 0.45, 0, 1);
     }
   } else if (primaryZone === 'rear') {
     car.damageRear = clamp((car.damageRear ?? 0) + dentGain, 0, 1);
     if (localContactY > 0.25) {
-      car.damageRight = clamp((car.damageRight ?? 0) + dentGain * 0.35, 0, 1);
+      car.damageRight = clamp((car.damageRight ?? 0) + dentGain * 0.38, 0, 1);
     } else if (localContactY < -0.25) {
-      car.damageLeft = clamp((car.damageLeft ?? 0) + dentGain * 0.35, 0, 1);
+      car.damageLeft = clamp((car.damageLeft ?? 0) + dentGain * 0.38, 0, 1);
     }
   } else if (primaryZone === 'left') {
     car.damageLeft = clamp((car.damageLeft ?? 0) + dentGain, 0, 1);
     if (localContactX > 0.3) {
-      car.damageFront = clamp((car.damageFront ?? 0) + dentGain * 0.35, 0, 1);
+      car.damageFront = clamp((car.damageFront ?? 0) + dentGain * 0.40, 0, 1);
     }
   } else {
     car.damageRight = clamp((car.damageRight ?? 0) + dentGain, 0, 1);
     if (localContactX > 0.3) {
-      car.damageFront = clamp((car.damageFront ?? 0) + dentGain * 0.35, 0, 1);
+      car.damageFront = clamp((car.damageFront ?? 0) + dentGain * 0.40, 0, 1);
     }
   }
 
   const totalDamage =
-    (car.damageFront ?? 0) * 0.34 +
-    (car.damageRear ?? 0) * 0.22 +
-    (car.damageLeft ?? 0) * 0.22 +
-    (car.damageRight ?? 0) * 0.22;
-  car.chassisHealth = Math.round(clamp(100 - totalDamage * 75, 25, 100));
+    (car.damageFront ?? 0) * 0.46 +
+    (car.damageRear ?? 0) * 0.18 +
+    (car.damageLeft ?? 0) * 0.18 +
+    (car.damageRight ?? 0) * 0.18;
+  car.chassisHealth = Math.round(clamp(100 - totalDamage * 80, 20, 100));
   car.lastImpactSeverity = Math.max(car.lastImpactSeverity ?? 0, severity);
   car.lastImpactZone = primaryZone;
   car.lastImpactPos = {
@@ -193,16 +203,20 @@ export function stepVehiclePhysics(
   car.slipstreamActive = slipstreamActive;
 
   // 3. Surface, Tire Degradation, Structural Aero Damage & Hybrid Strategy State
-  const surface = getTrackSurfaceInfo({ x: car.x, y: car.y }, track);
+  const surface = getTrackSurfaceInfo({ x: car.x, y: car.y }, track, car.trackSegmentIdx);
+  let segIdx = surface.segmentIdx;
+  const trackObstacles = getTrackObstacleColliders(track);
   car.offTrack = !surface.onAsphalt;
 
   const dmgFront = car.damageFront ?? 0;
   const dmgRear = car.damageRear ?? 0;
   const dmgLeft = car.damageLeft ?? 0;
   const dmgRight = car.damageRight ?? 0;
-  // Front wing / sidepod crumpling slightly reduces front aerodynamic downforce & increases parasitic drag
-  const aeroDownforceHealth = clamp(1.0 - dmgFront * 0.09 - dmgRear * 0.07, 0.84, 1.0);
-  const aeroDragPenalty = 1.0 + (dmgFront + dmgLeft + dmgRight) * 0.06;
+  const healthRatio = clamp((car.chassisHealth ?? 100) / 100, 0.25, 1.0);
+  // Real F1 crash physics: crumpled wings & sidepods meaningfully degrade aero downforce, add drag & hurt alignment
+  const aeroDownforceHealth = clamp(1.0 - dmgFront * 0.28 - dmgRear * 0.16, 0.58, 1.0);
+  const aeroDragPenalty = 1.0 + (dmgFront + dmgLeft + dmgRight) * 0.42;
+  const damageSpeedMult = clamp(0.62 + 0.38 * healthRatio, 0.62, 1.0);
 
   const currentErs = car.ersBattery ?? 100;
   const currentTireHealth = car.tireHealth ?? 100;
@@ -281,29 +295,36 @@ export function stepVehiclePhysics(
     surface.onAsphalt && isCornerZone && overspeedRatio >= 0.72 && overspeedRatio <= 1.08;
   const apexMult = isApexBoost ? 1.06 : 1.0;
 
-  // Off-track grass/gravel heavily penalizes speed (no grass corner-cutting shortcuts!), while allowing smooth ~80-95 km/h recovery back to asphalt!
-  const surfaceDragMult = surface.onAsphalt ? 1.0 : surface.onCurbOrGrass ? 2.5 : 8.5;
+  // Off-track grass/gravel heavily penalizes speed (no grass corner-cutting shortcuts!), while allowing smooth ~75-90 km/h recovery back to asphalt!
+  const surfaceDragMult = surface.onAsphalt ? 1.0 : surface.onCurbOrGrass ? 10.5 : 21.0;
   // At low speeds (< 2.0), mechanical tire tread bite lets an off-track car steer cleanly back onto asphalt
   // At high speeds (> 2.8), grass/gravel grip drops to 0.34 so overspeeding still causes true understeer!
   const lowSpeedGrassBite = clamp(1 - (currentSpeed0 - 1.3) / 1.8, 0, 1);
   const offTrackMu = 0.34 + lowSpeedGrassBite * 0.44;
-  const surfaceMu = surface.onAsphalt ? 1.0 : surface.onCurbOrGrass ? Math.max(0.68, offTrackMu) : offTrackMu;
+  const surfaceMu = surface.onAsphalt ? 1.0 : surface.onCurbOrGrass ? Math.max(0.58, offTrackMu) : offTrackMu;
 
-  // Effective physical top speed given engine power, DRS, slipstream & ERS
+  // Effective physical top speed given engine power, DRS, slipstream, ERS & chassis structural health
   const maxCarSpeed =
     stats.maxSpeed *
     strategySpeedMult *
     apexMult *
+    damageSpeedMult *
     (slipstreamActive ? 1.10 : drsOpen ? 1.05 : 1.0);
 
   let targetSpeed = Math.min(
-    desiredSpeed * strategySpeedMult * (slipstreamActive ? 1.11 : drsOpen ? 1.04 : 1.0),
+    desiredSpeed * strategySpeedMult * damageSpeedMult * (slipstreamActive ? 1.11 : drsOpen ? 1.04 : 1.0),
     maxCarSpeed
   );
 
-  // If currently off-track on deep grass/gravel, cap cruise speed realistically (~95 km/h) while keeping enough throttle to rejoin cleanly
+  // If currently off-track on deep grass/gravel, cap throttle cruise speed realistically (~85 km/h) while keeping enough torque to rejoin cleanly
   if (!surface.onAsphalt && !surface.onCurbOrGrass) {
-    targetSpeed = clamp(targetSpeed, 1.9, 2.35);
+    targetSpeed = clamp(targetSpeed, 1.65, 2.05);
+  }
+  // Immediately after slamming a guardrail/obstacle, real suspension shock & gear downshift briefly limit engine throttle recovery
+  if (car.bounceCooldown > 0) {
+    const stunRatio = clamp(car.bounceCooldown / 52, 0, 1);
+    const stunSpeedCap = 1.05 + (1 - stunRatio) * 2.4;
+    targetSpeed = Math.min(targetSpeed, stunSpeedCap);
   }
 
   // 5. Sub-stepped Rigid-Body Physics Integration (4 substeps per frame for rock-solid Newtonian stability!)
@@ -368,6 +389,23 @@ export function stepVehiclePhysics(
       cursorIdx++;
     }
 
+    // If a messy finger-drawn waypoint lies behind a solid guardrail (e.g. deep in the infield),
+    // aim for the closest drivable inside/outside asphalt apex instead of ramming blindly into the guardrail
+    const clampAimToCorridor = (pt: Point): Point => {
+      const tSurf = getTrackSurfaceInfo(pt, track);
+      if (tSurf.distFromCenter > tSurf.halfWidth + 4.5) {
+        const pullIn = tSurf.distFromCenter - Math.max(4, tSurf.halfWidth - 3.0);
+        return {
+          ...pt,
+          x: pt.x + tSurf.inwardNormal.x * pullIn,
+          y: pt.y + tSurf.inwardNormal.y * pullIn
+        };
+      }
+      return pt;
+    };
+
+    targetPt = clampAimToCorridor(targetPt);
+
     // Anti-Orbiting Turning-Circle Check:
     // If targetPt lies inside our physical turning circle (or right beside/behind us while waypoints remain ahead),
     // smoothly look further forward along the spline until the target is outside the turning circle!
@@ -388,7 +426,7 @@ export function stepVehiclePhysics(
       }
 
       cursorIdx = Math.min(path.length - 1, cursorIdx + 2);
-      targetPt = path[cursorIdx];
+      targetPt = clampAimToCorridor(path[cursorIdx]);
       relX = targetPt.x - x;
       relY = targetPt.y - y;
       localX = relX * cosY + relY * sinY;
@@ -408,6 +446,16 @@ export function stepVehiclePhysics(
       desiredSteer = Math.atan(WHEELBASE * rawCurvature * 1.25);
     }
 
+    // If off-track and pressed close to a guardrail/tire wall at low recovery speed, steer away from the wall back toward asphalt
+    if (!surface.onAsphalt && speed < 2.2) {
+      const noseIntoPerimeter =
+        cosY * -surface.inwardNormal.x + sinY * -surface.inwardNormal.y;
+      if (noseIntoPerimeter > 0.25 && surface.distFromCenter > surface.halfWidth + 4.0) {
+        const crossToTrack = cosY * surface.inwardNormal.y - sinY * surface.inwardNormal.x;
+        desiredSteer = (crossToTrack >= 0 ? 1 : -1) * maxSteerLock;
+      }
+    }
+
     // Natural F1 driver counter-steer assistance when rear steps out (prevents unrealistic 720 spins)
     if (speed > 1.4 && Math.abs(vLat) > 0.28) {
       const currentSlip = Math.atan2(vLat, Math.max(0.8, Math.abs(vFwd)));
@@ -421,16 +469,20 @@ export function stepVehiclePhysics(
     steer += clamp(steerErr, -maxSteerDelta, maxSteerDelta);
 
     // Longitudinal Driver Inputs (Smooth Throttle & Progressive Carbon-Ceramic Braking)
-    // When making a sharp >75° recovery turn at low speed, modulate speed cleanly so turning radius stays tight
+    // Throttle respects physical caps (deep gravel, crash gear-recovery), whereas carbon-ceramic brakes ONLY engage
+    // when the driver's drawn speed profile actually calls for braking (never free auto-braking for flat-out reckless drivers!)
     const effectiveTargetSpeed =
       localX < 0 && !surface.onAsphalt ? Math.min(targetSpeed, 1.9) : targetSpeed;
-    const speedErr = effectiveTargetSpeed - vFwd;
+    const driverBrakeTarget =
+      localX < 0 && !surface.onAsphalt ? Math.min(desiredSpeed, 1.9) : desiredSpeed;
+    const throttleErr = effectiveTargetSpeed - vFwd;
+    const brakeErr = driverBrakeTarget - vFwd;
     let throttle = 0;
     let brake = 0;
-    if (speedErr > 0.06) {
-      throttle = clamp(speedErr / 1.15, 0, 1);
-    } else if (speedErr < -0.10) {
-      brake = clamp(-speedErr / 1.25, 0, 1);
+    if (brakeErr < -0.10) {
+      brake = clamp(-brakeErr / 1.25, 0, 1);
+    } else if (throttleErr > 0.06) {
+      throttle = clamp(throttleErr / 1.15, 0, 1);
     }
 
     // Physical Engine Power Curve + Braking Force + Quadratic Aerodynamic Drag (F_drag ~ v^2)
@@ -491,9 +543,9 @@ export function stepVehiclePhysics(
     const slipSat = Math.max(Math.abs(alphaFront), Math.abs(alphaRear)) / 0.20;
     if (slipSat > maxSlipRatio) maxSlipRatio = slipSat;
 
-    // Tire scrub induced drag when violently understeering/sliding (energy dissipation!)
+    // Tire scrub induced drag when violently understeering/sliding (real kinetic energy dissipation into smoke & heat!)
     const scrubDrag =
-      slipSat > 0.95 ? 0.018 * Math.min(2.5, slipSat - 0.95) * vFwd : 0;
+      slipSat > 0.96 ? 0.036 * Math.min(3.5, slipSat - 0.96) * vFwd : 0;
 
     // Track Banking Gravity Assist: real banked corners incline the normal vector inward, supporting higher cornering G
     const bankGravityMag = surface.onAsphalt ? Math.sin(surface.bankAngleRad) * 0.068 : 0;
@@ -538,15 +590,190 @@ export function stepVehiclePhysics(
     x += vx * subDt;
     y += vy * subDt;
 
+    // 5B. Sub-stepped Hard Outer & Inner Guardrail ("Quitamiedos") Containment with Oriented Car Hull!
+    // Running inside every substep prevents high-speed tunneling and ensures nosecone/sidepods hit flush at the visible 3D barrier face.
+    const subSurf = getTrackSurfaceInfo({ x, y }, track, segIdx);
+    segIdx = subSurf.segmentIdx;
+    const toTrackX = subSurf.inwardNormal.x;
+    const toTrackY = subSurf.inwardNormal.y;
+    const awayX = -toTrackX;
+    const awayY = -toTrackY;
+
+    // Oriented car footprint projection along the barrier outward normal
+    const hullExtentAlongBarrierNormal =
+      Math.abs(newCos * awayX + newSin * awayY) * CAR_HALF_LENGTH +
+      Math.abs(-newSin * awayX + newCos * awayY) * CAR_HALF_WIDTH;
+
+    const wallDistFromCenter =
+      subSurf.signedLateralDist >= 0
+        ? subSurf.outerBarrierDistFromCenter
+        : subSurf.innerBarrierDistFromCenter;
+    const maxAllowedCenterDist = Math.max(
+      subSurf.halfWidth + 2.2,
+      wallDistFromCenter - hullExtentAlongBarrierNormal
+    );
+
+    if (subSurf.distFromCenter > maxAllowedCenterDist) {
+      const pushBack = subSurf.distFromCenter - maxAllowedCenterDist;
+      x += toTrackX * (pushBack + 0.08);
+      y += toTrackY * (pushBack + 0.08);
+
+      const preWallSpeed = Math.hypot(vx, vy);
+      const vAway = vx * awayX + vy * awayY;
+      const wallTanX = -awayY;
+      const wallTanY = awayX;
+      const vTan = vx * wallTanX + vy * wallTanY;
+
+      if (vAway > 0) {
+        // Real FIA Tecpro foam & galvanized Armco steel barrier: absorbs normal energy with low restitution
+        const tecproRestitution = vAway > 0.75 ? 0.16 : 0.10;
+        vx -= awayX * vAway * (1.0 + tecproRestitution);
+        vy -= awayY * vAway * (1.0 + tecproRestitution);
+
+        const wallSpeed = Math.hypot(vx, vy);
+        // Coulomb wall-scraping friction: grinding against Armco steel & Tecpro foam violently scrubs high speed & throws sparks
+        const wallFriction = vAway > 0.26 ? 0.68 : wallSpeed > 1.4 ? 0.36 : 0.12;
+        const tanScrub = clamp(
+          vAway * wallFriction + (wallSpeed > 1.4 ? Math.abs(vTan) * 0.20 : 0),
+          0,
+          Math.abs(vTan) * 0.72
+        );
+        vx -= wallTanX * Math.sign(vTan) * tanScrub;
+        vy -= wallTanY * Math.sign(vTan) * tanScrub;
+
+        if (vAway > 0.28) {
+          const speedLoss = clamp(0.62 - vAway * 0.12, 0.24, 0.56);
+          vx *= speedLoss;
+          vy *= speedLoss;
+          if (preWallSpeed > 0.38) hitBarrier = true;
+        } else if (wallSpeed > 1.35) {
+          vx *= 0.78;
+          vy *= 0.78;
+          if (Math.abs(vTan) > 1.0) {
+            hitBarrier = true;
+          }
+        } else {
+          vx *= 0.94;
+          vy *= 0.94;
+        }
+
+        // Rigid-body lever-arm yaw alignment torque: swings the nose parallel to the guardrail so it cannot wedge through
+        const noseIntoWall = newCos * awayX + newSin * awayY;
+        const crossWall = newCos * awayY - newSin * awayX;
+        if (noseIntoWall > 0.10) {
+          const deflectDir = crossWall >= 0 ? -1 : 1;
+          const yawAlignScale = wallSpeed < 1.8 ? 0.11 : 0.045;
+          yaw = normalizeAngle(yaw + deflectDir * yawAlignScale * noseIntoWall);
+          omega = clamp(omega + deflectDir * Math.max(0.25, vAway) * 0.028 * noseIntoWall, -0.14, 0.14);
+        } else {
+          omega *= 0.45;
+        }
+
+        const impactEnergy = vAway + Math.abs(vTan) * (vAway > 0.24 ? 0.24 : 0.12);
+        if (
+          preWallSpeed > 0.38 &&
+          (vAway > 0.20 || impactEnergy > 0.50 || (wallSpeed > 1.35 && Math.abs(vTan) > 1.0))
+        ) {
+          const rawSev = clamp((impactEnergy - 0.14) / 2.2, 0.10, 1.0);
+          stepImpactSeverity = Math.max(stepImpactSeverity, rawSev);
+          hitBarrier = true;
+          car.x = x;
+          car.y = y;
+          car.angle = yaw;
+          stepImpactZone = applyLocalizedChassisDent(car, toTrackX, toTrackY, rawSev);
+        }
+      } else {
+        // Pressed statically into the barrier at low recovery speed: smoothly pivot nose back toward the track centerline
+        const noseIntoWall = newCos * awayX + newSin * awayY;
+        if (noseIntoWall > 0.15) {
+          const crossWall = newCos * awayY - newSin * awayX;
+          const deflectDir = crossWall >= 0 ? -1 : 1;
+          yaw = normalizeAngle(yaw + deflectDir * 0.09 * noseIntoWall);
+        }
+      }
+    }
+
+    // 5C. Sub-stepped Hard 3D Trackside Physical Obstacles (FIA Tire Stacks, Gantry & Monaco Tunnel Pillars)
+    const curCos = Math.cos(yaw);
+    const curSin = Math.sin(yaw);
+    for (let o = 0; o < trackObstacles.length; o++) {
+      const obs = trackObstacles[o];
+      const dxObs = x - obs.x;
+      if (dxObs > 11.5 || dxObs < -11.5) continue;
+      const dyObs = y - obs.y;
+      if (dyObs > 11.5 || dyObs < -11.5) continue;
+
+      const distObs = Math.hypot(dxObs, dyObs);
+      if (distObs < 0.001) continue;
+      const nxObs = dxObs / distObs;
+      const nyObs = dyObs / distObs;
+
+      const obsHullExtent =
+        Math.abs(curCos * nxObs + curSin * nyObs) * (CAR_HALF_LENGTH * 0.88) +
+        Math.abs(-curSin * nxObs + curCos * nyObs) * CAR_HALF_WIDTH;
+      const minSep = obs.radius + obsHullExtent;
+
+      if (distObs < minSep) {
+        const overlapObs = minSep - distObs + 0.08;
+        x += nxObs * overlapObs;
+        y += nyObs * overlapObs;
+
+        const preObsSpeed = Math.hypot(vx, vy);
+        const vInto = -(vx * nxObs + vy * nyObs);
+        if (vInto > 0) {
+          const obsRestitution = obs.kind === 'tire_stack' ? 0.14 : 0.26;
+          vx += nxObs * vInto * (1.0 + obsRestitution);
+          vy += nyObs * vInto * (1.0 + obsRestitution);
+
+          const obsTanX = -nyObs;
+          const obsTanY = nxObs;
+          const vObsTan = vx * obsTanX + vy * obsTanY;
+          const obsFriction = obs.kind === 'tire_stack' ? 0.45 : 0.30;
+          const scrubObs = clamp(vInto * obsFriction, 0, Math.abs(vObsTan) * 0.55);
+          vx -= obsTanX * Math.sign(vObsTan) * scrubObs;
+          vy -= obsTanY * Math.sign(vObsTan) * scrubObs;
+
+          const speedDamp = obs.kind === 'tire_stack' ? 0.58 : 0.70;
+          if (vInto > 0.20) {
+            vx *= speedDamp;
+            vy *= speedDamp;
+          }
+
+          const crossObs = curCos * nyObs - curSin * nxObs;
+          omega = clamp(omega + crossObs * Math.max(0.25, vInto) * 0.036, -0.14, 0.14);
+
+          if (vInto > 0.16 && preObsSpeed > 0.35) {
+            const rawObsSev = clamp(vInto / 2.2, 0.10, 1.0);
+            stepImpactSeverity = Math.max(stepImpactSeverity, rawObsSev);
+            hitBarrier = true;
+            car.x = x;
+            car.y = y;
+            car.angle = yaw;
+            stepImpactZone = applyLocalizedChassisDent(car, nxObs, nyObs, rawObsSev);
+          }
+        }
+
+        // Prevent front wing from wedging statically head-on against a tire-stack or pillar cylinder
+        // Only apply when genuinely stalled after crash shock cooldown so high-speed crashes never get free recovery assist
+        const postObsSpeed = Math.hypot(vx, vy);
+        const noseIntoObs = -(curCos * nxObs + curSin * nyObs);
+        if (postObsSpeed < 0.42 && car.bounceCooldown <= 0 && noseIntoObs > 0.20) {
+          const crossToTrack = curCos * toTrackY - curSin * toTrackX;
+          const deflectObs = crossToTrack >= 0 ? 1 : -1;
+          yaw = normalizeAngle(yaw + deflectObs * 0.14 * noseIntoObs);
+        }
+      }
+    }
+
     // World canvas perimeter guard (outer stadium retaining walls)
     if (x < 14 || x > track.width - 14) {
       const normalIntoCarX = x < 14 ? 1 : -1;
       const impactV = Math.abs(vx);
       x = clamp(x, 14, track.width - 14);
-      vx *= -0.28;
-      vy *= 0.80;
+      vx *= -0.22;
+      vy *= 0.76;
       hitBarrier = true;
-      stepImpactSeverity = Math.max(stepImpactSeverity, clamp(impactV / 3.2, 0.15, 1.0));
+      stepImpactSeverity = Math.max(stepImpactSeverity, clamp(impactV / 3.0, 0.15, 1.0));
       car.x = x;
       car.y = y;
       car.angle = yaw;
@@ -556,10 +783,10 @@ export function stepVehiclePhysics(
       const normalIntoCarY = y < 14 ? 1 : -1;
       const impactV = Math.abs(vy);
       y = clamp(y, 14, track.height - 14);
-      vy *= -0.28;
-      vx *= 0.80;
+      vy *= -0.22;
+      vx *= 0.76;
       hitBarrier = true;
-      stepImpactSeverity = Math.max(stepImpactSeverity, clamp(impactV / 3.2, 0.15, 1.0));
+      stepImpactSeverity = Math.max(stepImpactSeverity, clamp(impactV / 3.0, 0.15, 1.0));
       car.x = x;
       car.y = y;
       car.angle = yaw;
@@ -572,72 +799,9 @@ export function stepVehiclePhysics(
     lastBrake = brake;
   }
 
-  // 6. Runoff Tecpro & Tire-Barrier Crash Physics (Realistic Energy Absorption, Wall Scraping, Yaw Lever-Arm & Localized Chassis Denting!)
-  const postSurf = getTrackSurfaceInfo({ x, y }, track);
-  const maxRunoffLimit = postSurf.halfWidth + 26;
-  if (postSurf.distFromCenter > maxRunoffLimit) {
-    const pushBack = postSurf.distFromCenter - maxRunoffLimit;
-    const toTrackX = postSurf.inwardNormal.x;
-    const toTrackY = postSurf.inwardNormal.y;
-    const awayX = -toTrackX;
-    const awayY = -toTrackY;
-
-    // Push cleanly back inside the Tecpro barrier face TOWARD the track centerline
-    x += toTrackX * pushBack;
-    y += toTrackY * pushBack;
-
-    // Decompose velocity into Normal (into barrier) and Tangential (along barrier face)
-    const vAway = vx * awayX + vy * awayY;
-    const wallTanX = -awayY;
-    const wallTanY = awayX;
-    const vTan = vx * wallTanX + vy * wallTanY;
-
-    if (vAway > 0) {
-      // Tecpro polyethylene foam & tire stacks have low coefficient of restitution (~0.18):
-      // they absorb normal impact energy by crumpling rather than bouncing like a pinball!
-      const tecproRestitution = vAway > 0.8 ? 0.18 : 0.14;
-      vx -= awayX * vAway * (1.0 + tecproRestitution);
-      vy -= awayY * vAway * (1.0 + tecproRestitution);
-
-      // Tangential wall-scraping Coulomb friction: grinding along the guardrail scrubs speed and throws sparks
-      const wallFriction = vAway > 0.45 ? 0.34 : 0.08;
-      const tanScrub = clamp(vAway * wallFriction, 0, Math.abs(vTan) * 0.42);
-      vx -= wallTanX * Math.sign(vTan) * tanScrub;
-      vy -= wallTanY * Math.sign(vTan) * tanScrub;
-
-      if (vAway > 0.45) {
-        vx *= 0.58;
-        vy *= 0.58;
-        hitBarrier = true;
-      } else {
-        vx *= 0.90;
-        vy *= 0.90;
-      }
-
-      // Realistic rigid-body lever-arm yaw torque when nose or sidepod strikes the barrier at an angle:
-      // aligns the chassis parallel to the barrier while transferring rotational jolt!
-      const noseIntoWall = Math.cos(yaw) * awayX + Math.sin(yaw) * awayY;
-      const crossWall = Math.cos(yaw) * awayY - Math.sin(yaw) * awayX;
-      if (noseIntoWall > 0.18) {
-        const deflectDir = crossWall >= 0 ? -1 : 1;
-        yaw = normalizeAngle(yaw + deflectDir * 0.13 * noseIntoWall);
-        omega = clamp(omega + deflectDir * vAway * 0.028 * noseIntoWall, -0.14, 0.14);
-      } else {
-        omega *= 0.42;
-      }
-
-      // Compute physical crash severity from both normal impact velocity & high-speed wall-grinding energy
-      const impactEnergy = vAway + Math.abs(vTan) * (vAway > 0.32 ? 0.25 : 0);
-      if (vAway > 0.30 || impactEnergy > 0.65) {
-        const rawSev = clamp((impactEnergy - 0.24) / 2.6, 0.08, 1.0);
-        stepImpactSeverity = Math.max(stepImpactSeverity, rawSev);
-        car.x = x;
-        car.y = y;
-        car.angle = yaw;
-        stepImpactZone = applyLocalizedChassisDent(car, toTrackX, toTrackY, rawSev);
-      }
-    }
-  }
+  // 6. Post-step surface state & progressive segment commit
+  const postSurf = getTrackSurfaceInfo({ x, y }, track, segIdx);
+  car.trackSegmentIdx = postSurf.segmentIdx;
 
   // 7. Commit updated physical state back to RaceCarState
   car.x = x;
@@ -678,8 +842,8 @@ export function stepVehiclePhysics(
     car.overspeedTimer = Math.max(0, (car.overspeedTimer || 0) - dtFactor);
   }
 
-  if (hitBarrier && car.bounceCooldown <= 0) {
-    car.bounceCooldown = 14;
+  if (hitBarrier) {
+    car.bounceCooldown = Math.max(car.bounceCooldown, 52);
   } else if (car.bounceCooldown > 0) {
     car.bounceCooldown = Math.max(0, car.bounceCooldown - dtFactor);
   }
@@ -745,7 +909,8 @@ export function stepVehiclePhysics(
  */
 export function resolveCarCollisions(
   cars: RaceCarState[],
-  onSpark?: (x: number, y: number, severity?: number) => void
+  onSpark?: (x: number, y: number, severity?: number) => void,
+  track?: Track
 ): void {
   const minDist = 13.0;
   const restitution = 0.28; // F1 carbon chassis/tires absorb most energy without ping-ponging
@@ -816,7 +981,175 @@ export function resolveCarCollisions(
             onSpark((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, impactSev);
           }
         }
+
+        // 4. Keep both separated cars strictly inside the track guardrails so a car-to-car shove never pushes a car through a wall
+        if (track) {
+          for (const c of [a, b]) {
+            const cSurf = getTrackSurfaceInfo({ x: c.x, y: c.y }, track, c.trackSegmentIdx);
+            const cAwayX = -cSurf.inwardNormal.x;
+            const cAwayY = -cSurf.inwardNormal.y;
+            const cHull =
+              Math.abs(Math.cos(c.angle) * cAwayX + Math.sin(c.angle) * cAwayY) * CAR_HALF_LENGTH +
+              Math.abs(-Math.sin(c.angle) * cAwayX + Math.cos(c.angle) * cAwayY) * CAR_HALF_WIDTH;
+            const cWall =
+              cSurf.signedLateralDist >= 0
+                ? cSurf.outerBarrierDistFromCenter
+                : cSurf.innerBarrierDistFromCenter;
+            const cMax = Math.max(cSurf.halfWidth + 2.2, cWall - cHull);
+            if (cSurf.distFromCenter > cMax) {
+              const back = cSurf.distFromCenter - cMax + 0.08;
+              c.x += cSurf.inwardNormal.x * back;
+              c.y += cSurf.inwardNormal.y * back;
+            }
+          }
+        }
       }
     }
   }
 }
+
+function inferStatsFromGrip(carGrip: number): CarStats {
+  if (carGrip <= 0.055) {
+    return {
+      name: 'Rayo Veloz',
+      color: '#ef4444',
+      maxSpeed: 8.6,
+      acceleration: 0.16,
+      grip: carGrip,
+      driftRecovery: 0.15,
+      description: ''
+    };
+  }
+  if (carGrip >= 0.095) {
+    return {
+      name: 'Derrape Pro',
+      color: '#10b981',
+      maxSpeed: 7.4,
+      acceleration: 0.25,
+      grip: carGrip,
+      driftRecovery: 0.75,
+      description: ''
+    };
+  }
+  return {
+    name: 'Grip F1',
+    color: '#0ea5e9',
+    maxSpeed: 8.1,
+    acceleration: 0.2,
+    grip: carGrip,
+    driftRecovery: 0.45,
+    description: ''
+  };
+}
+
+// Register exact Newtonian rigid-body evaluator so getPerfectLapGuide proves & optimizes every corner in closed loop
+registerPerfectLapPhysicsEvaluator((track, densePoints, speeds, carGrip, gridIdx) => {
+  const rawPath: Point[] = densePoints.map((pt, i) => ({
+    x: pt.x,
+    y: pt.y,
+    t: i * 16,
+    speed: speeds[i]
+  }));
+  const path = resampleAndSmoothPath(rawPath, 5);
+  const grid = track.startGrid[gridIdx] || track.startGrid[0];
+  const stats = inferStatsFromGrip(carGrip);
+
+  const car: RaceCarState = {
+    playerId: 'perfect-lap-eval',
+    x: grid.x,
+    y: grid.y,
+    vx: 0,
+    vy: 0,
+    angle: grid.angle,
+    targetIndex: 0,
+    isDrifting: false,
+    driftAngle: 0,
+    offTrack: false,
+    finished: false,
+    disqualified: false,
+    timeFinished: null,
+    checkpointPassed: -1,
+    lap: 1,
+    bounceCooldown: 0,
+    slipstreamActive: false,
+    lapStartTime: 0,
+    lapTimes: [],
+    bestLapTime: null,
+    tireHealth: 100,
+    ersBattery: 100,
+    drsActive: false,
+    angularVelocity: 0,
+    steerAngle: 0,
+    slipAngle: 0,
+    longitudinalG: 0,
+    lateralG: 0,
+    throttle: 0,
+    brake: 0
+  };
+
+  let offTrackFrames = 0;
+  let barrierHits = 0;
+  let maxSpeed = 0;
+  const badNodes: number[] = [];
+  const latPeak = new Float32Array(densePoints.length);
+  const maxFrames = 760;
+
+  for (let frame = 0; frame < maxFrames; frame++) {
+    const oldX = car.x;
+    const oldY = car.y;
+    const res = stepVehiclePhysics(car, path, stats, track, [car], 0, 'balanced', 1.0);
+    const dNode = Math.min(
+      densePoints.length - 1,
+      Math.round((car.targetIndex / Math.max(1, path.length - 1)) * (densePoints.length - 1))
+    );
+    const surf = getTrackSurfaceInfo({ x: car.x, y: car.y }, track, car.trackSegmentIdx);
+    const latRatio = surf.distFromCenter / Math.max(1, surf.halfWidth);
+    if (latRatio > latPeak[dNode]) latPeak[dNode] = latRatio;
+
+    if (car.offTrack || res.hitBarrier) {
+      if (car.offTrack) offTrackFrames++;
+      if (res.hitBarrier) barrierHits++;
+      badNodes.push(dNode);
+    }
+    if (res.newSpeed > maxSpeed) maxSpeed = res.newSpeed;
+
+    const nextCpIdx = car.checkpointPassed + 1;
+    if (nextCpIdx < track.checkpoints.length) {
+      const targetCp = track.checkpoints[nextCpIdx];
+      const cpDist = distToSegment({ x: car.x, y: car.y }, targetCp.p1, targetCp.p2).dist;
+      if (
+        checkSegmentCrossing({ x: oldX, y: oldY }, { x: car.x, y: car.y }, targetCp) ||
+        cpDist < 12
+      ) {
+        car.checkpointPassed = nextCpIdx;
+      }
+    }
+
+    if (
+      car.checkpointPassed >= track.checkpoints.length - 1 &&
+      (checkSegmentCrossing({ x: oldX, y: oldY }, { x: car.x, y: car.y }, track.startLine) ||
+        car.targetIndex >= path.length - 2)
+    ) {
+      return {
+        finished: true,
+        simSeconds: (frame * 16.667) / 1000,
+        offTrackFrames,
+        barrierHits,
+        maxSpeed,
+        badNodes,
+        latPeak
+      };
+    }
+  }
+
+  return {
+    finished: false,
+    simSeconds: (maxFrames * 16.667) / 1000,
+    offTrackFrames,
+    barrierHits,
+    maxSpeed,
+    badNodes,
+    latPeak
+  };
+});
+

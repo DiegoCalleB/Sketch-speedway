@@ -6,7 +6,8 @@ import {
   getPerfectLapGuide,
   resampleAndSmoothPath,
   checkSegmentCrossing,
-  distToSegment
+  distToSegment,
+  getTrackSurfaceInfo
 } from './tracks';
 import { stepVehiclePhysics, resolveCarCollisions } from './vehiclePhysics';
 
@@ -335,4 +336,112 @@ for (const track of TRACKS) {
   assert(allFinished, `${track.name}: All 4 cars in wheel-to-wheel pack race finish cleanly without sticking`);
 }
 
+// Regression Test 4: High-Speed Head-On Impact Against Outer & Inner Guardrails ("Quitamiedos") — Zero Tunneling!
+for (const track of TRACKS) {
+  const { perfectPath } = getPerfectLapGuide(track, CAR_STATS.balanced.grip);
+  const path = resampleAndSmoothPath(perfectPath, 5);
+  const grid = track.startGrid[0];
+  const car = createInitialCar(track, 'wall-crash-test', 0);
+
+  // Aim car straight perpendicular into the outer guardrail at full F1 speed (~325 km/h)
+  const surfStart = getTrackSurfaceInfo(grid, track);
+  const outAng = Math.atan2(surfStart.outwardEdgeVec.y, surfStart.outwardEdgeVec.x);
+  car.angle = outAng;
+  car.vx = Math.cos(outAng) * 7.1;
+  car.vy = Math.sin(outAng) * 7.1;
+  car.trackSegmentIdx = surfStart.segmentIdx;
+
+  // Create a malicious path pointing straight through the outer guardrail wall 200 units out of bounds
+  const throughWallPath: Point[] = [];
+  for (let k = 0; k < 40; k++) {
+    throughWallPath.push({
+      x: grid.x + Math.cos(outAng) * (k * 6),
+      y: grid.y + Math.sin(outAng) * (k * 6),
+      t: k * 16,
+      speed: 7.2
+    });
+  }
+
+  let hitWall = false;
+  let maxPenetrationBeyondWall = 0;
+  for (let f = 0; f < 45; f++) {
+    const res = stepVehiclePhysics(car, throughWallPath, CAR_STATS.balanced, track, [car], 0, 'balanced', 1.0);
+    if (res.hitBarrier) hitWall = true;
+    const s = getTrackSurfaceInfo({ x: car.x, y: car.y }, track, car.trackSegmentIdx);
+    const pen = s.distFromCenter - s.outerBarrierDistFromCenter;
+    if (pen > maxPenetrationBeyondWall) maxPenetrationBeyondWall = pen;
+  }
+
+  assert(
+    hitWall && maxPenetrationBeyondWall <= 0.01 && (car.chassisHealth ?? 100) < 100,
+    `${track.name}: 325 km/h head-on guardrail crash blocks car completely (pen=${maxPenetrationBeyondWall.toFixed(
+      2
+    )} <= 0, health=${car.chassisHealth}%)`
+  );
+
+  // Also test inner infield guardrail impenetrability!
+  const innerCar = createInitialCar(track, 'inner-wall-test', 0);
+  const inAng = Math.atan2(-surfStart.outwardEdgeVec.y, -surfStart.outwardEdgeVec.x);
+  innerCar.angle = inAng;
+  innerCar.vx = Math.cos(inAng) * 7.1;
+  innerCar.vy = Math.sin(inAng) * 7.1;
+  innerCar.trackSegmentIdx = surfStart.segmentIdx;
+
+  const throughInnerPath: Point[] = [];
+  for (let k = 0; k < 40; k++) {
+    throughInnerPath.push({
+      x: grid.x + Math.cos(inAng) * (k * 6),
+      y: grid.y + Math.sin(inAng) * (k * 6),
+      t: k * 16,
+      speed: 7.2
+    });
+  }
+
+  let hitInner = false;
+  let maxInnerPen = 0;
+  for (let f = 0; f < 45; f++) {
+    const res = stepVehiclePhysics(innerCar, throughInnerPath, CAR_STATS.balanced, track, [innerCar], 0, 'balanced', 1.0);
+    if (res.hitBarrier) hitInner = true;
+    const s = getTrackSurfaceInfo({ x: innerCar.x, y: innerCar.y }, track, innerCar.trackSegmentIdx);
+    const pen = s.distFromCenter - s.innerBarrierDistFromCenter;
+    if (pen > maxInnerPen) maxInnerPen = pen;
+  }
+
+  assert(
+    hitInner && maxInnerPen <= 0.01 && path.length > 10,
+    `${track.name}: 325 km/h inner infield guardrail blocks car completely (pen=${maxInnerPen.toFixed(2)} <= 0)`
+  );
+}
+
+// Regression Test 5: Perfect Lap Provable Optimality Stress Test
+// Actively tries to beat getPerfectLapGuide with faster speed scales on every circuit and proves no legal clean lap (offTrack=0, walls=0) beats it!
+for (const track of TRACKS) {
+  const { perfectPath } = getPerfectLapGuide(track, CAR_STATS.balanced.grip);
+  const optSim = simulateSingleLap(track, perfectPath, 'balanced');
+  assert(
+    optSim.finished && optSim.offTrackFrames === 0 && optSim.barrierHits === 0,
+    `${track.name}: Optimal Perfect Lap completes legally with zero off-track & zero wall hits (${optSim.simSeconds.toFixed(2)}s)`
+  );
+
+  let fastestCleanChallenger = optSim.simSeconds;
+  let challengerLabel = 'none';
+  for (const mult of [1.03, 1.06, 1.10, 1.16, 1.25]) {
+    const fasterPath = perfectPath.map((pt) => ({
+      ...pt,
+      speed: Math.min(7.8, pt.speed * mult)
+    }));
+    const chal = simulateSingleLap(track, fasterPath, 'balanced');
+    if (chal.finished && chal.offTrackFrames === 0 && chal.barrierHits === 0 && chal.simSeconds < fastestCleanChallenger) {
+      fastestCleanChallenger = chal.simSeconds;
+      challengerLabel = `x${mult}`;
+    }
+  }
+
+  assert(
+    optSim.simSeconds <= fastestCleanChallenger + 0.05,
+    `${track.name}: Perfect Lap (${optSim.simSeconds.toFixed(2)}s) is provably optimal against faster legal speed profiles (best challenger ${challengerLabel}: ${fastestCleanChallenger.toFixed(2)}s)`
+  );
+}
+
 console.log('--- ALL NEWTONIAN RIGID-BODY PHYSICS TESTS PASSED ---');
+

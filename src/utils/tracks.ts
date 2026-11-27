@@ -28,15 +28,15 @@ export function distToSegment(
   p: TrackPoint,
   a: TrackPoint,
   b: TrackPoint
-): { dist: number; closest: TrackPoint } {
+): { dist: number; closest: TrackPoint; t: number } {
   const dx = b.x - a.x;
   const dy = b.y - a.y;
   const lenSq = dx * dx + dy * dy;
-  if (lenSq === 0) return { dist: Math.hypot(p.x - a.x, p.y - a.y), closest: { x: a.x, y: a.y } };
+  if (lenSq === 0) return { dist: Math.hypot(p.x - a.x, p.y - a.y), closest: { x: a.x, y: a.y }, t: 0 };
   let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
   t = Math.max(0, Math.min(1, t));
   const closest = { x: a.x + t * dx, y: a.y + t * dy };
-  return { dist: Math.hypot(p.x - closest.x, p.y - closest.y), closest };
+  return { dist: Math.hypot(p.x - closest.x, p.y - closest.y), closest, t };
 }
 
 // Check if a line segment intersects another line segment
@@ -709,10 +709,18 @@ export function getTrackBankingProfile(track: Track): {
   return profile;
 }
 
-// Analyze where a point is relative to the track centerline, boundaries, and local track curvature
+// Physical Guardrail ("Quitamiedos") & Trackside Obstacle Offsets (world units beyond track asphalt edge)
+// These constants are shared 1:1 between the 3D WebGL TrackMesh geometry and the rigid-body collision physics!
+export const OUTER_GUARDRAIL_OFFSET = 13.5; // Continuous outer FIA Tecpro & steel Armco barrier offset outside outerBoundary
+export const INNER_GUARDRAIL_OFFSET = 9.5;  // Continuous inner FIA Armco guardrail offset inside innerBoundary (infield perimeter)
+
+// Analyze where a point is relative to the track centerline, boundaries, guardrails, and local track curvature.
+// If hintSegmentIdx is provided, searches a local progressive window around hintSegmentIdx first so a car
+// can NEVER teleport or snap through an infield guardrail wall onto a different leg of the circuit!
 export function getTrackSurfaceInfo(
   pt: TrackPoint,
-  track: Track
+  track: Track,
+  hintSegmentIdx?: number
 ): {
   onAsphalt: boolean;
   onCurbOrGrass: boolean;
@@ -721,7 +729,11 @@ export function getTrackSurfaceInfo(
   inwardNormal: TrackPoint;
   outwardEdgeVec: TrackPoint;
   distFromCenter: number;
+  signedLateralDist: number; // + toward outer guardrail, - toward inner infield guardrail
   halfWidth: number;
+  outerBarrierDistFromCenter: number;
+  innerBarrierDistFromCenter: number;
+  segmentIdx: number;
   trackCurvature: number; // radians per pixel of centerline turn
   trackTurnSign: number;
   elevationZ: number;
@@ -734,8 +746,9 @@ export function getTrackSurfaceInfo(
   let minDist = Infinity;
   let bestIdx = 0;
   let bestClosest: TrackPoint = { x: 400, y: 250 };
+  let bestT = 0;
 
-  for (let i = 0; i < len; i++) {
+  const evaluateSegment = (i: number) => {
     const nIdx = (i + 1) % len;
     const c1 = { x: (outer[i].x + inner[i].x) * 0.5, y: (outer[i].y + inner[i].y) * 0.5 };
     const c2 = { x: (outer[nIdx].x + inner[nIdx].x) * 0.5, y: (outer[nIdx].y + inner[nIdx].y) * 0.5 };
@@ -744,6 +757,26 @@ export function getTrackSurfaceInfo(
       minDist = res.dist;
       bestIdx = i;
       bestClosest = res.closest;
+      bestT = res.t;
+    }
+  };
+
+  if (typeof hintSegmentIdx === 'number' && hintSegmentIdx >= 0 && hintSegmentIdx < len) {
+    // Search a progressive window of ±12 segments around the car's current track progression
+    const windowRadius = Math.min(14, Math.floor(len * 0.16));
+    for (let offset = -windowRadius; offset <= windowRadius; offset++) {
+      const i = (hintSegmentIdx + offset + len * 4) % len;
+      evaluateSegment(i);
+    }
+    // Only fall back to full global search if the point is extraordinarily far from the local corridor (> 145 units)
+    if (minDist > 145) {
+      for (let i = 0; i < len; i++) {
+        evaluateSegment(i);
+      }
+    }
+  } else {
+    for (let i = 0; i < len; i++) {
+      evaluateSegment(i);
     }
   }
 
@@ -772,25 +805,48 @@ export function getTrackSurfaceInfo(
   const trackCurvature = Math.abs(dAngle) / ((d1 + d2) * 0.5);
   const trackTurnSign = Math.sign(dAngle) || 1;
 
-  const outerPt = outer[bestIdx];
-  const innerPt = inner[bestIdx];
+  const nBestIdx = (bestIdx + 1) % len;
+  const outerPt = {
+    x: outer[bestIdx].x + (outer[nBestIdx].x - outer[bestIdx].x) * bestT,
+    y: outer[bestIdx].y + (outer[nBestIdx].y - outer[bestIdx].y) * bestT
+  };
+  const innerPt = {
+    x: inner[bestIdx].x + (inner[nBestIdx].x - inner[bestIdx].x) * bestT,
+    y: inner[bestIdx].y + (inner[nBestIdx].y - inner[bestIdx].y) * bestT
+  };
   const halfWidth = Math.hypot(outerPt.x - innerPt.x, outerPt.y - innerPt.y) * 0.5;
 
-  const dx = bestClosest.x - pt.x;
-  const dy = bestClosest.y - pt.y;
-  const dLen = Math.hypot(dx, dy) || 1;
-  const inwardNormal = { x: dx / dLen, y: dy / dLen };
-
-  // Vector pointing from inner apex toward outer curb of the track at bestIdx
+  // Vector pointing from inner apex toward outer curb of the track at interpolated segment point
   const oDx = outerPt.x - innerPt.x;
   const oDy = outerPt.y - innerPt.y;
   const oLen = Math.hypot(oDx, oDy) || 1;
   const outwardEdgeVec = { x: oDx / oLen, y: oDy / oLen };
 
-  const inPoly = isPointInPolygon(pt, outer) && !isPointInPolygon(pt, inner);
-  const onAsphalt = inPoly || minDist <= halfWidth + 2;
-  const onCurbOrGrass = !onAsphalt && minDist <= halfWidth + 14;
-  const hitBarrier = false; // No artificial invisible wall bounce — realistic gravel/grass runoff slows the car down!
+  // Signed lateral projection from centerline (+ = toward outer boundary, - = toward inner infield boundary)
+  const relFromCenterX = pt.x - bestClosest.x;
+  const relFromCenterY = pt.y - bestClosest.y;
+  const radialDot = relFromCenterX * outwardEdgeVec.x + relFromCenterY * outwardEdgeVec.y;
+  const signedLateralDist = radialDot >= 0 ? minDist : -minDist;
+
+  // Inward normal ALWAYS points from the car back toward the track centerline
+  const dx = bestClosest.x - pt.x;
+  const dy = bestClosest.y - pt.y;
+  const dLen = Math.hypot(dx, dy);
+  const inwardNormal =
+    dLen > 0.001
+      ? { x: dx / dLen, y: dy / dLen }
+      : { x: -outwardEdgeVec.x * Math.sign(radialDot || 1), y: -outwardEdgeVec.y * Math.sign(radialDot || 1) };
+
+  const outerBarrierDistFromCenter = halfWidth + OUTER_GUARDRAIL_OFFSET;
+  const innerBarrierDistFromCenter = halfWidth + INNER_GUARDRAIL_OFFSET;
+
+  const onAsphalt = minDist <= halfWidth + 1.8;
+  // Exact 3D painted FIA kerb strip width (~2.4–3.4 units); beyond +3.2 up to the guardrail is deep gravel/grass runoff!
+  const onCurbOrGrass = !onAsphalt && minDist <= halfWidth + 3.2;
+  const hitBarrier =
+    radialDot >= 0
+      ? minDist > outerBarrierDistFromCenter
+      : minDist > innerBarrierDistFromCenter;
 
   // Compute banking height & roll angle at this point
   const distToInner = Math.hypot(pt.x - innerPt.x, pt.y - innerPt.y);
@@ -807,12 +863,178 @@ export function getTrackSurfaceInfo(
     inwardNormal,
     outwardEdgeVec,
     distFromCenter: minDist,
+    signedLateralDist,
     halfWidth,
+    outerBarrierDistFromCenter,
+    innerBarrierDistFromCenter,
+    segmentIdx: bestIdx,
     trackCurvature,
     trackTurnSign,
     elevationZ,
     bankAngleRad
   };
+}
+
+/**
+ * Constrain a user-drawn point so the player's finger/cursor cannot draw a racing line that passes
+ * through the physical 3D inner or outer guardrails ("quitamiedos") or cuts across the infield to another leg.
+ */
+export function clampDrawnPointToTrackCorridor(
+  rawPt: TrackPoint,
+  track: Track,
+  prevSegmentIdx?: number
+): { pt: TrackPoint; segmentIdx: number; clampedAgainstBarrier: boolean } {
+  const surf = getTrackSurfaceInfo(rawPt, track, prevSegmentIdx);
+  // Keep drawn centerline target inside the physical guardrail face minus car half-width margin (3.3 units)
+  const maxOuterDraw = surf.outerBarrierDistFromCenter - 3.3;
+  const maxInnerDraw = surf.innerBarrierDistFromCenter - 3.3;
+
+  if (surf.signedLateralDist > maxOuterDraw) {
+    return {
+      pt: {
+        x: surf.closestCenterPt.x + surf.outwardEdgeVec.x * maxOuterDraw,
+        y: surf.closestCenterPt.y + surf.outwardEdgeVec.y * maxOuterDraw
+      },
+      segmentIdx: surf.segmentIdx,
+      clampedAgainstBarrier: true
+    };
+  }
+  if (-surf.signedLateralDist > maxInnerDraw) {
+    return {
+      pt: {
+        x: surf.closestCenterPt.x - surf.outwardEdgeVec.x * maxInnerDraw,
+        y: surf.closestCenterPt.y - surf.outwardEdgeVec.y * maxInnerDraw
+      },
+      segmentIdx: surf.segmentIdx,
+      clampedAgainstBarrier: true
+    };
+  }
+  return {
+    pt: rawPt,
+    segmentIdx: surf.segmentIdx,
+    clampedAgainstBarrier: false
+  };
+}
+
+export interface TrackObstacleCollider {
+  x: number;
+  y: number;
+  radius: number;
+  kind: 'tire_stack' | 'pillar';
+}
+
+const _trackObstacleCache = new Map<string, TrackObstacleCollider[]>();
+
+/**
+ * Compute physical 2D rigid-body colliders for trackside 3D obstacles (FIA corner tire barrier stacks,
+ * start/finish & sector gantry pillars, and Monaco tunnel colonade pillars) matching TrackMesh.tsx 1:1.
+ */
+export function getTrackObstacleColliders(track: Track): TrackObstacleCollider[] {
+  const cached = _trackObstacleCache.get(track.id);
+  if (cached) return cached;
+
+  const colliders: TrackObstacleCollider[] = [];
+  const outer = track.outerBoundary;
+  const inner = track.innerBoundary;
+  const len = Math.min(outer.length, inner.length);
+  const banking = getTrackBankingProfile(track);
+
+  const tryPushObstacle = (x: number, y: number, radius: number, kind: 'tire_stack' | 'pillar') => {
+    const s = getTrackSurfaceInfo({ x, y }, track);
+    // Guarantee zero trackside obstacles ever overhang the racing asphalt or kerbs (even across tight hairpin folds)
+    if (s.distFromCenter < s.halfWidth + 7.2) return;
+    colliders.push({ x, y, radius, kind });
+  };
+
+  // 1. FIA Corner Tire Barrier Stacks flush against outer & inner corner guardrails
+  for (let i = 0; i < len; i++) {
+    const nIdx = (i + 1) % len;
+    const b1 = banking[i];
+    const b2 = banking[nIdx];
+    if (b1.curvature < 0.0032 && b2.curvature < 0.0032) continue;
+
+    const o1 = outer[i];
+    const i1 = inner[i];
+    const dx = o1.x - i1.x;
+    const dy = o1.y - i1.y;
+    const dLen = Math.hypot(dx, dy) || 1;
+    const nx = dx / dLen;
+    const ny = dy / dLen;
+
+    // Outer tire stack column (matches TrackMesh.tsx cylinder radius 1.45)
+    tryPushObstacle(
+      o1.x + nx * (OUTER_GUARDRAIL_OFFSET - 0.9),
+      o1.y + ny * (OUTER_GUARDRAIL_OFFSET - 0.9),
+      1.65,
+      'tire_stack'
+    );
+
+    // Inner apex tire stack column
+    if (i % 2 === 0) {
+      tryPushObstacle(
+        i1.x - nx * (INNER_GUARDRAIL_OFFSET - 0.9),
+        i1.y - ny * (INNER_GUARDRAIL_OFFSET - 0.9),
+        1.55,
+        'tire_stack'
+      );
+    }
+  }
+
+  // 2. Start/Finish Overhead FIA Gantry Steel Pillars
+  {
+    const p1 = track.startLine.p1;
+    const p2 = track.startLine.p2;
+    const mx = (p1.x + p2.x) * 0.5;
+    const my = (p1.y + p2.y) * 0.5;
+    const dx = p2.x - p1.x;
+    const dy = p2.y - p1.y;
+    const span = Math.hypot(dx, dy) || 1;
+    const ux = dx / span;
+    const uy = dy / span;
+    const fullDist = Math.max(40, span - 14);
+    const pillarOff = fullDist * 0.56;
+    tryPushObstacle(mx - ux * pillarOff, my - uy * pillarOff, 2.0, 'pillar');
+    tryPushObstacle(mx + ux * pillarOff, my + uy * pillarOff, 2.0, 'pillar');
+  }
+
+  // 3. Sector Timing Arch Pillars (S1, S2, S3)
+  for (const cp of track.checkpoints) {
+    const mx = (cp.p1.x + cp.p2.x) * 0.5;
+    const my = (cp.p1.y + cp.p2.y) * 0.5;
+    const dx = cp.p2.x - cp.p1.x;
+    const dy = cp.p2.y - cp.p1.y;
+    const span = Math.hypot(dx, dy) || 1;
+    const ux = dx / span;
+    const uy = dy / span;
+    const cSpan = Math.max(46, span + 8);
+    const pillarOff = cSpan * 0.54;
+    tryPushObstacle(mx - ux * pillarOff, my - uy * pillarOff, 1.6, 'pillar');
+    tryPushObstacle(mx + ux * pillarOff, my + uy * pillarOff, 1.6, 'pillar');
+  }
+
+  // 4. Monaco Louis II Tunnel Concrete Colonade Pillars
+  if (track.id === 'monaco') {
+    const tunnelIndices = [48, 51, 54, 57, 60, 63];
+    for (const tIdx of tunnelIndices) {
+      const rIdx = tIdx % len;
+      const oRaw = outer[rIdx];
+      const iRaw = inner[rIdx];
+      const mx = (oRaw.x + iRaw.x) * 0.5;
+      const my = (oRaw.y + iRaw.y) * 0.5;
+      const dx = iRaw.x - oRaw.x;
+      const dy = iRaw.y - oRaw.y;
+      const span = Math.hypot(dx, dy) || 1;
+      const ux = dx / span;
+      const uy = dy / span;
+      const tSpan = Math.max(54, span + 12);
+      const pillarOff = tSpan * 0.54;
+      tryPushObstacle(mx - ux * pillarOff, my - uy * pillarOff, 2.1, 'pillar');
+      tryPushObstacle(mx + ux * pillarOff, my + uy * pillarOff, 2.1, 'pillar');
+    }
+  }
+
+  _trackObstacleCache.set(track.id, colliders);
+  return colliders;
 }
 
 // Compute the maximum safe cornering speed for a given path curvature & track curvature
@@ -1248,9 +1470,225 @@ export interface PerfectLapCallout {
   label: string;
 }
 
+export interface PerfectLapEvalResult {
+  finished: boolean;
+  simSeconds: number;
+  offTrackFrames: number;
+  barrierHits: number;
+  maxSpeed: number;
+  badNodes: number[];
+  latPeak: Float32Array;
+}
+
+export type PerfectLapPhysicsEvaluator = (
+  track: Track,
+  densePoints: TrackPoint[],
+  speeds: number[],
+  carGrip: number,
+  gridIdx: number
+) => PerfectLapEvalResult;
+
+let registeredPerfectLapEvaluator: PerfectLapPhysicsEvaluator | null = null;
+const perfectLapCache = new Map<
+  string,
+  { perfectPath: Point[]; callouts: PerfectLapCallout[]; optimalLapTimeSeconds?: number }
+>();
+
+export function registerPerfectLapPhysicsEvaluator(evaluator: PerfectLapPhysicsEvaluator): void {
+  registeredPerfectLapEvaluator = evaluator;
+  perfectLapCache.clear();
+}
+
 export const F1_KMH_FACTOR = 46;
 
-// Compute the "Perfect Lap" qualifying path (Out-In-Out racing line + late F1 braking + early full throttle exit)
+/**
+ * Iterative Minimum-Curvature + Shortest-Path (Out-In-Out) Racing Line Solver.
+ * Relaxes lateral station coordinates across the full usable asphalt corridor using a
+ * combined elastic-string (shortest distance) and biharmonic (minimum curvature) stencil,
+ * then upsamples via Catmull-Rom spline for C1-continuous F1 cornering arcs.
+ */
+export function computeMinimumCurvatureRacingLine(
+  track: Track,
+  marginPx: number = 8.0,
+  curvBlend: number = 0.36,
+  gridIdx: number = 0,
+  stepsCount: number = 220
+): TrackPoint[] {
+  const outer = track.outerBoundary;
+  const inner = track.innerBoundary;
+  const len = Math.min(outer.length, inner.length);
+
+  const startGridPt = track.startGrid[gridIdx] || track.startGrid[0];
+  let startIdx = 0;
+  let minDist = Infinity;
+  for (let i = 0; i < len; i++) {
+    const cx = (outer[i].x + inner[i].x) * 0.5;
+    const cy = (outer[i].y + inner[i].y) * 0.5;
+    const d = Math.hypot(cx - startGridPt.x, cy - startGridPt.y);
+    if (d < minDist) {
+      minDist = d;
+      startIdx = i;
+    }
+  }
+
+  const fvx = Math.cos(startGridPt.angle);
+  const fvy = Math.sin(startGridPt.angle);
+  const c0x = (outer[startIdx].x + inner[startIdx].x) * 0.5;
+  const c0y = (outer[startIdx].y + inner[startIdx].y) * 0.5;
+  const nIdx = (startIdx + 1) % len;
+  const pIdx = (startIdx - 1 + len) % len;
+  const fwdDot =
+    ((outer[nIdx].x + inner[nIdx].x) * 0.5 - c0x) * fvx +
+    ((outer[nIdx].y + inner[nIdx].y) * 0.5 - c0y) * fvy;
+  const bwdDot =
+    ((outer[pIdx].x + inner[pIdx].x) * 0.5 - c0x) * fvx +
+    ((outer[pIdx].y + inner[pIdx].y) * 0.5 - c0y) * fvy;
+  const isForward = fwdDot >= bwdDot;
+
+  const stations: { inner: TrackPoint; outer: TrackPoint; alpha: number }[] = [];
+  for (let i = 0; i < len; i++) {
+    const index = isForward ? (startIdx + i) % len : (startIdx - i + len * 10) % len;
+    stations.push({ inner: inner[index], outer: outer[index], alpha: 0.5 });
+  }
+
+  const getStationPt = (i: number): TrackPoint => {
+    const s = stations[(i + len * 10) % len];
+    return {
+      x: s.inner.x + (s.outer.x - s.inner.x) * s.alpha,
+      y: s.inner.y + (s.outer.y - s.inner.y) * s.alpha
+    };
+  };
+
+  // 65 passes of Gauss-Seidel minimum-curvature + shortest-path relaxation
+  for (let iter = 0; iter < 65; iter++) {
+    for (let i = 0; i < len; i++) {
+      const pM2 = getStationPt(i - 2);
+      const pM1 = getStationPt(i - 1);
+      const pP1 = getStationPt(i + 1);
+      const pP2 = getStationPt(i + 2);
+
+      const midX = (pM1.x + pP1.x) * 0.5;
+      const midY = (pM1.y + pP1.y) * 0.5;
+      const bihX = (4 * (pM1.x + pP1.x) - (pM2.x + pP2.x)) / 6;
+      const bihY = (4 * (pM1.y + pP1.y) - (pM2.y + pP2.y)) / 6;
+
+      const tx = midX * (1 - curvBlend) + bihX * curvBlend;
+      const ty = midY * (1 - curvBlend) + bihY * curvBlend;
+
+      const s = stations[i];
+      const wx = s.outer.x - s.inner.x;
+      const wy = s.outer.y - s.inner.y;
+      const wLenSq = Math.max(1, wx * wx + wy * wy);
+      const wLen = Math.sqrt(wLenSq);
+      const minA = Math.min(0.44, marginPx / wLen);
+      const rawA = ((tx - s.inner.x) * wx + (ty - s.inner.y) * wy) / wLenSq;
+      const clampedA = Math.max(minA, Math.min(1 - minA, rawA));
+      s.alpha = s.alpha * 0.55 + clampedA * 0.45;
+    }
+  }
+
+  // Smoothly merge start grid position into the optimal closed racing line
+  const ctrl: TrackPoint[] = [];
+  for (let i = 0; i < len; i++) {
+    const p = getStationPt(i);
+    if (i === 0) {
+      ctrl.push({ x: startGridPt.x, y: startGridPt.y });
+    } else if (i <= 3) {
+      const b = i / 4;
+      ctrl.push({
+        x: startGridPt.x * (1 - b) + p.x * b,
+        y: startGridPt.y * (1 - b) + p.y * b
+      });
+    } else {
+      ctrl.push(p);
+    }
+  }
+  ctrl.push(getStationPt(0), getStationPt(1), getStationPt(2), getStationPt(3));
+
+  // Catmull-Rom C1 spline upsampling
+  const dense: TrackPoint[] = [];
+  for (let s = 0; s < stepsCount; s++) {
+    const fIdx = (s / (stepsCount - 1)) * (ctrl.length - 1);
+    const i1 = Math.min(ctrl.length - 2, Math.floor(fIdx));
+    const t = fIdx - i1;
+    const p0 = ctrl[Math.max(0, i1 - 1)];
+    const p1 = ctrl[i1];
+    const p2 = ctrl[Math.min(ctrl.length - 1, i1 + 1)];
+    const p3 = ctrl[Math.min(ctrl.length - 1, i1 + 2)];
+    const t2 = t * t;
+    const t3 = t2 * t;
+    dense.push({
+      x:
+        0.5 *
+        (2 * p1.x +
+          (-p0.x + p2.x) * t +
+          (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 +
+          (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+      y:
+        0.5 *
+        (2 * p1.y +
+          (-p0.y + p2.y) * t +
+          (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 +
+          (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+    });
+  }
+
+  return dense;
+}
+
+function applyKinematicBrakingEnvelope(
+  dense: TrackPoint[],
+  rawSpeeds: number[],
+  brakeDecel: number
+): number[] {
+  const speeds = [...rawSpeeds];
+  for (let i = speeds.length - 2; i >= 0; i--) {
+    const ds = Math.hypot(dense[i + 1].x - dense[i].x, dense[i + 1].y - dense[i].y);
+    const vBrake = Math.sqrt(speeds[i + 1] * speeds[i + 1] + 2 * brakeDecel * ds);
+    if (vBrake < speeds[i]) {
+      speeds[i] = vBrake;
+    }
+  }
+  return speeds;
+}
+
+function computeAnalyticalPacejkaSpeeds(
+  track: Track,
+  dense: TrackPoint[],
+  carGrip: number,
+  eta: number,
+  maxStraightSpeed: number
+): number[] {
+  const baseMu = 0.195 * Math.pow(carGrip / 0.075, 0.54);
+  const peakLatCoeff = 1.152 * baseMu * eta;
+  const speeds = new Array<number>(dense.length).fill(maxStraightSpeed);
+
+  for (let i = 0; i < dense.length; i++) {
+    const pPrev = dense[Math.max(0, i - 3)];
+    const pCurr = dense[i];
+    const pNext = dense[Math.min(dense.length - 1, i + 3)];
+
+    const d1 = Math.hypot(pCurr.x - pPrev.x, pCurr.y - pPrev.y) || 1;
+    const d2 = Math.hypot(pNext.x - pCurr.x, pNext.y - pCurr.y) || 1;
+    const a1 = Math.atan2(pCurr.y - pPrev.y, pCurr.x - pPrev.x);
+    const a2 = Math.atan2(pNext.y - pCurr.y, pNext.x - pCurr.x);
+    let diff = Math.abs(a2 - a1);
+    if (diff > Math.PI) diff = Math.PI * 2 - diff;
+    const kappa = diff / ((d1 + d2) * 0.5);
+
+    const surf = getTrackSurfaceInfo(pCurr, track);
+    const bankAssist = Math.abs(Math.sin(surf.bankAngleRad)) * 0.068;
+    const effectiveKappa = kappa - 0.0068 * peakLatCoeff;
+    if (effectiveKappa > 0.0002) {
+      const vCorner = Math.sqrt((0.90 * peakLatCoeff + bankAssist) / effectiveKappa);
+      speeds[i] = Math.max(2.0, Math.min(maxStraightSpeed, vCorner));
+    }
+  }
+
+  return speeds;
+}
+
+// Compute the "Perfect Lap" qualifying path (true minimum-curvature Out-In-Out + closed-loop Pacejka physics optimization)
 export function getPerfectLapGuide(
   track: Track,
   carGrip: number = 0.08,
@@ -1258,85 +1696,123 @@ export function getPerfectLapGuide(
 ): {
   perfectPath: Point[];
   callouts: PerfectLapCallout[];
+  optimalLapTimeSeconds?: number;
 } {
-  const basePath = generateAIPath(track, 220, 'apex_master', gridIdx);
+  const cacheKey = `${track.id}:${carGrip.toFixed(3)}:${gridIdx}:${registeredPerfectLapEvaluator ? 1 : 0}`;
+  const cached = perfectLapCache.get(cacheKey);
+  if (cached) {
+    return {
+      perfectPath: cached.perfectPath.map((p) => ({ ...p })),
+      callouts: cached.callouts.map((c) => ({ ...c })),
+      optimalLapTimeSeconds: cached.optimalLapTimeSeconds
+    };
+  }
 
-  // Apply 2 passes of racing-line chord straightening (Out-In-Out minimum curvature line) while keeping on asphalt
-  const straightened: TrackPoint[] = basePath.map((p) => ({ x: p.x, y: p.y }));
-  for (let pass = 0; pass < 2; pass++) {
-    for (let i = 2; i < straightened.length - 2; i++) {
-      const prev = straightened[i - 2];
-      const curr = straightened[i];
-      const next = straightened[i + 2];
-      const cand = {
-        x: curr.x * 0.46 + (prev.x + next.x) * 0.27,
-        y: curr.y * 0.46 + (prev.y + next.y) * 0.27
-      };
-      const surf = getTrackSurfaceInfo(cand, track);
-      if (surf.onAsphalt && surf.distFromCenter <= surf.halfWidth * 0.86) {
-        straightened[i] = cand;
+  const maxStraightSpeed = carGrip <= 0.055 ? 7.8 : carGrip >= 0.095 ? 7.45 : 7.8;
+  const brakeDecel = (0.24 + carGrip * 0.95) * 0.84;
+
+  let bestDense: TrackPoint[] | null = null;
+  let bestSpeeds: number[] | null = null;
+  let bestSimTime = Infinity;
+
+  if (registeredPerfectLapEvaluator) {
+    const evaluator = registeredPerfectLapEvaluator;
+    const geometryCandidates = [
+      { marginPx: 8.2, curvBlend: 0.34 },
+      { marginPx: 7.2, curvBlend: 0.48 }
+    ];
+
+    for (const cfg of geometryCandidates) {
+      const dense = computeMinimumCurvatureRacingLine(track, cfg.marginPx, cfg.curvBlend, gridIdx, 220);
+      const rawSpeeds = computeAnalyticalPacejkaSpeeds(track, dense, carGrip, 1.02, maxStraightSpeed);
+
+      for (let iter = 0; iter < 16; iter++) {
+        const speeds = applyKinematicBrakingEnvelope(dense, rawSpeeds, brakeDecel);
+        const evalRes = evaluator(track, dense, speeds, carGrip, gridIdx);
+
+        if (evalRes.finished && evalRes.offTrackFrames === 0 && evalRes.barrierHits === 0) {
+          if (evalRes.simSeconds < bestSimTime) {
+            bestSimTime = evalRes.simSeconds;
+            bestDense = dense;
+            bestSpeeds = speeds;
+          }
+
+          // Selectively push ONLY corners that still have lateral grip headroom (< 90% of asphalt half-width)
+          let boosted = false;
+          for (let i = 0; i < rawSpeeds.length; i++) {
+            if (rawSpeeds[i] < maxStraightSpeed - 0.02) {
+              let localPeakLat = 0;
+              const winStart = Math.max(0, i - 4);
+              const winEnd = Math.min(dense.length - 1, i + 10);
+              for (let k = winStart; k <= winEnd; k++) {
+                if (evalRes.latPeak[k] > localPeakLat) {
+                  localPeakLat = evalRes.latPeak[k];
+                }
+              }
+              if (localPeakLat < 0.90) {
+                rawSpeeds[i] = Math.min(maxStraightSpeed, rawSpeeds[i] * 1.055);
+                boosted = true;
+              }
+            }
+          }
+          if (!boosted) break;
+          continue;
+        }
+
+        // Trim ONLY the braking/entry window leading into any off-track or barrier contact
+        const trimmed = new Set<number>();
+        for (let b = 0; b < evalRes.badNodes.length; b++) {
+          const bn = evalRes.badNodes[b];
+          const winStart = Math.max(0, bn - 17);
+          const winEnd = Math.min(dense.length - 1, bn + 3);
+          for (let k = winStart; k <= winEnd; k++) {
+            if (!trimmed.has(k)) {
+              trimmed.add(k);
+              rawSpeeds[k] = Math.max(1.85, rawSpeeds[k] * 0.91);
+            }
+          }
+        }
+        if (trimmed.size === 0) break;
+      }
+    }
+
+    // Final micro-polish: verify whether a tiny uniform +2.5% global speed push beats bestSimTime cleanly
+    if (bestDense && bestSpeeds) {
+      for (const nudge of [1.025, 1.05]) {
+        const nudgedSpeeds = applyKinematicBrakingEnvelope(
+          bestDense,
+          bestSpeeds.map((v) => Math.min(maxStraightSpeed, v * nudge)),
+          brakeDecel
+        );
+        const res = evaluator(track, bestDense, nudgedSpeeds, carGrip, gridIdx);
+        if (res.finished && res.offTrackFrames === 0 && res.barrierHits === 0 && res.simSeconds < bestSimTime) {
+          bestSimTime = res.simSeconds;
+          bestSpeeds = nudgedSpeeds;
+        } else {
+          break;
+        }
       }
     }
   }
 
-  // Compute local maximum grip speed at each node along the straightened Out-In-Out line
-  const rawMaxSpeeds: number[] = [];
-  for (let i = 0; i < straightened.length; i++) {
-    const curr = straightened[i];
-    const prev = straightened[Math.max(0, i - 3)];
-    const next = straightened[Math.min(straightened.length - 1, i + 3)];
-
-    const d1 = Math.hypot(curr.x - prev.x, curr.y - prev.y) || 1;
-    const d2 = Math.hypot(next.x - curr.x, next.y - curr.y) || 1;
-    const a1 = Math.atan2(curr.y - prev.y, curr.x - prev.x);
-    const a2 = Math.atan2(next.y - curr.y, next.x - curr.x);
-    let diff = Math.abs(a2 - a1);
-    if (diff > Math.PI) diff = Math.PI * 2 - diff;
-    const localCurv = diff / ((d1 + d2) * 0.5);
-
-    const surf = getTrackSurfaceInfo(curr, track);
-    const maxSafe = getMaxSafeCornerSpeed(localCurv, surf.trackCurvature, carGrip, true);
-    const isLowGripClass = carGrip < 0.07;
-    const gripCaution = isLowGripClass ? 0.90 : 0.975;
-    const minApexSpeed = isLowGripClass ? 2.40 : 2.60;
-
-    // Push physical tire limit in corners and full 7.45 (343 km/h) on straights!
-    const targetV = localCurv < 0.0034 && surf.trackCurvature < 0.0044
-      ? 7.45
-      : Math.max(minApexSpeed, Math.min(7.45, maxSafe * gripCaution));
-    rawMaxSpeeds.push(targetV);
-  }
-
-  // Backward pass (Late F1 Carbon-Ceramic Braking before corners) & Forward pass (Full-Throttle Exit)
-  const finalSpeeds = [...rawMaxSpeeds];
-  const brakeRate = carGrip < 0.07 ? 0.072 : 0.086;
-  for (let i = finalSpeeds.length - 2; i >= 0; i--) {
-    const stepDist = Math.hypot(
-      straightened[i + 1].x - straightened[i].x,
-      straightened[i + 1].y - straightened[i].y
-    );
-    // Late F1 braking deceleration envelope
-    finalSpeeds[i] = Math.min(finalSpeeds[i], finalSpeeds[i + 1] + stepDist * brakeRate);
-  }
-  for (let i = 1; i < finalSpeeds.length; i++) {
-    const stepDist = Math.hypot(
-      straightened[i].x - straightened[i - 1].x,
-      straightened[i].y - straightened[i - 1].y
-    );
-    // Crisp F1 exit acceleration envelope
-    finalSpeeds[i] = Math.min(finalSpeeds[i], finalSpeeds[i - 1] + stepDist * 0.115);
+  // Analytical fallback (used when tracks.ts runs standalone without vehiclePhysics registered, or extreme edge cases)
+  if (!bestDense || !bestSpeeds) {
+    bestDense = computeMinimumCurvatureRacingLine(track, 9.0, 0.42, gridIdx, 220);
+    const analyticalEta = carGrip < 0.06 ? 0.72 : 0.80;
+    const rawSpeeds = computeAnalyticalPacejkaSpeeds(track, bestDense, carGrip, analyticalEta, maxStraightSpeed);
+    bestSpeeds = applyKinematicBrakingEnvelope(bestDense, rawSpeeds, brakeDecel * 0.85);
   }
 
   const perfectPath: Point[] = [];
   let accumT = 0;
 
-  for (let i = 0; i < straightened.length; i++) {
-    const curr = straightened[i];
-    const idealSpeed = finalSpeeds[i];
+  for (let i = 0; i < bestDense.length; i++) {
+    const curr = bestDense[i];
+    const idealSpeed = bestSpeeds[i];
     const stepDist =
-      i === 0 ? 0 : Math.hypot(curr.x - straightened[i - 1].x, curr.y - straightened[i - 1].y);
+      i === 0 ? 0 : Math.hypot(curr.x - bestDense[i - 1].x, curr.y - bestDense[i - 1].y);
     // Match exact human drawing speed formula: rawSpeed = (dist / dt) * 15.5 => dt = (dist * 15.5) / idealSpeed
-    accumT += (stepDist * 15.5) / Math.max(2.0, idealSpeed);
+    accumT += (stepDist * 15.5) / Math.max(1.8, idealSpeed);
 
     perfectPath.push({
       x: curr.x,
@@ -1363,7 +1839,7 @@ export function getPerfectLapGuide(
       if (perfectPath[i].speed > maxPt.speed) maxPt = perfectPath[i];
     }
 
-    if (minPt.speed < 5.3) {
+    if (minPt.speed < 5.6) {
       const kmh = Math.round(minPt.speed * F1_KMH_FACTOR);
       callouts.push({
         x: minPt.x,
@@ -1384,6 +1860,18 @@ export function getPerfectLapGuide(
     }
   }
 
-  return { perfectPath, callouts };
+  const result = {
+    perfectPath,
+    callouts,
+    optimalLapTimeSeconds: Number.isFinite(bestSimTime) ? bestSimTime : undefined
+  };
+  perfectLapCache.set(cacheKey, result);
+
+  return {
+    perfectPath: result.perfectPath.map((p) => ({ ...p })),
+    callouts: result.callouts.map((c) => ({ ...c })),
+    optimalLapTimeSeconds: result.optimalLapTimeSeconds
+  };
 }
+
 

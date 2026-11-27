@@ -2,7 +2,12 @@ import React, { useMemo, useEffect, useRef } from 'react';
 import { useThree, useFrame } from '@react-three/fiber';
 import * as THREE from 'three';
 import { Track, WeatherCondition } from '../../types';
-import { getTrackBankingProfile } from '../../utils/tracks';
+import {
+  getTrackBankingProfile,
+  getTrackSurfaceInfo,
+  OUTER_GUARDRAIL_OFFSET,
+  INNER_GUARDRAIL_OFFSET
+} from '../../utils/tracks';
 import { LightingPreset } from './SceneAtmosphere';
 
 interface TrackMeshProps {
@@ -522,7 +527,11 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
     outerKerbGeometry,
     innerKerbGeometry,
     barrierGeometry,
+    innerBarrierGeometry,
+    outerRailCapGeometry,
+    innerRailCapGeometry,
     catchFenceGeometry,
+    innerCatchFenceGeometry,
     tireStackTransforms,
     apexCatEyeTransforms,
     marshalPanels,
@@ -723,11 +732,11 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       apronIdx.push(aVertCount + 1, aVertCount + 3, aVertCount + 2);
       aVertCount += 4;
 
-      // Raked Limestone Gravel Trap beyond the FIA friction apron
-      const g1x = o1.x + nx1 * stripW1;
-      const g1y = o1.y + ny1 * stripW1;
-      const g2x = o2.x + nx2 * stripW2;
-      const g2y = o2.y + ny2 * stripW2;
+      // Raked Limestone Gravel Trap beyond the FIA friction apron up to the outer guardrail face
+      const g1x = o1.x + nx1 * OUTER_GUARDRAIL_OFFSET;
+      const g1y = o1.y + ny1 * OUTER_GUARDRAIL_OFFSET;
+      const g2x = o2.x + nx2 * OUTER_GUARDRAIL_OFFSET;
+      const g2y = o2.y + ny2 * OUTER_GUARDRAIL_OFFSET;
 
       gravelPos.push(aEnd1X, 500 - aEnd1Y, 0.12);
       gravelPos.push(g1x, 500 - g1y, 0.08);
@@ -742,14 +751,28 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       gravelIndices.push(gVertCount + 1, gVertCount + 3, gVertCount + 2);
       gVertCount += 4;
 
-      // 3D Dark Rubber & FIA Blue/White Tecpro Tire Stack Columns along outer corner wall
-      const tx = o1.x + nx1 * (stripW1 + 0.8);
-      const ty = 500 - (o1.y + ny1 * (stripW1 + 0.8));
+      // 3D Dark Rubber & FIA Blue/White Tecpro Tire Stack Columns flush against outer & inner corner guardrails
       const isBlue = i % 2 === 0;
-      tireTransforms.push(
-        { x: tx, y: ty, z: 0.7, color: '#181c24' },
-        { x: tx, y: ty, z: 1.9, color: isBlue ? '#0284c7' : '#e2e8f0' }
-      );
+      const rawOutX = o1.x + nx1 * (OUTER_GUARDRAIL_OFFSET - 0.9);
+      const rawOutY = o1.y + ny1 * (OUTER_GUARDRAIL_OFFSET - 0.9);
+      const outSurf = getTrackSurfaceInfo({ x: rawOutX, y: rawOutY }, track);
+      if (outSurf.distFromCenter >= outSurf.halfWidth + 7.2) {
+        tireTransforms.push(
+          { x: rawOutX, y: 500 - rawOutY, z: 0.7, color: '#181c24' },
+          { x: rawOutX, y: 500 - rawOutY, z: 1.9, color: isBlue ? '#0284c7' : '#e2e8f0' }
+        );
+      }
+      if (i % 2 === 0) {
+        const rawInX = i1.x - nx1 * (INNER_GUARDRAIL_OFFSET - 0.9);
+        const rawInY = i1.y - ny1 * (INNER_GUARDRAIL_OFFSET - 0.9);
+        const inSurf = getTrackSurfaceInfo({ x: rawInX, y: rawInY }, track);
+        if (inSurf.distFromCenter >= inSurf.halfWidth + 7.2) {
+          tireTransforms.push(
+            { x: rawInX, y: 500 - rawInY, z: 0.7, color: '#181c24' },
+            { x: rawInX, y: 500 - rawInY, z: 1.8, color: isBlue ? '#ef4444' : '#e2e8f0' }
+          );
+        }
+      }
 
       // Embedded Solar LED Apex Cat-Eye Studs along inner & outer kerbs
       catEyes.push(
@@ -771,8 +794,8 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       if (i % 9 === 0 && b1.curvature > 0.005) {
         const aimAngle = Math.atan2(-ny1, -nx1);
         marshals.push({
-          x: o1.x + nx1 * (stripW1 + 1.8),
-          y: 500 - (o1.y + ny1 * (stripW1 + 1.8)),
+          x: o1.x + nx1 * (OUTER_GUARDRAIL_OFFSET + 1.4),
+          y: 500 - (o1.y + ny1 * (OUTER_GUARDRAIL_OFFSET + 1.4)),
           z: 4.5,
           angle: -aimAngle
         });
@@ -795,15 +818,32 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       gravelGeo.computeVertexNormals();
     }
 
-    // 4. Perimeter FIA Sponsor Tecpro Barrier Wall + Upper Debris Catch-Fencing Ribbon
+    // 4. Outer & Inner Continuous FIA Tecpro / Armco Guardrails ("Quitamiedos") + Top Steel Caps + Catch-Fencing
     const barPos: number[] = [];
     const barUvs: number[] = [];
     const barIdx: number[] = [];
 
+    const innerBarPos: number[] = [];
+    const innerBarUvs: number[] = [];
+    const innerBarIdx: number[] = [];
+
+    const outerCapPos: number[] = [];
+    const outerCapIdx: number[] = [];
+
+    const innerCapPos: number[] = [];
+    const innerCapIdx: number[] = [];
+
     const fencePos: number[] = [];
     const fenceIdx: number[] = [];
-    const wallHeight = 2.8;
+
+    const innerFencePos: number[] = [];
+    const innerFenceIdx: number[] = [];
+
+    const wallHeight = 3.0;
+    const innerWallHeight = 2.7;
+    const wallThickness = 1.25;
     const fenceHeight = 6.6;
+    const innerFenceHeight = 5.4;
 
     for (let i = 0; i <= len; i++) {
       const idx = i % len;
@@ -812,20 +852,42 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       const dx = oPt.x - iPt.x;
       const dy = oPt.y - iPt.y;
       const dLen = Math.hypot(dx, dy) || 1;
-      const b = banking[idx];
-      const offset = b.curvature > 0.0032 ? Math.min(31, 15 + b.curvature * 1200) : 13.5;
+      const nx = dx / dLen;
+      const ny = dy / dLen;
 
-      const bx = oPt.x + (dx / dLen) * offset;
-      const by = oPt.y + (dy / dLen) * offset;
+      // Exact 1:1 alignment with OUTER_GUARDRAIL_OFFSET & INNER_GUARDRAIL_OFFSET in tracks.ts / vehiclePhysics.ts
+      const bx = oPt.x + nx * OUTER_GUARDRAIL_OFFSET;
+      const by = oPt.y + ny * OUTER_GUARDRAIL_OFFSET;
       barPos.push(bx, 500 - by, 0.0);
       barPos.push(bx, 500 - by, wallHeight);
+
+      const bxBack = bx + nx * wallThickness;
+      const byBack = by + ny * wallThickness;
+      outerCapPos.push(bx, 500 - by, wallHeight + 0.04);
+      outerCapPos.push(bxBack, 500 - byBack, wallHeight + 0.04);
+
+      const ibx = iPt.x - nx * INNER_GUARDRAIL_OFFSET;
+      const iby = iPt.y - ny * INNER_GUARDRAIL_OFFSET;
+      innerBarPos.push(ibx, 500 - iby, 0.0);
+      innerBarPos.push(ibx, 500 - iby, innerWallHeight);
+
+      const ibxBack = ibx - nx * wallThickness;
+      const ibyBack = iby - ny * wallThickness;
+      innerCapPos.push(ibx, 500 - iby, innerWallHeight + 0.04);
+      innerCapPos.push(ibxBack, 500 - ibyBack, innerWallHeight + 0.04);
 
       const u = cumDist[i] / 95;
       barUvs.push(u, 0);
       barUvs.push(u, 1);
 
+      innerBarUvs.push(u, 0);
+      innerBarUvs.push(u, 1);
+
       fencePos.push(bx, 500 - by, wallHeight);
       fencePos.push(bx, 500 - by, fenceHeight);
+
+      innerFencePos.push(ibx, 500 - iby, innerWallHeight);
+      innerFencePos.push(ibx, 500 - iby, innerFenceHeight);
     }
 
     for (let i = 0; i < len; i++) {
@@ -834,8 +896,20 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       barIdx.push(v0, v1, v0 + 1);
       barIdx.push(v1, v1 + 1, v0 + 1);
 
+      innerBarIdx.push(v0, v1, v0 + 1);
+      innerBarIdx.push(v1, v1 + 1, v0 + 1);
+
+      outerCapIdx.push(v0, v1, v0 + 1);
+      outerCapIdx.push(v1, v1 + 1, v0 + 1);
+
+      innerCapIdx.push(v0, v1, v0 + 1);
+      innerCapIdx.push(v1, v1 + 1, v0 + 1);
+
       fenceIdx.push(v0, v1, v0 + 1);
       fenceIdx.push(v1, v1 + 1, v0 + 1);
+
+      innerFenceIdx.push(v0, v1, v0 + 1);
+      innerFenceIdx.push(v1, v1 + 1, v0 + 1);
     }
 
     const barGeo = new THREE.BufferGeometry();
@@ -844,10 +918,31 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
     barGeo.setIndex(barIdx);
     barGeo.computeVertexNormals();
 
+    const innerBarGeo = new THREE.BufferGeometry();
+    innerBarGeo.setAttribute('position', new THREE.Float32BufferAttribute(innerBarPos, 3));
+    innerBarGeo.setAttribute('uv', new THREE.Float32BufferAttribute(innerBarUvs, 2));
+    innerBarGeo.setIndex(innerBarIdx);
+    innerBarGeo.computeVertexNormals();
+
+    const outerCapGeo = new THREE.BufferGeometry();
+    outerCapGeo.setAttribute('position', new THREE.Float32BufferAttribute(outerCapPos, 3));
+    outerCapGeo.setIndex(outerCapIdx);
+    outerCapGeo.computeVertexNormals();
+
+    const innerCapGeo = new THREE.BufferGeometry();
+    innerCapGeo.setAttribute('position', new THREE.Float32BufferAttribute(innerCapPos, 3));
+    innerCapGeo.setIndex(innerCapIdx);
+    innerCapGeo.computeVertexNormals();
+
     const fenceGeo = new THREE.BufferGeometry();
     fenceGeo.setAttribute('position', new THREE.Float32BufferAttribute(fencePos, 3));
     fenceGeo.setIndex(fenceIdx);
     fenceGeo.computeVertexNormals();
+
+    const innerFenceGeo = new THREE.BufferGeometry();
+    innerFenceGeo.setAttribute('position', new THREE.Float32BufferAttribute(innerFencePos, 3));
+    innerFenceGeo.setIndex(innerFenceIdx);
+    innerFenceGeo.computeVertexNormals();
 
     // 5. Start/Finish line & Overhead FIA Gantry Transform
     const p1 = track.startLine.p1;
@@ -957,7 +1052,11 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       outerKerbGeometry: outerKerbGeo,
       innerKerbGeometry: innerKerbGeo,
       barrierGeometry: barGeo,
+      innerBarrierGeometry: innerBarGeo,
+      outerRailCapGeometry: outerCapGeo,
+      innerRailCapGeometry: innerCapGeo,
       catchFenceGeometry: fenceGeo,
+      innerCatchFenceGeometry: innerFenceGeo,
       tireStackTransforms: tireTransforms,
       apexCatEyeTransforms: catEyes,
       marshalPanels: marshals,
@@ -1032,6 +1131,17 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
       checkerTexture.dispose();
       gantryTexture.dispose();
       sectorGantries.forEach((sg) => sg.texture.dispose());
+      bankedTrackGeometry.dispose();
+      runoffApronGeometry.dispose();
+      gravelTrapGeometry.dispose();
+      outerKerbGeometry.dispose();
+      innerKerbGeometry.dispose();
+      barrierGeometry.dispose();
+      innerBarrierGeometry.dispose();
+      outerRailCapGeometry.dispose();
+      innerRailCapGeometry.dispose();
+      catchFenceGeometry.dispose();
+      innerCatchFenceGeometry.dispose();
     };
   }, [
     asphaltMaps,
@@ -1041,7 +1151,18 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
     barrierTexture,
     checkerTexture,
     gantryTexture,
-    sectorGantries
+    sectorGantries,
+    bankedTrackGeometry,
+    runoffApronGeometry,
+    gravelTrapGeometry,
+    outerKerbGeometry,
+    innerKerbGeometry,
+    barrierGeometry,
+    innerBarrierGeometry,
+    outerRailCapGeometry,
+    innerRailCapGeometry,
+    catchFenceGeometry,
+    innerCatchFenceGeometry
   ]);
 
   const countNum = countdownValue ? parseInt(countdownValue, 10) : 0;
@@ -1160,7 +1281,7 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
         </group>
       ))}
 
-      {/* Perimeter FIA Sponsor Tecpro Barriers */}
+      {/* Outer & Inner Continuous FIA Sponsor Tecpro & Armco Guardrail Barriers ("Quitamiedos") */}
       <mesh geometry={barrierGeometry} castShadow receiveShadow>
         <meshStandardMaterial
           map={barrierTexture}
@@ -1169,13 +1290,40 @@ export const TrackMesh: React.FC<TrackMeshProps> = ({
           side={THREE.DoubleSide}
         />
       </mesh>
+      <mesh geometry={innerBarrierGeometry} castShadow receiveShadow>
+        <meshStandardMaterial
+          map={barrierTexture}
+          roughness={0.36}
+          metalness={0.34}
+          side={THREE.DoubleSide}
+        />
+      </mesh>
 
-      {/* Perimeter Debris Catch-Fencing above the Tecpro Wall */}
+      {/* Galvanized Steel Guardrail Top Caps (gives unmistakable 3D wall thickness on both sides of the circuit) */}
+      <mesh geometry={outerRailCapGeometry} receiveShadow>
+        <meshStandardMaterial color="#94a3b8" roughness={0.28} metalness={0.82} side={THREE.DoubleSide} />
+      </mesh>
+      <mesh geometry={innerRailCapGeometry} receiveShadow>
+        <meshStandardMaterial color="#94a3b8" roughness={0.28} metalness={0.82} side={THREE.DoubleSide} />
+      </mesh>
+
+      {/* Outer & Inner Perimeter Debris Catch-Fencing above the Guardrail Walls */}
       <mesh geometry={catchFenceGeometry}>
         <meshStandardMaterial
           color="#64748b"
           transparent
           opacity={0.22}
+          roughness={0.28}
+          metalness={0.86}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+        />
+      </mesh>
+      <mesh geometry={innerCatchFenceGeometry}>
+        <meshStandardMaterial
+          color="#64748b"
+          transparent
+          opacity={0.20}
           roughness={0.28}
           metalness={0.86}
           side={THREE.DoubleSide}

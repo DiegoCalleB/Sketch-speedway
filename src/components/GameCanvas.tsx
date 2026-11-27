@@ -20,6 +20,7 @@ import {
   computeTelemetryEvaluation,
   resampleAndSmoothPath,
   getTrackSurfaceInfo,
+  clampDrawnPointToTrackCorridor,
   getMaxSafeCornerSpeed,
   analyzeDrawnPathSafety,
   getPerfectLapGuide,
@@ -150,6 +151,8 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
   const svgTrackGroupRef = useRef<SVGGElement>(null);
   const raceSessionIdRef = useRef(0);
   const activePointerIdRef = useRef<number | null>(null);
+  const drawingSegmentIdxRef = useRef<number | undefined>(undefined);
+  const lastBarrierClampHapticRef = useRef<number>(0);
 
   // Automatically detect screen portrait vs landscape on Android & iPhone (including iOS Safari orientationchange delay)
   useEffect(() => {
@@ -503,7 +506,8 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
         damageLeft: 0,
         damageRight: 0,
         chassisHealth: 100,
-        lastImpactSeverity: 0
+        lastImpactSeverity: 0,
+        trackSegmentIdx: getTrackSurfaceInfo(grid, track).segmentIdx
       };
     });
 
@@ -1085,7 +1089,7 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
           kind: 'spark'
         });
       }
-    });
+    }, track);
 
     for (let i = active_particles.length - 1; i >= 0; i--) {
       const p = active_particles[i];
@@ -1186,9 +1190,18 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
       t: now,
       speed: initSpeed
     };
+    const startSeg = getTrackSurfaceInfo(firstPoint, track).segmentIdx;
+    drawingSegmentIdxRef.current = startSeg;
     const initialList: Point[] = [firstPoint];
     if (distAnchor > 6) {
-      initialList.push({ x, y, t: now + 8, speed: Math.max(2.4, initSpeed) });
+      const clampedInit = clampDrawnPointToTrackCorridor({ x, y }, track, startSeg);
+      drawingSegmentIdxRef.current = clampedInit.segmentIdx;
+      initialList.push({
+        x: clampedInit.pt.x,
+        y: clampedInit.pt.y,
+        t: now + 8,
+        speed: Math.max(2.4, initSpeed)
+      });
     }
 
     drawnPointsRef.current = initialList;
@@ -1206,10 +1219,24 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
     if (!isDrawing || phase !== 'drawing' || !activePlayer) return;
     if (activePointerIdRef.current !== null && e.pointerId !== activePointerIdRef.current) return;
 
-    const { x, y } = getSvgPointFromEvent(e);
+    const rawPointer = getSvgPointFromEvent(e);
     const now = performance.now();
     const activePath = drawnPointsRef.current;
     if (activePath.length === 0) return;
+
+    // Physically prevent drawing trajectories through outer or inner guardrails ("quitamiedos") across the infield
+    const clampedCorridor = clampDrawnPointToTrackCorridor(
+      rawPointer,
+      track,
+      drawingSegmentIdxRef.current
+    );
+    drawingSegmentIdxRef.current = clampedCorridor.segmentIdx;
+    const { x, y } = clampedCorridor.pt;
+
+    if (clampedCorridor.clampedAgainstBarrier && now - lastBarrierClampHapticRef.current > 180) {
+      lastBarrierClampHapticRef.current = now;
+      haptics.lightTap();
+    }
 
     const lastPt = activePath[activePath.length - 1];
     const dist = Math.hypot(x - lastPt.x, y - lastPt.y);
@@ -1220,14 +1247,14 @@ export const GameCanvas: React.FC<GameCanvasProps> = ({
 
     const alpha = 0.28;
     const smoothedSpeed = lastPt.speed * (1 - alpha) + rawSpeed * alpha;
-    const clampedSpeed = Math.max(1.2, Math.min(7.2, smoothedSpeed));
+    const clampedSpeed = Math.max(1.2, Math.min(7.8, smoothedSpeed));
 
     const newPoint: Point = { x, y, t: now, speed: clampedSpeed };
     activePath.push(newPoint);
     setDrawnPoints([...activePath]);
 
     // Real-time corner vs straightaway evaluation
-    const surface = getTrackSurfaceInfo(newPoint, track);
+    const surface = getTrackSurfaceInfo(newPoint, track, drawingSegmentIdxRef.current);
     let pathCurv = 0;
     if (activePath.length >= 3) {
       const pPrev = activePath[Math.max(0, activePath.length - 3)];
